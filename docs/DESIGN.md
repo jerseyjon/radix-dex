@@ -104,7 +104,7 @@ cannot take anything a user has not signed for. Float is swept regularly.
 - Markets: union of venue pool lists, filtered by allow-listed packages and minimum depth.
 - Candles: Ociswap UDF history to begin with; our own indexer (ledger swap events →
   trades → candles, SQLite) replaces it.
-- Gateway URL is configuration, so it can point at Jon's own node / thin gateway.
+- Gateway URL is configuration, so it can point at a self-hosted node or gateway.
 
 ## Pool safety (drain risks) and what we do about them
 
