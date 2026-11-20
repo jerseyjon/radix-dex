@@ -1,15 +1,8 @@
 import { verifyAsync } from '@noble/ed25519';
-import { blake2b } from '@noble/hashes/blake2b';
 import { PublicKey, RadixEngineToolkit } from '@steleaio/radix-engine-toolkit';
 import { Decimal, isAccount, isResource } from './manifest.ts';
 import { type LimitOrderParams, limitOrderManifest } from './orders.ts';
-import { type DecodedOrder, decodeSignedPartialTransaction, fromHex, normaliseSubintentManifest, toHex } from './tx.ts';
-
-/** The hash the on-ledger registry uses (Scrypto `hash` = Blake2b-256). */
-export function orderKeyFromSecret(secretHex: string): string {
-  if (!/^[0-9a-f]{64}$/.test(secretHex)) throw new Error('Cancel secret must be 32 bytes of lowercase hex');
-  return toHex(blake2b(fromHex(secretHex), { dkLen: 32 }));
-}
+import { type DecodedOrder, decodeSignedPartialTransaction, fromHex, normaliseSubintentManifest } from './tx.ts';
 
 export class OrderRejected extends Error {}
 

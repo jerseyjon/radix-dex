@@ -43,10 +43,8 @@ export interface Pool {
   /** Display-only statistics from the venue's own API. */
   tvlUsd: number;
   volume24hUsd: number;
-  /** Approximate reserves of tokens[0] and tokens[1], in token units. Used only to size depth probes. */
+  /** Roughly half the pool's value expressed in tokens[0] and in tokens[1]. Used only to size depth probes. */
   reserves: [number, number];
-  /** DefiPlaza: the pair component (the swap call goes to the dex, `address`). */
-  pairAddress?: string;
 }
 
 export interface Market {

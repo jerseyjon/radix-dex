@@ -101,6 +101,8 @@ export function poolFillManifest(o: { solver: SolverIdentity; feeLockXrd: string
   lines.push(
     `TAKE_ALL_FROM_WORKTOP ${addr(buy)} ${bucket('out')};`,
     `YIELD_TO_CHILD NamedIntent("order") ${bucket('out')};`,
+    // Normally empty. Catches any part of the input a pool handed back unswapped, which would otherwise fail the transaction.
+    `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
   );
   return lines.join('\n');
 }

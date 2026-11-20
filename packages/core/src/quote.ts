@@ -36,7 +36,10 @@ export function routeInstructions(route: Pool[], sell: string): string[] {
 export class Quoter {
   private readonly gateway: Gateway;
   private readonly funders = new Map<string, Promise<{ address: string; amount: Decimal }[]>>();
+  private readonly divisibilities = new Map<string, Promise<number>>();
   private epoch: { value: number; at: number } | undefined;
+  /** Why the most recent failed simulation failed; for diagnostics only. */
+  lastFailure: string | undefined;
 
   constructor(gateway: Gateway) {
     this.gateway = gateway;
@@ -47,6 +50,21 @@ export class Quoter {
       this.epoch = { value: (await this.gateway.status()).epoch, at: Date.now() };
     }
     return this.epoch.value;
+  }
+
+  /** A token's divisibility: amounts with more decimal places than this cannot be withdrawn at all. */
+  divisibility(resource: string): Promise<number> {
+    let p = this.divisibilities.get(resource);
+    if (!p) {
+      p = this.gateway.entityDetails([resource]).then((d) => {
+        const div = d[0]?.details?.divisibility;
+        if (typeof div !== 'number') throw new Error(`No divisibility for ${resource}`);
+        return div;
+      });
+      p.catch(() => this.divisibilities.delete(resource));
+      this.divisibilities.set(resource, p);
+    }
+    return p;
   }
 
   private fundersFor(resource: string) {
@@ -63,7 +81,7 @@ export class Quoter {
 
   /** Simulate selling `sellAmount` of `sell` along `route`. Returns undefined if no funder can cover it or the swap fails. */
   async simulate(route: Pool[], sell: string, sellAmount: string | Decimal): Promise<Quote | undefined> {
-    const amount = new Decimal(sellAmount);
+    const amount = new Decimal(sellAmount).toDecimalPlaces(await this.divisibility(sell), Decimal.ROUND_DOWN);
     if (!amount.isPositive()) return undefined;
     const path = routePath(route, sell);
     const buy = path[path.length - 1]!;
@@ -79,18 +97,22 @@ export class Quoter {
       const res = await this.gateway.preview(manifest, epoch);
       if (!res.ok) {
         // An account that is securified or otherwise unusable fails at the withdraw; try the next holder.
+        this.lastFailure = res.error;
         if (/withdraw|Unauthorized|AuthError/i.test(res.error ?? '')) continue;
         return undefined;
       }
-      const received = res.changes
-        .filter((c) => c.entity === funder.address && c.resource === buy)
+      const net = (resource: string) => res.changes
+        .filter((c) => c.entity === funder.address && c.resource === resource)
         .reduce((a, c) => a.plus(c.amount), new Decimal(0));
-      if (!received.isPositive()) return undefined;
+      const received = net(buy);
+      // A pool short of liquidity can hand part of the input back, so measure what was really sold.
+      const sold = net(sell).neg();
+      if (!received.isPositive() || !sold.isPositive()) return undefined;
       return {
         sell, buy,
-        sellAmount: amount.toFixed(),
+        sellAmount: sold.toFixed(),
         buyAmount: received.toFixed(),
-        price: received.div(amount).toSignificantDigits(12).toFixed(),
+        price: received.div(sold).toSignificantDigits(12).toFixed(),
         route,
         networkFeeXrd: res.feeXrd,
       };

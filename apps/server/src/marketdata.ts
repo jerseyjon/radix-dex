@@ -110,8 +110,9 @@ export class MarketData {
     return this.candleCache.get(`${market.id}|${resolution}`, async () => {
       const to = Math.floor(Date.now() / 1000);
       const from = to - RES_SECONDS[resolution]! * count;
-      const series = async (token: string) => {
-        const j = await defaultJsonFetch(`https://api.ociswap.com/udf/history?symbol=${token}&resolution=${res}&from=${from}&to=${to}`);
+      const xrd = this.config.network.xrd;
+      const series = async (token: string, currency: 'XRD' | 'USD') => {
+        const j = await defaultJsonFetch(`https://api.ociswap.com/udf/history?symbol=${token}&resolution=${res}&from=${from}&to=${to}&currencyCode=${currency}`);
         const out = new Map<number, Candle>();
         if (j?.s !== 'ok' || !Array.isArray(j.t)) return out;
         j.t.forEach((t: number, i: number) => out.set(t, {
@@ -119,22 +120,29 @@ export class MarketData {
         }));
         return out;
       };
-      const [base, quote] = await Promise.all([series(market.base.address), series(market.quote.address)]);
-      const candles: Candle[] = [];
-      let lastQuote: Candle | undefined;
-      for (const t of [...base.keys()].sort((a, b) => a - b)) {
-        const b = base.get(t)!;
-        const q = quote.get(t) ?? lastQuote;
-        if (!q || !(q.close > 0) || !(q.open > 0)) continue;
-        lastQuote = q;
-        const open = b.open / q.open, close = b.close / q.close;
-        candles.push({
-          time: t, open, close,
-          high: Math.max(open, close, b.high / q.close),
-          low: Math.min(open, close, b.low / q.close),
-          volume: b.volume,
-        });
+      let candles: Candle[];
+      if (market.quote.address === xrd) {
+        // Priced in XRD: the feed's own candles, wicks and all.
+        candles = [...(await series(market.base.address, 'XRD')).values()];
+      } else if (market.base.address === xrd && this.config.quotePriority.indexOf(market.quote.address) < this.config.quotePriority.indexOf(xrd)) {
+        // XRD against a dollar stablecoin: XRD's dollar candles are a fair stand-in.
+        candles = [...(await series(xrd, 'USD')).values()];
+      } else {
+        // Any other pair: ratio of the two XRD-priced series. Highs and lows of a ratio cannot be
+        // recovered from two separate series, so these candles show open and close only.
+        const [base, quote] = await Promise.all([series(market.base.address, 'XRD'), series(market.quote.address, 'XRD')]);
+        candles = [];
+        let lastQuote: Candle | undefined;
+        for (const t of [...base.keys()].sort((x, y) => x - y)) {
+          const b = base.get(t)!;
+          const q = quote.get(t) ?? lastQuote;
+          if (!q || !(q.close > 0) || !(q.open > 0)) continue;
+          lastQuote = q;
+          const open = b.open / q.open, close = b.close / q.close;
+          candles.push({ time: t, open, close, high: Math.max(open, close), low: Math.min(open, close), volume: b.volume });
+        }
       }
+      candles.sort((x, y) => x.time - y.time);
       return candles.filter((c) => [c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v) && v > 0));
     });
   }

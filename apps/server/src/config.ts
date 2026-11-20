@@ -25,11 +25,13 @@ export interface Config {
   marketsFile: string | undefined;
 }
 
-/** Bridged dollar stablecoins on mainnet, by resource address (never matched by symbol, which anyone can copy). */
+/**
+ * Bridged dollar stablecoins on mainnet, by resource address (never matched by symbol, which anyone can copy).
+ * xUSDC is left out on purpose: its bridge is gone and it no longer trades near a dollar.
+ */
 const MAINNET_STABLES = [
   'resource_rdx1thxj9m87sn5cc9ehgp9qxp6vzeqxtce90xm5cp33373tclyp4et4gv', // hUSDC
   'resource_rdx1th4v03gezwgzkuma6p38lnum8ww8t4ds9nvcrkr2p9ft6kxx3kxvhe', // hUSDT
-  'resource_rdx1t4upr78guuapv5ept7d7ptekk9mqhy605zgms33mcszen8l9fac8vf', // xUSDC
 ];
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
