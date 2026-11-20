@@ -2,6 +2,7 @@ import {
   type Depth, type Gateway, type Market, type Pool, type Quote, type Token,
   Quoter, buildMarkets, filterAllowedPools, listDefiPlaza, listOciswap, mergeDepth, tokensFromLedger, defaultJsonFetch,
 } from '@radix-dex/core';
+import { readFileSync } from 'node:fs';
 import type { Config } from './config.ts';
 
 export interface Candle { time: number; open: number; high: number; low: number; close: number; volume: number }
@@ -47,7 +48,22 @@ export class MarketData {
 
   /** Rebuild the market list from the venues. A venue that fails is skipped; the previous list is kept if all fail. */
   async refresh(): Promise<void> {
-    if (this.config.network.name !== 'mainnet') { this.refreshedAt = Date.now(); return; }
+    if (this.config.network.name !== 'mainnet') {
+      // No venue APIs off mainnet: markets come from a local file of tokens and pools.
+      if (this.config.marketsFile) {
+        const j = JSON.parse(readFileSync(this.config.marketsFile, 'utf8'));
+        this.tokens = new Map((j.tokens as Token[]).map((t) => [t.address, t]));
+        this.pools = j.pools as Pool[];
+        this.markets = buildMarkets(this.pools, this.tokens, [...(j.quotePriority ?? []), ...this.config.quotePriority]);
+        for (const [base, quote] of (j.markets ?? []) as [string, string][]) {
+          const id = `${base}/${quote}`;
+          const b = this.tokens.get(base), q = this.tokens.get(quote);
+          if (b && q && !this.markets.some((m) => m.id === id)) this.markets.push({ id, base: b, quote: q, pools: [], tvlUsd: 0, volume24hUsd: 0 });
+        }
+      }
+      this.refreshedAt = Date.now();
+      return;
+    }
     const min = { minTvlUsd: this.config.minPoolTvlUsd };
     const results = await Promise.allSettled([listOciswap(min), listDefiPlaza(min)]);
     const listed: Pool[] = [];
@@ -88,6 +104,7 @@ export class MarketData {
 
   /** Candles for a market, as the ratio of the two tokens' USD series from Ociswap's chart feed. */
   candles(market: Market, resolution: string, count = 300): Promise<Candle[]> {
+    if (this.config.network.name !== 'mainnet') return Promise.resolve([]);
     const res = RESOLUTIONS[resolution];
     if (!res) return Promise.reject(new Error(`Unsupported resolution "${resolution}"`));
     return this.candleCache.get(`${market.id}|${resolution}`, async () => {

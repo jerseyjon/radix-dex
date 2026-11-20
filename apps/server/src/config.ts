@@ -13,6 +13,16 @@ export interface Config {
   /** Trading fee taken by the solver from limit-order fills, in basis points. */
   feeBps: number;
   webDir: string | undefined;
+  /** Limit orders are accepted only when a solver badge is configured. */
+  solverBadge: string | undefined;
+  /** File holding the solver's Ed25519 private key (hex), mode 600. Without it orders are stored but not filled. */
+  solverKeyFile: string | undefined;
+  /** Hard-cancel registry component, if deployed. */
+  registry: string | undefined;
+  maxOrderLifetimeSec: number;
+  maxOpenOrdersPerAccount: number;
+  /** Optional JSON file of extra tokens and pools (used on Stokenet, where no venue API exists). */
+  marketsFile: string | undefined;
 }
 
 /** Bridged dollar stablecoins on mainnet, by resource address (never matched by symbol, which anyone can copy). */
@@ -38,5 +48,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     quotePriority: [...(name === 'mainnet' ? MAINNET_STABLES : []), network.xrd],
     feeBps,
     webDir: env.DEX_WEB_DIR,
+    solverBadge: env.DEX_SOLVER_BADGE,
+    solverKeyFile: env.DEX_SOLVER_KEY_FILE,
+    registry: env.DEX_REGISTRY,
+    maxOrderLifetimeSec: Number(env.DEX_MAX_ORDER_LIFETIME_SEC ?? 30 * 86400),
+    maxOpenOrdersPerAccount: Number(env.DEX_MAX_OPEN_ORDERS ?? 50),
+    marketsFile: env.DEX_MARKETS_FILE,
   };
 }

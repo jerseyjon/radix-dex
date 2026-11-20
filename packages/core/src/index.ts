@@ -7,3 +7,4 @@ export * from './markets.ts';
 export * from './orders.ts';
 export * from './tx.ts';
 export * from './validate.ts';
+export * from './solver.ts';
