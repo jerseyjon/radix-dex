@@ -1,0 +1,18 @@
+import { Gateway, NETWORKS, listOciswap, listDefiPlaza, filterAllowedPools, tokensFromLedger, buildMarkets, Quoter, mergeDepth } from '../packages/core/src/index.ts';
+const net = NETWORKS.mainnet; const gw = new Gateway(net);
+const [oci, dfp] = await Promise.all([listOciswap({ minTvlUsd: 500 }), listDefiPlaza({ minTvlUsd: 500 })]);
+console.log('listed', oci.pools.length, dfp.pools.length);
+const pools = await filterAllowedPools(gw, [...oci.pools, ...dfp.pools]);
+console.log('allowed', pools.length, pools.filter(p=>p.venue==='defiplaza').length);
+const tokens = new Map(oci.tokens.map(t => [t.address, t]));
+const missing = [...new Set(pools.flatMap(p => p.tokens))].filter(a => !tokens.has(a));
+for (const t of await tokensFromLedger(gw, missing)) tokens.set(t.address, t);
+const markets = buildMarkets(pools, tokens, [net.xrd]);
+for (const m of markets.slice(0, 12)) console.log(m.base.symbol + '/' + m.quote.symbol, m.pools.map(p => p.venue + ':' + p.kind).join(','), Math.round(m.tvlUsd));
+const q = new Quoter(gw);
+const m = markets[0]!;
+console.log(await q.best(pools, net.xrd, m.base.address, '1000', net.xrd).then(x => x && { buy: x.buyAmount, price: x.price, route: x.route.map(p => p.venue), fee: x.networkFeeXrd }));
+const dm = markets.find(m => m.quote.address === net.xrd && m.pools.some(p => p.venue === 'defiplaza'))!;
+console.log(dm.base.symbol, await q.simulate([dm.pools.find(p => p.venue === 'defiplaza')!], net.xrd, '1000').then(x => x && x.buyAmount));
+const t = Date.now(); const d = mergeDepth(m.id, [await q.poolDepth(m, m.pools[0]!)]);
+console.log(Date.now() - t, 'ms', d.mid, d.bids.slice(0, 3), d.asks.slice(0, 3));

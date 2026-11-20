@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.repos/
+data/
+*.key
+*.key.json
+keys/
+.env
+.env.*
+!.env.example
+target/
+*.log
