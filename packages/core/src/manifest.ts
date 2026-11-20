@@ -1,4 +1,4 @@
-import Decimal from 'decimal.js';
+import { Decimal } from 'decimal.js';
 
 Decimal.set({ precision: 60, rounding: Decimal.ROUND_DOWN });
 export { Decimal };

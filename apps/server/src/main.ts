@@ -39,7 +39,7 @@ api.on('GET', '/api/quote', async ({ url }) => {
   const buy = need(url.searchParams.get('buy'), 'buy');
   const amount = need(url.searchParams.get('amount'), 'amount');
   if (!isResource(sell) || !isResource(buy) || sell === buy) throw new HttpError(400, 'Bad token addresses');
-  let d: InstanceType<typeof Decimal>;
+  let d: Decimal;
   try { d = new Decimal(amount); } catch { throw new HttpError(400, 'Bad amount'); }
   if (!d.isFinite() || !d.isPositive()) throw new HttpError(400, 'Bad amount');
   const q = await data.quote(sell, buy, d.toDecimalPlaces(18).toFixed());
