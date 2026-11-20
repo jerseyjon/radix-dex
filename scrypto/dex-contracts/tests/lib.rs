@@ -234,25 +234,27 @@ fn add_remove_round_trips_never_profit_on_a_low_divisibility_token() {
     let mut world = World::new();
     let badge = world.token(dec!(1), 0);
     let btc = world.token(dec!(21), 8); // 8 decimals, like the wrapped bitcoins
-    let (pool, units) = world.pool(btc, XRD, 30, 0, badge);
+    // A stand-in for XRD with a large supply: the test account's real XRD balance is only 10,000.
+    let xrd = world.token(dec!(1_000_000_000), 18);
+    let (pool, units) = world.pool(btc, xrd, 30, 0, badge);
     // An awkward ratio so that almost nothing divides evenly.
-    world.add(pool, btc, dec!("0.01234567"), XRD, dec!("987654.321")).expect_commit_success();
+    world.add(pool, btc, dec!("0.01234567"), xrd, dec!("987654.321")).expect_commit_success();
 
-    let start = (world.balance(btc), world.balance(XRD));
+    let start = (world.balance(btc), world.balance(xrd));
     let reserves_start = world.reserves(pool);
     for i in 0..40u32 {
         // Tiny, odd-sized deposits: the sizes where rounding matters most.
         let sats = Decimal::from(1 + (i * 7) % 23) * dec!("0.00000001");
-        let xrd = Decimal::from(1 + (i * 13) % 97) * dec!("0.791");
+        let xrd_amount = Decimal::from(1 + (i * 13) % 97) * dec!("0.791");
         let before_units = world.balance(units);
-        let receipt = world.add(pool, btc, sats, XRD, xrd);
+        let receipt = world.add(pool, btc, sats, xrd, xrd_amount);
         if !receipt.is_commit_success() {
             continue; // "Deposit too small" is an acceptable answer
         }
         let minted = world.balance(units) - before_units;
         world.remove(pool, units, minted).expect_commit_success();
         assert!(world.balance(btc) <= start.0, "round {i}: gained BTC");
-        assert!(world.balance(XRD) <= start.1, "round {i}: gained XRD");
+        assert!(world.balance(xrd) <= start.1, "round {i}: gained XRD");
     }
     let reserves_end = world.reserves(pool);
     assert!(reserves_end.0 >= reserves_start.0 && reserves_end.1 >= reserves_start.1, "the pool never lost a unit of either token");
@@ -265,22 +267,24 @@ fn dust_swaps_never_profit_and_k_never_falls() {
     let mut world = World::new();
     let badge = world.token(dec!(1), 0);
     let btc = world.token(dec!(21), 8);
-    let (pool, _) = world.pool(btc, XRD, 30, 10, badge);
-    world.add(pool, btc, dec!("0.5"), XRD, dec!("40000000")).expect_commit_success();
+    // A stand-in for XRD with a large supply: the test account's real XRD balance is only 10,000.
+    let xrd = world.token(dec!(1_000_000_000), 18);
+    let (pool, _) = world.pool(btc, xrd, 30, 10, badge);
+    world.add(pool, btc, dec!("0.5"), xrd, dec!("40000000")).expect_commit_success();
 
     let k = |r: (Decimal, Decimal)| PreciseDecimal::from(r.0) * PreciseDecimal::from(r.1);
     let mut last_k = k(world.reserves(pool));
     let start_btc = world.balance(btc);
-    let start_xrd = world.balance(XRD);
+    let start_xrd = world.balance(xrd);
     let mut refused = 0;
     for i in 0..30u32 {
         let sats = Decimal::from(1 + i % 5) * dec!("0.00000001");
-        let xrd_before = world.balance(XRD);
+        let xrd_before = world.balance(xrd);
         let receipt = world.swap(pool, btc, sats);
         if receipt.is_commit_success() {
-            let xrd_got = world.balance(XRD) - xrd_before;
+            let xrd_got = world.balance(xrd) - xrd_before;
             // Swap the XRD straight back.
-            let _ = world.swap(pool, XRD, xrd_got);
+            let _ = world.swap(pool, xrd, xrd_got);
         } else {
             refused += 1; // "Trade too small": the fee alone is a whole satoshi
         }
@@ -290,7 +294,13 @@ fn dust_swaps_never_profit_and_k_never_falls() {
         assert!(world.balance(btc) <= start_btc, "round {i}: gained BTC");
     }
     assert!(world.balance(btc) < start_btc || refused == 30, "round trips cost the attacker BTC");
-    assert!(world.balance(XRD) <= start_xrd, "and never made them XRD");
+    // The attacker may end up holding XRD they bought with BTC when the swap back was refused as
+    // too small. That is a purchase, not a profit: valued at the pool's opening price
+    // (40,000,000 XRD for 0.5 BTC), their holdings must not have grown.
+    let price = dec!(80_000_000);
+    let value = |btc_amount: Decimal, xrd_amount: Decimal| btc_amount * price + xrd_amount;
+    let end = value(world.balance(btc), world.balance(xrd));
+    assert!(end <= value(start_btc, start_xrd), "holdings grew in value: {} -> {}", value(start_btc, start_xrd), end);
 }
 
 /// A token with no decimal places at all is the extreme case of the rounding problem.
@@ -299,25 +309,27 @@ fn zero_divisibility_token_pool_rounds_against_the_caller() {
     let mut world = World::new();
     let badge = world.token(dec!(1), 0);
     let tickets = world.token(dec!(100_000), 0);
-    let (pool, units) = world.pool(tickets, XRD, 30, 0, badge);
-    world.add(pool, tickets, dec!(1000), XRD, dec!(50_000)).expect_commit_success();
+    // A stand-in for XRD with a large supply: the test account's real XRD balance is only 10,000.
+    let xrd = world.token(dec!(1_000_000_000), 18);
+    let (pool, units) = world.pool(tickets, xrd, 30, 0, badge);
+    world.add(pool, tickets, dec!(1000), xrd, dec!(50_000)).expect_commit_success();
 
     // 1 ticket in: the fee rounds up to the whole ticket, so nothing comes out and the trade is refused.
     world.swap(pool, tickets, dec!(1)).expect_commit_failure_containing_error("Trade too small");
 
     // Buying tickets with XRD: 60 XRD would buy 1.19 tickets at the margin; you get 1, never 2.
     let before = world.balance(tickets);
-    world.swap(pool, XRD, dec!(60)).expect_commit_success();
+    world.swap(pool, xrd, dec!(60)).expect_commit_success();
     assert_eq!(world.balance(tickets) - before, dec!(1));
 
     // Deposit sized for 0.5 of a ticket: units are minted for what was asked, but a whole ticket is charged.
-    let (tickets_before, xrd_before, units_before) = (world.balance(tickets), world.balance(XRD), world.balance(units));
-    let receipt = world.add(pool, tickets, dec!(5), XRD, dec!(25));
+    let (tickets_before, xrd_before, units_before) = (world.balance(tickets), world.balance(xrd), world.balance(units));
+    let receipt = world.add(pool, tickets, dec!(5), xrd, dec!(25));
     if receipt.is_commit_success() {
         let minted = world.balance(units) - units_before;
         world.remove(pool, units, minted).expect_commit_success();
-        assert!(world.balance(tickets) <= tickets_before && world.balance(XRD) <= xrd_before, "no gain from a fractional-ticket deposit");
-        assert!(world.balance(tickets) < tickets_before || world.balance(XRD) < xrd_before, "and it cost something");
+        assert!(world.balance(tickets) <= tickets_before && world.balance(xrd) <= xrd_before, "no gain from a fractional-ticket deposit");
+        assert!(world.balance(tickets) < tickets_before || world.balance(xrd) < xrd_before, "and it cost something");
     }
 }
 
