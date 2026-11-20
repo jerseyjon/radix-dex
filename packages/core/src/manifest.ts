@@ -14,7 +14,8 @@ export function addr(a: string): string {
 /** Format a non-negative amount as an RTM Decimal with at most 18 decimal places (rounded down). */
 export function dec(v: string | number | Decimal): string {
   const d = new Decimal(v);
-  if (!d.isFinite() || d.isNegative()) throw new Error(`Not a valid amount: ${String(v)}`);
+  // Radix Decimal is a 192-bit fixed-point number; anything near its limit is certainly a mistake.
+  if (!d.isFinite() || d.isNegative() || d.gt('1e38')) throw new Error(`Not a valid amount: ${String(v)}`);
   return `Decimal("${d.toDecimalPlaces(18, Decimal.ROUND_DOWN).toFixed()}")`;
 }
 
