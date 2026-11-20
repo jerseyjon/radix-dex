@@ -7,7 +7,7 @@ import { fmtPrice, fmtTime, fmtUsd, shortAddr } from './format';
 import { Markets } from './Markets';
 import { OrderForm } from './OrderForm';
 import { Orders } from './Orders';
-import { DAPP_DEFINITION, type WalletAccount, getWallet } from './wallet';
+import { type WalletAccount, getWallet } from './wallet';
 
 const RESOLUTIONS = ['15m', '1h', '4h', '1d', '1w'];
 
@@ -51,15 +51,18 @@ export function App() {
   const market = useMemo(() => markets.find((m) => m.id === selected), [markets, selected]);
   useEffect(() => { if (selected) history.replaceState(null, '', '#' + encodeURIComponent(selected)); }, [selected]);
 
-  const wallet = useMemo(() => (config && !STATIC ? getWallet(config.networkId) : undefined), [config]);
+  const wallet = useMemo(() => (config && !STATIC ? getWallet(config.networkId, config.dAppDefinition) : undefined), [config]);
   useEffect(() => wallet?.onAccounts((a) => { setAccounts(a); setAccount((cur) => (cur && a.some((x) => x.address === cur) ? cur : a[0]?.address)); }), [wallet]);
 
   useEffect(() => {
     if (!market) return;
     let live = true;
     setCandlesLoading(true);
-    api.candles(market.id, resolution).then((c) => live && setCandles(c)).catch(() => live && setCandles([])).finally(() => live && setCandlesLoading(false));
-    return () => { live = false; };
+    const load = () => api.candles(market.id, resolution).then((c) => live && setCandles(c)).catch(() => live && setCandles([])).finally(() => live && setCandlesLoading(false));
+    void load();
+    // Keep the chart moving while the page is open.
+    const t = STATIC ? undefined : setInterval(() => { if (!document.hidden) void load(); }, 60_000);
+    return () => { live = false; clearInterval(t); };
   }, [market?.id, resolution]);
 
   useEffect(() => setDepth(undefined), [market?.id]);
@@ -107,7 +110,7 @@ export function App() {
             </select>
           )}
           {/* The Radix connect button is a web component registered by the dApp toolkit. */}
-          {wallet ? <radix-connect-button /> : <span className="muted small">{STATIC ? 'read-only preview' : DAPP_DEFINITION ? '' : 'wallet not configured'}</span>}
+          {wallet ? <radix-connect-button /> : <span className="muted small">{STATIC ? 'read-only preview' : 'wallet not configured'}</span>}
         </div>
       </header>
 

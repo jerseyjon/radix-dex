@@ -8,6 +8,7 @@ export function Chart({ candles, loading }: { candles: Candle[]; loading: boolea
   const chart = useRef<IChartApi>();
   const price = useRef<ISeriesApi<'Candlestick'>>();
   const volume = useRef<ISeriesApi<'Histogram'>>();
+  const fitted = useRef<string>();
 
   useEffect(() => {
     if (!el.current) return;
@@ -33,7 +34,8 @@ export function Chart({ candles, loading }: { candles: Candle[]; loading: boolea
     price.current.applyOptions({ priceFormat: { type: 'price', precision, minMove: 10 ** -precision } });
     price.current.setData(candles.map((c) => ({ time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close })));
     volume.current.setData(candles.map((c) => ({ time: c.time as UTCTimestamp, value: c.volume, color: c.close >= c.open ? '#1fbf8f55' : '#f0506e55' })));
-    chart.current?.timeScale().fitContent();
+    // Fit once per data set of a different shape, so a periodic refresh does not undo the user's zoom.
+    if (fitted.current !== candles[0]?.time + ':' + (candles.length > 0)) { chart.current?.timeScale().fitContent(); fitted.current = candles[0]?.time + ':' + (candles.length > 0); }
   }, [candles]);
 
   return (

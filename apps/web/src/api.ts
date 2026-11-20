@@ -4,6 +4,8 @@ export interface MarketSummary { id: string; base: Token; quote: Token; tvlUsd: 
 export interface Candle { time: number; open: number; high: number; low: number; close: number; volume: number }
 export interface ServerConfig {
   network: 'mainnet' | 'stokenet'; networkId: number; xrd: string; feeBps: number; warning: string | null;
+  /** dApp definition account; null means the wallet cannot connect and the site is read-only. */
+  dAppDefinition?: string | null;
   limitOrders: { enabled: false } | { enabled: true; solverBadge: string; registry: string | null; maxLifetimeSec: number; filling: boolean };
   /** Set by the static preview build: data is a snapshot taken at this time and nothing can be traded. */
   snapshotAt?: number;

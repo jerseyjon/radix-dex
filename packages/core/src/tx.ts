@@ -32,7 +32,7 @@ export interface IntentWindow {
   expiresAt?: number;
 }
 
-function core(manifest: string, w: IntentWindow, children: Uint8Array[] = []): IntentCoreV2 {
+function core(manifest: string, w: IntentWindow, children: Uint8Array[] = [], blobs: Uint8Array[] = []): IntentCoreV2 {
   return {
     header: {
       networkId: w.networkId,
@@ -43,7 +43,7 @@ function core(manifest: string, w: IntentWindow, children: Uint8Array[] = []): I
       intentDiscriminator: Number(BigInt.asUintN(53, BigInt('0x' + toHex(crypto.getRandomValues(new Uint8Array(8)))))),
     },
     instructions: manifest,
-    blobs: [],
+    blobs,
     message: NO_MESSAGE,
     children,
   };
@@ -112,10 +112,12 @@ export interface BuiltTransaction {
  */
 export async function buildTransaction(o: {
   manifest: string; window: IntentWindow; notary: Ed25519Key; children?: Record<string, DecodedOrder>; tipBasisPoints?: number;
+  /** Binary attachments referenced from the manifest as Blob("<blake2b-256 hash>"), e.g. package code. */
+  blobs?: Uint8Array[];
 }): Promise<BuiltTransaction> {
   const children = Object.entries(o.children ?? {});
   const useChild = children.map(([name, c]) => `USE_CHILD NamedIntent("${name}") Intent("${c.hashId}");`);
-  const rootCore = core([...useChild, o.manifest].join('\n'), o.window, children.map(([, c]) => fromHex(c.hashHex)));
+  const rootCore = core([...useChild, o.manifest].join('\n'), o.window, children.map(([, c]) => fromHex(c.hashHex)), o.blobs ?? []);
   const builder = await TransactionV2Builder.new();
   let step = builder
     .header({ notaryPublicKey: o.notary.publicKey(), notaryIsSignatory: true, tipBasisPoints: o.tipBasisPoints ?? 0 })

@@ -49,15 +49,18 @@ depth and quotes but cannot trade.
 | `DEX_SOLVER_KEY_FILE` | File (mode 600) with the solver's Ed25519 key in hex; enables filling | unset |
 | `DEX_REGISTRY` | `OrderRegistry` component, to enable hard cancels | unset |
 | `DEX_MARKETS_FILE` | JSON of tokens and pools, for networks with no venue API | unset |
-| `VITE_DAPP_DEFINITION` (web build) | dApp definition account, so the wallet will connect | unset |
+| `DEX_DAPP_DEFINITION` | dApp definition account, so the wallet will connect | unset |
 
 ## Tests
 
 ```bash
-npm test                               # 22 unit tests: order validation, matching, API
+npm test                               # unit tests: order validation, matching, API
 npx tsx scripts/live-check.ts          # read-only check against mainnet pools
 npx tsx scripts/stokenet-e2e.ts        # signs and fills real orders on Stokenet with throwaway keys
 npx tsx scripts/stokenet-server-e2e.ts # same, through the HTTP API and solver
+npx tsx scripts/stokenet-setup.ts      # publish contracts, pool, registry and dApp definition on Stokenet
+npx tsx scripts/stokenet-pool-e2e.ts   # pool fill and on-ledger cancel against that deployment
+scripts/run-stokenet.sh                # run the Stokenet test site with wallet connect on port 8788
 scrypto/run.sh test                    # contract tests, including attempts to drain the pool
 ```
 

@@ -23,6 +23,8 @@ export interface Config {
   maxOpenOrdersPerAccount: number;
   /** Optional JSON file of extra tokens and pools (used on Stokenet, where no venue API exists). */
   marketsFile: string | undefined;
+  /** dApp definition account the wallet checks the site against. Without it the site is read-only. */
+  dAppDefinition: string | undefined;
 }
 
 /**
@@ -56,5 +58,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxOrderLifetimeSec: Number(env.DEX_MAX_ORDER_LIFETIME_SEC ?? 30 * 86400),
     maxOpenOrdersPerAccount: Number(env.DEX_MAX_OPEN_ORDERS ?? 50),
     marketsFile: env.DEX_MARKETS_FILE,
+    dAppDefinition: env.DEX_DAPP_DEFINITION,
   };
 }

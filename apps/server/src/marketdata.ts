@@ -39,6 +39,8 @@ export class MarketData {
   private readonly quoteCache = new TtlCache<Quote | undefined>(8_000);
   private readonly depthCache = new TtlCache<Depth>(20_000);
   private readonly candleCache = new TtlCache<Candle[]>(60_000);
+  /** Mid-price samples per market, for networks with no chart feed. Kept in memory only. */
+  private readonly samples = new Map<string, { time: number; price: number }[]>();
 
   constructor(config: Config, gateway: Gateway) {
     this.config = config;
@@ -104,7 +106,7 @@ export class MarketData {
 
   /** Candles for a market, as the ratio of the two tokens' USD series from Ociswap's chart feed. */
   candles(market: Market, resolution: string, count = 300): Promise<Candle[]> {
-    if (this.config.network.name !== 'mainnet') return Promise.resolve([]);
+    if (this.config.network.name !== 'mainnet') return Promise.resolve(this.sampledCandles(market, resolution, count));
     const res = RESOLUTIONS[resolution];
     if (!res) return Promise.reject(new Error(`Unsupported resolution "${resolution}"`));
     return this.candleCache.get(`${market.id}|${resolution}`, async () => {
@@ -145,5 +147,33 @@ export class MarketData {
       candles.sort((x, y) => x.time - y.time);
       return candles.filter((c) => [c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v) && v > 0));
     });
+  }
+
+  /** Record the current mid price of every market that has pools. Call on a timer where there is no chart feed. */
+  async samplePrices(): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    for (const market of this.markets) {
+      if (!market.pools.length) continue;
+      const mid = (await this.depth(market).catch(() => undefined))?.mid;
+      if (!mid || !(mid > 0)) continue;
+      const list = this.samples.get(market.id) ?? [];
+      list.push({ time: now, price: mid });
+      if (list.length > 50_000) list.splice(0, list.length - 50_000);
+      this.samples.set(market.id, list);
+    }
+  }
+
+  /** Candles built from the sampled mid prices. No volume: these are quotes, not trades. */
+  private sampledCandles(market: Market, resolution: string, count: number): Candle[] {
+    const step = RES_SECONDS[resolution];
+    if (!step) throw new Error(`Unsupported resolution "${resolution}"`);
+    const out = new Map<number, Candle>();
+    for (const s of this.samples.get(market.id) ?? []) {
+      const time = Math.floor(s.time / step) * step;
+      const c = out.get(time);
+      if (!c) out.set(time, { time, open: s.price, high: s.price, low: s.price, close: s.price, volume: 0 });
+      else { c.high = Math.max(c.high, s.price); c.low = Math.min(c.low, s.price); c.close = s.price; }
+    }
+    return [...out.values()].slice(-count);
   }
 }

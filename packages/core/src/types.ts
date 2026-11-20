@@ -29,7 +29,8 @@ export interface Token {
   iconUrl?: string;
 }
 
-export type VenueId = 'ociswap' | 'defiplaza';
+/** 'radixdex' is this project's own Pool blueprint. */
+export type VenueId = 'ociswap' | 'defiplaza' | 'radixdex';
 
 /** One swappable pool on some venue. Amounts are decimal strings or plain numbers for display-only stats. */
 export interface Pool {

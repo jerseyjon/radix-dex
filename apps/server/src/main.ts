@@ -14,5 +14,12 @@ if (solver) {
   setInterval(() => store.expire(Math.floor(Date.now() / 1000)), 30_000).unref();
 }
 
+if (config.network.name !== 'mainnet') {
+  // No chart feed off mainnet: build the chart from our own price samples.
+  const sample = () => data.samplePrices().catch((e) => console.error('[samples] failed:', e));
+  void sample();
+  setInterval(sample, 30_000).unref();
+}
+
 api.listen(config.port, config.host);
 console.log(`radix-dex server on http://${config.host}:${config.port} (${config.network.name}, ${data.markets.length} markets, limit orders ${config.solverBadge ? 'on' : 'off'}, solver ${solver ? 'on' : 'off'})`);

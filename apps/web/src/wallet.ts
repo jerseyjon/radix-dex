@@ -10,15 +10,13 @@ export interface Wallet {
   signOrder(manifest: string, expiresInSec: number, message?: string): Promise<{ signedPartialTransactionHex: string; subintentHash: string }>;
 }
 
-/** A dApp definition address must be configured at build time for the wallet to connect. */
-export const DAPP_DEFINITION: string | undefined = import.meta.env.VITE_DAPP_DEFINITION || undefined;
-
 let wallet: Wallet | undefined;
 
-export function getWallet(networkId: number): Wallet | undefined {
-  if (!DAPP_DEFINITION) return undefined;
+/** The wallet connects only if the server names a dApp definition account for this site. */
+export function getWallet(networkId: number, dAppDefinition: string | null | undefined): Wallet | undefined {
+  if (!dAppDefinition) return undefined;
   if (wallet) return wallet;
-  const rdt = RadixDappToolkit({ dAppDefinitionAddress: DAPP_DEFINITION, networkId, applicationName: 'Radix DEX', applicationVersion: '0.1.0' });
+  const rdt = RadixDappToolkit({ dAppDefinitionAddress: dAppDefinition, networkId, applicationName: 'Radix DEX', applicationVersion: '0.1.0' });
   rdt.walletApi.setRequestData(DataRequestBuilder.accounts().atLeast(1));
   wallet = {
     onAccounts(cb) {

@@ -50,6 +50,7 @@ export async function createApp(config: Config) {
   api.on('GET', '/api/config', () => ({
     network: config.network.name, networkId: config.network.networkId, xrd: config.network.xrd,
     feeBps: config.feeBps, refreshedAt: data.refreshedAt, warning: data.lastError ?? null,
+    dAppDefinition: config.dAppDefinition ?? null,
     limitOrders: config.solverBadge
       ? { enabled: true, solverBadge: config.solverBadge, registry: config.registry ?? null, maxLifetimeSec: config.maxOrderLifetimeSec, filling: Boolean(solver) }
       : { enabled: false },
