@@ -1,4 +1,4 @@
-import type { Depth, Pool, Token } from '@radix-dex/core/browser';
+import { type Depth, type Pool, type Token, marketKey } from '@radix-dex/core/browser';
 
 export interface MarketSummary { id: string; base: Token; quote: Token; tvlUsd: number; volume24hUsd: number; venues: string[] }
 export interface Candle { time: number; open: number; high: number; low: number; close: number; volume: number }
@@ -34,12 +34,6 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return json;
 }
 
-/** Snapshot files are named by a short hash of the market id, since ids contain slashes. */
-export function marketKey(id: string): string {
-  let h = 2166136261;
-  for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
-  return (h >>> 0).toString(36);
-}
 const q = encodeURIComponent;
 
 export const api = {

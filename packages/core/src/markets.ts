@@ -26,3 +26,10 @@ export function buildMarkets(pools: Pool[], tokens: Map<string, Token>, quotePri
   }
   return [...markets.values()].sort((x, y) => y.tvlUsd - x.tvlUsd);
 }
+
+/** Short, filename-safe key for a market id (ids contain slashes). FNV-1a, base 36. */
+export function marketKey(id: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0).toString(36);
+}

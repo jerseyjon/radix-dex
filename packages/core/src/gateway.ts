@@ -108,6 +108,22 @@ export class Gateway {
     return out;
   }
 
+  /**
+   * An account's balance of one fungible resource, as a decimal string.
+   * Asks for that resource's vaults directly, so it is right even for accounts holding hundreds of tokens
+   * (the entity-details call only returns the first page of them).
+   */
+  async fungibleBalance(account: string, resource: string): Promise<string> {
+    const j = await this.post('/state/entity/page/fungible-vaults/', { address: account, resource_address: resource });
+    let total = 0n;
+    for (const v of j.items ?? []) {
+      const [whole, frac = ''] = String(v.amount).split('.');
+      total += BigInt(whole!) * 10n ** 18n + BigInt((frac + '0'.repeat(18)).slice(0, 18));
+    }
+    const s = total.toString().padStart(19, '0');
+    return `${s.slice(0, -18)}.${s.slice(-18)}`.replace(/\.?0+$/, '') || '0';
+  }
+
   /** Largest holders of a fungible resource (Gateway extension endpoint). */
   async resourceHolders(resource: string, limit = 20): Promise<{ address: string; amount: string }[]> {
     const j = await this.post('/extensions/resource-holders/page', { resource_address: resource, limit_per_page: limit });

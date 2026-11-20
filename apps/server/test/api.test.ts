@@ -86,3 +86,15 @@ test('resting orders appear in the book on the right side at the right price', (
   assert.deepEqual(asks, [{ price: 0.1, size: 100, source: 'orders' }]);
   assert.deepEqual(bids, [{ price: 0.09, size: 100, source: 'orders' }]);
 });
+
+test('an order that keeps failing to fill is dropped, with growing delays in between', async () => {
+  const o = await order();
+  const { json } = await call('POST', '/api/orders', o.body);
+  assert.equal(app.store.noteFailure(json.id, 'boom', 100), 1);
+  assert.equal(app.store.get(json.id)!.retryAt, 100);
+  assert.equal(app.store.noteFailure(json.id, 'boom', 200), 2);
+  assert.equal(app.store.noteFailure(json.id, 'boom', 300), 3);
+  assert.equal(app.store.markCancelled(json.id, 'Dropped after 3 failed fills'), true);
+  assert.equal(app.store.get(json.id)!.status, 'cancelled');
+  assert.equal(app.store.noteFailure(json.id, 'late', 400), 3, 'a closed order no longer counts failures');
+});

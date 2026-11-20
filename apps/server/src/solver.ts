@@ -18,6 +18,7 @@ export function loadSolverKey(path: string): Ed25519Key {
 const FEE_LOCK_XRD = '10';
 /** Rough network cost of a fill, charged to the order in the bought token. */
 const GAS_XRD = '1';
+const MAX_FILL_FAILURES = 3;
 
 /** Fills open orders: against each other when they cross, otherwise through pools when the price is there. */
 export class Solver {
@@ -55,9 +56,7 @@ export class Solver {
   };
 
   private async balance(account: string, resource: string): Promise<Decimal> {
-    const [d] = await this.gateway.entityDetails([account]);
-    const item = d?.fungible_resources?.items?.find((i: any) => i.resource_address === resource);
-    return new Decimal(item?.amount ?? 0);
+    return new Decimal(await this.gateway.fungibleBalance(account, resource));
   }
 
   private async window() {
@@ -80,9 +79,17 @@ export class Solver {
     return out.status === 'CommittedSuccess' ? { ok: true, txid: tx.intentHashId } : { ok: false, error: `${out.status}: ${out.error}` };
   }
 
+  /**
+   * Record a failed fill. Each failure costs the solver a network fee, so retries back off
+   * (1, 4, 16 minutes) and the order is dropped after the third: otherwise anyone could bleed
+   * the solver's float with orders built to fail.
+   */
   private fail(orders: StoredOrder[], error: string): void {
-    const retryAt = Math.floor(Date.now() / 1000) + 60;
-    for (const o of orders) this.store.noteFailure(o.id, error, retryAt);
+    const now = Math.floor(Date.now() / 1000);
+    for (const o of orders) {
+      const failures = this.store.noteFailure(o.id, error, now + 60 * 4 ** Math.min(o.failures, 5));
+      if (failures >= MAX_FILL_FAILURES) this.store.markCancelled(o.id, `Dropped after ${failures} failed fills: ${error}`);
+    }
     console.warn(`[solver] ${orders.map((o) => o.id.slice(-8)).join('+')}: ${error.slice(0, 200)}`);
   }
 

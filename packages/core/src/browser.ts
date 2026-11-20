@@ -4,3 +4,4 @@ export * from './manifest.ts';
 export * from './orders.ts';
 export * from './orderkey.ts';
 export { routePath } from './quote.ts';
+export { marketKey } from './markets.ts';

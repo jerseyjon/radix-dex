@@ -20,11 +20,12 @@ export interface StoredOrder {
   received: string | null;
   lastError: string | null;
   retryAt: number;
+  failures: number;
 }
 
 const COLUMNS = `id, account, sell, sell_amount AS sellAmount, buy, min_buy_amount AS minBuyAmount, order_key AS orderKeyHex,
   expires_at AS expiresAt, created_at AS createdAt, status, spt_hex AS signedPartialTransactionHex,
-  fill_tx AS fillTx, received, last_error AS lastError, retry_at AS retryAt`;
+  fill_tx AS fillTx, received, last_error AS lastError, retry_at AS retryAt, failures`;
 
 /** Orders in SQLite. All statements are parameterised. */
 export class OrderStore {
@@ -39,14 +40,15 @@ export class OrderStore {
         id TEXT PRIMARY KEY, account TEXT NOT NULL, sell TEXT NOT NULL, sell_amount TEXT NOT NULL,
         buy TEXT NOT NULL, min_buy_amount TEXT NOT NULL, order_key TEXT NOT NULL,
         expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, status TEXT NOT NULL,
-        spt_hex TEXT NOT NULL, fill_tx TEXT, received TEXT, last_error TEXT, retry_at INTEGER NOT NULL DEFAULT 0
+        spt_hex TEXT NOT NULL, fill_tx TEXT, received TEXT, last_error TEXT, retry_at INTEGER NOT NULL DEFAULT 0,
+        failures INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS orders_status ON orders(status, created_at);
       CREATE INDEX IF NOT EXISTS orders_account ON orders(account, created_at);
     `);
   }
 
-  insert(o: Omit<StoredOrder, 'status' | 'fillTx' | 'received' | 'lastError' | 'retryAt'>): boolean {
+  insert(o: Omit<StoredOrder, 'status' | 'fillTx' | 'received' | 'lastError' | 'retryAt' | 'failures'>): boolean {
     const r = this.db.prepare(`INSERT OR IGNORE INTO orders
       (id, account, sell, sell_amount, buy, min_buy_amount, order_key, expires_at, created_at, status, spt_hex)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`)
@@ -76,18 +78,20 @@ export class OrderStore {
   }
 
   /** Only an open order can change state, so a filled order can never be re-opened or re-labelled. */
-  private close(id: string, status: OrderStatus, fillTx: string | null, received: string | null): boolean {
-    const r = this.db.prepare(`UPDATE orders SET status = ?, fill_tx = ?, received = ?, last_error = NULL WHERE id = ? AND status = 'open'`).run(status, fillTx, received, id);
+  private close(id: string, status: OrderStatus, fillTx: string | null, received: string | null, note: string | null = null): boolean {
+    const r = this.db.prepare(`UPDATE orders SET status = ?, fill_tx = ?, received = ?, last_error = ? WHERE id = ? AND status = 'open'`).run(status, fillTx, received, note, id);
     return Number(r.changes) === 1;
   }
   markFilled(id: string, fillTx: string, received: string | null) { return this.close(id, 'filled', fillTx, received); }
-  markCancelled(id: string) { return this.close(id, 'cancelled', null, null); }
+  markCancelled(id: string, note: string | null = null) { return this.close(id, 'cancelled', null, null, note?.slice(0, 500) ?? null); }
 
   expire(nowSec: number): number {
     return Number(this.db.prepare(`UPDATE orders SET status = 'expired' WHERE status = 'open' AND expires_at <= ?`).run(nowSec).changes);
   }
 
-  noteFailure(id: string, error: string, retryAt: number): void {
-    this.db.prepare(`UPDATE orders SET last_error = ?, retry_at = ? WHERE id = ? AND status = 'open'`).run(error.slice(0, 500), retryAt, id);
+  /** Returns the order's failure count after this one. */
+  noteFailure(id: string, error: string, retryAt: number): number {
+    this.db.prepare(`UPDATE orders SET last_error = ?, retry_at = ?, failures = failures + 1 WHERE id = ? AND status = 'open'`).run(error.slice(0, 500), retryAt, id);
+    return this.get(id)?.failures ?? 0;
   }
 }
