@@ -9,6 +9,18 @@ export interface Candle { time: number; open: number; high: number; low: number;
 const RESOLUTIONS: Record<string, string> = { '5m': '5', '15m': '15', '1h': '60', '4h': '240', '1d': '1D', '1w': 'W' };
 const RES_SECONDS: Record<string, number> = { '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400, '1w': 604800 };
 
+/** Is this one of the candle resolutions served? Own keys only: `__proto__` and `toString` are not resolutions. */
+export const isResolution = (r: string): boolean => Object.hasOwn(RESOLUTIONS, r);
+
+/**
+ * Make a candle self-consistent: the high is at least the open and the close, the low at most.
+ * Ociswap's feed opens each bar at the previous bar's close but takes the high and low from the
+ * bar's own trades only, so a bar with one trade can have its open outside its high-low range.
+ */
+export function normaliseCandle(c: Candle): Candle {
+  return { ...c, high: Math.max(c.open, c.high, c.close), low: Math.min(c.open, c.low, c.close) };
+}
+
 class TtlCache<V> {
   private readonly map = new Map<string, { at: number; value: Promise<V> }>();
   private readonly ttlMs: number;
@@ -91,6 +103,17 @@ export class MarketData {
     return this.markets.find((m) => m.id === id);
   }
 
+  /** A token's symbol for log lines, or the start of its address. */
+  symbol(resource: string): string {
+    const m = this.markets.find((x) => x.base.address === resource || x.quote.address === resource);
+    return this.tokens.get(resource)?.symbol ?? (m ? (m.base.address === resource ? m.base.symbol : m.quote.symbol) : resource.slice(0, 16) + '…');
+  }
+
+  /** Do these two tokens form a market the site lists? Only such pairs are accepted and filled. */
+  isListedPair(a: string, b: string): boolean {
+    return this.markets.some((m) => (m.base.address === a && m.quote.address === b) || (m.base.address === b && m.quote.address === a));
+  }
+
   private readonly xrdRates = new Map<string, { at: number; perXrd: Decimal | undefined }>();
 
   /**
@@ -106,7 +129,8 @@ export class MarketData {
       const probe = '10';
       const q = await this.quoter.best(this.pools, xrd, resource, probe, xrd).catch(() => undefined);
       rate = { at: Date.now(), perXrd: q ? new Decimal(q.buyAmount).div(probe) : undefined };
-      this.xrdRates.set(resource, rate);
+      // A failed probe is not remembered: one Gateway blip must not stop every fill in this token for two minutes.
+      if (rate.perXrd) this.xrdRates.set(resource, rate);
     }
     return rate.perXrd?.mul(xrdAmount).toFixed(18);
   }
@@ -132,7 +156,8 @@ export class MarketData {
   venueTrades(market: Market): Promise<(LedgerSwap & { venue: string })[]> {
     return this.tradesCache.get(market.id, async () => {
       const pools = [...market.pools].sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 3);
-      const lists = await Promise.all(pools.map((p) => this.gateway.swapsAt(p.address, market.base.address, market.quote.address).catch(() => [] as LedgerSwap[])));
+      // Only the pool's own holdings count as its side of a trade: its component, or the native pool that holds its funds.
+      const lists = await Promise.all(pools.map((p) => this.gateway.swapsAt(p.address, market.base.address, market.quote.address, 30, [p.address, ...(p.holders ?? [])]).catch(() => [] as LedgerSwap[])));
       const seen = new Set<string>(), out: (LedgerSwap & { venue: string })[] = [];
       // A transaction through two of these pools turns up in both lists: keep each swap once.
       lists.forEach((list, i) => { for (const s of list) { const k = s.txid + s.entity; if (!seen.has(k)) { seen.add(k); out.push({ ...s, venue: pools[i]!.venue }); } } });
@@ -143,8 +168,8 @@ export class MarketData {
   /** Candles for a market, as the ratio of the two tokens' USD series from Ociswap's chart feed. */
   candles(market: Market, resolution: string, count = 300): Promise<Candle[]> {
     if (this.config.network.name !== 'mainnet') return Promise.resolve(this.sampledCandles(market, resolution, count));
-    const res = RESOLUTIONS[resolution];
-    if (!res) return Promise.reject(new Error(`Unsupported resolution "${resolution}"`));
+    if (!isResolution(resolution)) return Promise.reject(new Error(`Unsupported resolution "${resolution}"`));
+    const res = RESOLUTIONS[resolution]!;
     return this.candleCache.get(`${market.id}|${resolution}`, async () => {
       const to = Math.floor(Date.now() / 1000);
       const from = to - RES_SECONDS[resolution]! * count;
@@ -181,7 +206,7 @@ export class MarketData {
         }
       }
       candles.sort((x, y) => x.time - y.time);
-      return candles.filter((c) => [c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v) && v > 0));
+      return candles.filter((c) => [c.open, c.high, c.low, c.close].every((v) => Number.isFinite(v) && v > 0)).map(normaliseCandle);
     });
   }
 
@@ -201,8 +226,8 @@ export class MarketData {
 
   /** Candles built from the sampled mid prices. No volume: these are quotes, not trades. */
   private sampledCandles(market: Market, resolution: string, count: number): Candle[] {
-    const step = RES_SECONDS[resolution];
-    if (!step) throw new Error(`Unsupported resolution "${resolution}"`);
+    if (!isResolution(resolution)) throw new Error(`Unsupported resolution "${resolution}"`);
+    const step = RES_SECONDS[resolution]!;
     const out = new Map<number, Candle>();
     for (const s of this.samples.get(market.id) ?? []) {
       const time = Math.floor(s.time / step) * step;

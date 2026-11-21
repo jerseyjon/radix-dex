@@ -35,6 +35,33 @@ export interface Config {
   ratePerMinute: number;
   /** Optional second listener over https (the Radix Connector extension needs https off localhost). */
   tls: { port: number; keyFile: string; certFile: string } | undefined;
+  /** Loss limit: the solver stops sending when network fees paid on failed transactions in the last hour reach this (XRD). */
+  failedFeeLimitXrd: number;
+  /** An account whose orders failed this many times in 24 hours may not post orders, and its open orders are skipped, until the count falls. */
+  accountFailureLimit: number;
+  /** Most resting signed orders, and most on-ledger book orders, the solver looks at in one pass (market orders are not limited). */
+  maxRestingPerTick: number;
+  maxBookPerTick: number;
+  /** Book orders worth less than this many XRD are not bought by the solver with its own funds (they cannot pay their network fee). */
+  minBookOrderXrd: number;
+  /** /api/health reports the solver as low on funds below this XRD balance. */
+  lowXrd: number;
+}
+
+/** A whole number from the environment, or the default; anything else is a start-up error rather than a silent NaN. */
+function int(env: NodeJS.ProcessEnv, name: string, dflt: number, min: number, max: number): number {
+  const v = env[name];
+  if (v === undefined || v === '') return dflt;
+  if (!/^\d+$/.test(v.trim()) || Number(v) < min || Number(v) > max) throw new Error(`${name} must be a whole number from ${min} to ${max}, not "${v}"`);
+  return Number(v);
+}
+
+/** A non-negative decimal number from the environment, or the default. */
+function num(env: NodeJS.ProcessEnv, name: string, dflt: number, max: number): number {
+  const v = env[name];
+  if (v === undefined || v === '') return dflt;
+  if (!/^\d+(\.\d+)?$/.test(v.trim()) || Number(v) > max) throw new Error(`${name} must be a number from 0 to ${max}, not "${v}"`);
+  return Number(v);
 }
 
 /**
@@ -50,16 +77,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const name = (env.DEX_NETWORK ?? 'mainnet') as NetworkName;
   const network = NETWORKS[name];
   if (!network) throw new Error(`Unknown DEX_NETWORK "${name}"`);
-  const feeBps = Number(env.DEX_TAKER_FEE_BPS ?? env.DEX_FEE_BPS ?? 10);
-  const makerFeeBps = Number(env.DEX_MAKER_FEE_BPS ?? 0);
-  for (const f of [feeBps, makerFeeBps]) if (!(f >= 0 && f <= 100)) throw new Error('Fees must be between 0 and 100 basis points');
+  const feeBps = env.DEX_TAKER_FEE_BPS !== undefined ? int(env, 'DEX_TAKER_FEE_BPS', 10, 0, 100) : int(env, 'DEX_FEE_BPS', 10, 0, 100);
+  const makerFeeBps = int(env, 'DEX_MAKER_FEE_BPS', 0, 0, 100);
   return {
     network,
     gatewayUrl: env.DEX_GATEWAY_URL ?? network.gatewayUrl,
-    port: Number(env.DEX_PORT ?? 8787),
+    port: int(env, 'DEX_PORT', 8787, 0, 65535),
     host: env.DEX_HOST ?? '127.0.0.1',
     dataDir: env.DEX_DATA_DIR ?? 'data',
-    minPoolTvlUsd: Number(env.DEX_MIN_POOL_TVL_USD ?? 300),
+    minPoolTvlUsd: num(env, 'DEX_MIN_POOL_TVL_USD', 300, 1e12),
     quotePriority: [...(name === 'mainnet' ? MAINNET_STABLES : []), network.xrd],
     feeBps,
     makerFeeBps,
@@ -68,13 +94,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     solverKeyFile: env.DEX_SOLVER_KEY_FILE,
     registry: env.DEX_REGISTRY,
     orderBook: env.DEX_ORDER_BOOK,
-    maxOrderLifetimeSec: Number(env.DEX_MAX_ORDER_LIFETIME_SEC ?? 30 * 86400),
-    maxOpenOrdersPerAccount: Number(env.DEX_MAX_OPEN_ORDERS ?? 50),
+    maxOrderLifetimeSec: int(env, 'DEX_MAX_ORDER_LIFETIME_SEC', 30 * 86400, 60, 365 * 86400),
+    maxOpenOrdersPerAccount: int(env, 'DEX_MAX_OPEN_ORDERS', 50, 1, 10_000),
     marketsFile: env.DEX_MARKETS_FILE,
     dAppDefinition: env.DEX_DAPP_DEFINITION,
     clientIpHeader: env.DEX_CLIENT_IP_HEADER,
-    ratePerMinute: Number(env.DEX_RATE_PER_MINUTE ?? 240),
+    ratePerMinute: int(env, 'DEX_RATE_PER_MINUTE', 240, 1, 1_000_000),
     tls: env.DEX_TLS_KEY_FILE && env.DEX_TLS_CERT_FILE
-      ? { port: Number(env.DEX_TLS_PORT ?? 8443), keyFile: env.DEX_TLS_KEY_FILE, certFile: env.DEX_TLS_CERT_FILE } : undefined,
+      ? { port: int(env, 'DEX_TLS_PORT', 8443, 0, 65535), keyFile: env.DEX_TLS_KEY_FILE, certFile: env.DEX_TLS_CERT_FILE } : undefined,
+    failedFeeLimitXrd: num(env, 'DEX_FAILED_FEE_LIMIT_XRD', 3, 1e6),
+    accountFailureLimit: int(env, 'DEX_ACCOUNT_FAILURE_LIMIT', 6, 1, 1_000_000),
+    maxRestingPerTick: int(env, 'DEX_MAX_RESTING_PER_TICK', 20, 1, 10_000),
+    maxBookPerTick: int(env, 'DEX_MAX_BOOK_PER_TICK', 20, 1, 10_000),
+    minBookOrderXrd: num(env, 'DEX_MIN_BOOK_ORDER_XRD', 5, 1e9),
+    lowXrd: num(env, 'DEX_LOW_XRD', 30, 1e9),
   };
 }
