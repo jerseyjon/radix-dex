@@ -1,5 +1,5 @@
 import {
-  type Depth, type Gateway, type Market, type Pool, type Quote, type Token,
+  type Depth, type Gateway, type LedgerSwap, type Market, type Pool, type Quote, type Token,
   Quoter, buildMarkets, filterAllowedPools, listDefiPlaza, listOciswap, mergeDepth, tokensFromLedger, defaultJsonFetch, Decimal } from '@radix-dex/core';
 import { readFileSync } from 'node:fs';
 import type { Config } from './config.ts';
@@ -37,6 +37,7 @@ export class MarketData {
   readonly quoter: Quoter;
   private readonly quoteCache = new TtlCache<Quote | undefined>(8_000);
   private readonly depthCache = new TtlCache<Depth>(20_000);
+  private readonly tradesCache = new TtlCache<(LedgerSwap & { venue: string })[]>(15_000);
   private readonly candleCache = new TtlCache<Candle[]>(60_000);
   /** Mid-price samples per market, for networks with no chart feed. Kept in memory only. */
   private readonly samples = new Map<string, { time: number; price: number }[]>();
@@ -121,6 +122,21 @@ export class MarketData {
       const pools = [...market.pools].sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 3);
       const parts = await Promise.all(pools.map((p) => this.quoter.poolDepth(market, p).catch(() => ({ bids: [], asks: [] }))));
       return mergeDepth(market.id, parts);
+    });
+  }
+
+  /**
+   * Recent swaps in a market's three deepest pools, read from the ledger, each labelled with its venue.
+   * A pool that cannot be read is left out rather than failing the list.
+   */
+  venueTrades(market: Market): Promise<(LedgerSwap & { venue: string })[]> {
+    return this.tradesCache.get(market.id, async () => {
+      const pools = [...market.pools].sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 3);
+      const lists = await Promise.all(pools.map((p) => this.gateway.swapsAt(p.address, market.base.address, market.quote.address).catch(() => [] as LedgerSwap[])));
+      const seen = new Set<string>(), out: (LedgerSwap & { venue: string })[] = [];
+      // A transaction through two of these pools turns up in both lists: keep each swap once.
+      lists.forEach((list, i) => { for (const s of list) { const k = s.txid + s.entity; if (!seen.has(k)) { seen.add(k); out.push({ ...s, venue: pools[i]!.venue }); } } });
+      return out.sort((a, b) => b.time - a.time);
     });
   }
 

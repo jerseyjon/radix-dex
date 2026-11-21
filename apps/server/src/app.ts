@@ -25,17 +25,18 @@ const publicOrder = (o: StoredOrder) => ({
   limitBuyAmount: o.limitBuyAmount, kind: o.kind, expiresAt: o.expiresAt, createdAt: o.createdAt, status: o.status, fillTx: o.fillTx, received: o.received,
 });
 
-export interface MarketTrade { txid: string; time: number; side: 'buy' | 'sell'; price: number; size: number }
+/** `venue` is "here" for a trade made through this exchange, otherwise the pool's venue. */
+export interface MarketTrade { txid: string; time: number; side: 'buy' | 'sell'; price: number; size: number; venue: string }
 
 /**
  * Trades made on this exchange in one market, newest first: filled signed orders and purchases
  * from the on-ledger book. `side` is what the base token's seller or buyer did; one row per transaction.
  */
-export function marketTrades(market: Market, filled: StoredOrder[], bookOrders: BookOrder[], bookFills: { id: number; txid: string; time: number; sold: string; paid: string }[], limit = 60): MarketTrade[] {
+export function marketTrades(market: Market, filled: StoredOrder[], bookOrders: BookOrder[], bookFills: { id: number; txid: string; time: number; sold: string; paid: string }[], elsewhere: MarketTrade[] = [], limit = 60): MarketTrade[] {
   const base = market.base.address, quote = market.quote.address;
   const row = (txid: string, time: number, sell: string, sold: number, got: number): MarketTrade | undefined => {
     if (!(sold > 0) || !(got > 0)) return undefined;
-    return sell === base ? { txid, time, side: 'sell', price: got / sold, size: sold } : { txid, time, side: 'buy', price: sold / got, size: got };
+    return sell === base ? { txid, time, side: 'sell', price: got / sold, size: sold, venue: 'here' } : { txid, time, side: 'buy', price: sold / got, size: got, venue: 'here' };
   };
   const byTx = new Map<string, MarketTrade>();
   // The order that took liquidity names the trade: a market order before the resting order it met.
@@ -52,7 +53,8 @@ export function marketTrades(market: Market, filled: StoredOrder[], bookOrders: 
     const t = row(f.txid, f.time, o.sell, Number(f.sold), Number(f.paid));
     if (t) byTx.set(f.txid, { ...t, side: t.side === 'sell' ? 'buy' : 'sell' });
   }
-  return [...byTx.values()].sort((a, b) => b.time - a.time).slice(0, limit);
+  // A fill of ours that went through a pool is also a swap in that pool: show it once, as ours.
+  return [...byTx.values(), ...elsewhere.filter((t) => !byTx.has(t.txid))].sort((a, b) => b.time - a.time).slice(0, limit);
 }
 
 /** Resting orders as book levels for one market. */
@@ -167,7 +169,9 @@ export async function createApp(config: Config) {
   api.on('GET', '/api/trades', async ({ url }) => {
     const market = marketOr404(need(url.searchParams.get('market'), 'market'));
     await readBookSoon();
-    return marketTrades(market, store.recentFills(market.base.address, market.quote.address), book ? [...book.orders.values()] : [], book?.fills ?? []);
+    const elsewhere = await data.venueTrades(market).catch(() => []);
+    return marketTrades(market, store.recentFills(market.base.address, market.quote.address), book ? [...book.orders.values()] : [], book?.fills ?? [],
+      elsewhere.map(({ txid, time, side, price, size, venue }) => ({ txid, time, side, price, size, venue })));
   });
 
   // The account's own trades, read from the ledger: market orders and limit-order fills alike.

@@ -2,7 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
-import { NETWORKS, accountOf, keyFromHex, limitOrderManifest, orderKeyFromSecret, signSubintent } from '@radix-dex/core';
+import { NETWORKS, accountOf, keyFromHex, limitOrderManifest, orderKeyFromSecret, signSubintent, swapsInTransaction } from '@radix-dex/core';
 import { createApp, marketTrades, orderLevels } from '../src/app.ts';
 import { loadConfig } from '../src/config.ts';
 import { fillGasXrd } from '../src/solver.ts';
@@ -138,10 +138,24 @@ test('market trades: one row per transaction, priced in the quote token, on the 
   const trades = marketTrades(market,
     [o('limit', TUSD, '10', '100', 'tx1', 5), o('market', net.xrd, '100', '10', 'tx1', 6), o('market', TUSD, '5', '40', 'tx2', 9)],
     [{ id: 1, sell: TUSD, buy: net.xrd } as any],
-    [{ id: 1, txid: 'tx3', time: 7, sold: '2', paid: '25' }, { id: 1, txid: 'tx2', time: 9, sold: '1', paid: '10' }]);
+    [{ id: 1, txid: 'tx3', time: 7, sold: '2', paid: '25' }, { id: 1, txid: 'tx2', time: 9, sold: '1', paid: '10' }],
+    // Swaps read from the pools: one is our own fill again, one was made elsewhere.
+    [{ txid: 'tx2', time: 9, side: 'buy', price: 0.124, size: 40.3, venue: 'ociswap' }, { txid: 'tx9', time: 8, side: 'buy', price: 0.11, size: 7, venue: 'ociswap' }]);
   assert.deepEqual(trades, [
-    { txid: 'tx2', time: 9, side: 'buy', price: 0.125, size: 40 },
-    { txid: 'tx3', time: 7, side: 'sell', price: 0.08, size: 25 },
-    { txid: 'tx1', time: 6, side: 'sell', price: 0.1, size: 100 },
+    { txid: 'tx2', time: 9, side: 'buy', price: 0.125, size: 40, venue: 'here' },
+    { txid: 'tx9', time: 8, side: 'buy', price: 0.11, size: 7, venue: 'ociswap' },
+    { txid: 'tx3', time: 7, side: 'sell', price: 0.08, size: 25, venue: 'here' },
+    { txid: 'tx1', time: 6, side: 'sell', price: 0.1, size: 100, venue: 'here' },
   ]);
+});
+
+test('swaps are read from a transaction: opposite moves in a pool are a trade, liquidity changes are not', () => {
+  const ch = (entity_address: string, resource_address: string, balance_change: string) => ({ entity_address, resource_address, balance_change });
+  const tx = { transaction_status: 'CommittedSuccess', intent_hash: 'tx', confirmed_at: '2026-11-21T22:00:00.000Z', balance_changes: { fungible_balance_changes: [
+    ch('account_a', net.xrd, '-100'), ch('account_a', TUSD, '9.5'),
+    ch('pool_1', net.xrd, '100'), ch('pool_1', TUSD, '-9.6'), ch('component_fee', TUSD, '0.1'),
+    ch('pool_2', net.xrd, '50'), ch('pool_2', TUSD, '5'),
+  ] } };
+  assert.deepEqual(swapsInTransaction(tx, net.xrd, TUSD), [{ txid: 'tx', time: 1795298400, side: 'sell', price: 0.096, size: 100, entity: 'pool_1' }]);
+  assert.deepEqual(swapsInTransaction({ ...tx, transaction_status: 'CommittedFailure' }, net.xrd, TUSD), []);
 });

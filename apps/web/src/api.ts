@@ -28,8 +28,8 @@ export interface OrderView {
   outlook?: { available: string; needed: string; at: number } | null;
 }
 
-/** One trade made on this exchange in a market; `side` is the base token's taker side. */
-export interface MarketTrade { txid: string; time: number; side: 'buy' | 'sell'; price: number; size: number }
+/** One trade in a market; `side` is the base token's taker side, `venue` is "here" or the pool's venue. */
+export interface MarketTrade { txid: string; time: number; side: 'buy' | 'sell'; price: number; size: number; venue: string }
 export interface TradeView { txid: string; time: number; sell: string; sellAmount: string; buy: string; buyAmount: string; feeXrd: string;
   /** Set when this is a sale from the account's order in the on-ledger book: the order's number there. */
   book?: number }

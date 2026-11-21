@@ -35,7 +35,7 @@ export function Book({ depth, trades, explorer, baseSymbol, quoteSymbol, onPick 
           <button role="tab" aria-selected={tab === 'book'} className={tab === 'book' ? 'on' : ''} onClick={() => setTab('book')}>Order book</button>
           <button role="tab" aria-selected={tab === 'trades'} className={tab === 'trades' ? 'on' : ''} onClick={() => setTab('trades')}>Trades</button>
         </div>
-        <span className="muted small">{tab === 'book' ? 'pools + limit orders' : 'on this exchange'}</span>
+        <span className="muted small">{tab === 'book' ? 'pools + limit orders' : '● made here'}</span>
       </header>
       {tab === 'book' ? <>
         <div className="book-cols small muted"><span>Price ({quoteSymbol})</span><span>Size ({baseSymbol})</span><span>Total</span></div>
@@ -49,15 +49,16 @@ export function Book({ depth, trades, explorer, baseSymbol, quoteSymbol, onPick 
       </> : <>
         <div className="book-cols small muted"><span>Price ({quoteSymbol})</span><span>Size ({baseSymbol})</span><span>Time</span></div>
         <div className="trade-list">
-          {(trades ?? []).map((t) => (
-            <a key={t.txid} className={`book-row ${t.side === 'buy' ? 'bid' : 'ask'}`} href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer" title={`${t.side === 'buy' ? 'Bought' : 'Sold'} ${baseSymbol}. Open the transaction.`}>
+          {(trades ?? []).map((t, i) => (
+            <a key={t.txid + i} className={`book-row ${t.side === 'buy' ? 'bid' : 'ask'}`} href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer"
+              title={`${t.side === 'buy' ? 'Bought' : 'Sold'} ${baseSymbol} ${t.venue === 'here' ? 'on this exchange' : 'on ' + t.venue}. Open the transaction.`}>
               <span className="p">{fmtPrice(t.price)}</span>
               <span>{fmtAmount(t.size)}</span>
-              <span className="src">{clock(t.time)}</span>
+              <span className="src">{t.venue === 'here' ? '●' : ''}{clock(t.time)}</span>
             </a>
           ))}
           {trades === undefined && <p className="empty">Loading…</p>}
-          {trades?.length === 0 && <p className="empty">No trades on this exchange in this market yet.</p>}
+          {trades?.length === 0 && <p className="empty">No recent trades in this market.</p>}
         </div>
       </>}
     </section>

@@ -74,6 +74,14 @@ export class Gateway {
    * The account's most recent committed transactions with its own net balance change per
    * resource (network fees reported separately, in XRD).
    */
+  /** Recent swaps between `base` and `quote` in transactions that touched `component` (a pool), newest first. */
+  async swapsAt(component: string, base: string, quote: string, limit = 30): Promise<LedgerSwap[]> {
+    const j = await this.post('/stream/transactions', {
+      affected_global_entities_filter: [component], order: 'desc', limit_per_page: Math.min(limit, 100), opt_ins: { balance_changes: true },
+    });
+    return (j?.items ?? []).flatMap((t: any) => swapsInTransaction(t, base, quote));
+  }
+
   async accountActivity(account: string, limit = 40): Promise<{ txid: string; time: number; changes: Record<string, string>; feeXrd: string }[]> {
     const j = await this.post('/stream/transactions', {
       affected_global_entities_filter: [account], order: 'desc', limit_per_page: Math.min(limit, 100), opt_ins: { balance_changes: true },
@@ -176,3 +184,32 @@ export class Gateway {
     return (j.items ?? []).map((i: any) => ({ address: String(i.holder_address), amount: String(i.amount) }));
   }
 }
+
+/** One swap against a pool, read from a committed transaction. `side` is what the trader did with the base token. */
+export interface LedgerSwap { txid: string; time: number; side: 'buy' | 'sell'; price: number; size: number; entity: string }
+
+/**
+ * The swaps between `base` and `quote` inside one transaction of the Gateway's stream (with
+ * balance changes): every non-account entity whose holdings of the two moved in opposite
+ * directions took one side of a trade. Adding or removing liquidity moves both the same way and is ignored.
+ */
+export function swapsInTransaction(t: any, base: string, quote: string): LedgerSwap[] {
+  if (t?.transaction_status !== 'CommittedSuccess' || typeof t.intent_hash !== 'string') return [];
+  const time = Math.floor(Date.parse(t.confirmed_at ?? t.round_timestamp) / 1000);
+  const net = new Map<string, { b: number; q: number }>();
+  for (const c of t.balance_changes?.fungible_balance_changes ?? []) {
+    const entity = c?.entity_address, resource = c?.resource_address, change = Number(c?.balance_change);
+    if (typeof entity !== 'string' || entity.startsWith('account_') || !Number.isFinite(change) || (resource !== base && resource !== quote)) continue;
+    const n = net.get(entity) ?? { b: 0, q: 0 };
+    if (resource === base) n.b += change; else n.q += change;
+    net.set(entity, n);
+  }
+  const out: LedgerSwap[] = [];
+  for (const [entity, { b, q }] of net) {
+    if (!(b * q < 0) || !Number.isFinite(time)) continue;
+    // The pool gained base: a trader sold it. The pool lost base: a trader bought it.
+    out.push({ txid: t.intent_hash, time, side: b > 0 ? 'sell' : 'buy', price: Math.abs(q / b), size: Math.abs(b), entity });
+  }
+  return out;
+}
+
