@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { createApp } from './app.ts';
 import { loadConfig } from './config.ts';
 
@@ -22,4 +23,8 @@ if (config.network.name !== 'mainnet') {
 }
 
 api.listen(config.port, config.host);
+if (config.tls) {
+  api.listen(config.tls.port, config.host, { key: readFileSync(config.tls.keyFile), cert: readFileSync(config.tls.certFile) });
+  console.log(`also on https://${config.host}:${config.tls.port}`);
+}
 console.log(`radix-dex server on http://${config.host}:${config.port} (${config.network.name}, ${data.markets.length} markets, limit orders ${config.solverBadge ? 'on' : 'off'}, solver ${solver ? 'on' : 'off'})`);

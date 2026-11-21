@@ -50,6 +50,7 @@ depth and quotes but cannot trade.
 | `DEX_REGISTRY` | `OrderRegistry` component, to enable hard cancels | unset |
 | `DEX_MARKETS_FILE` | JSON of tokens and pools, for networks with no venue API | unset |
 | `DEX_DAPP_DEFINITION` | dApp definition account, so the wallet will connect | unset |
+| `DEX_TLS_KEY_FILE`, `DEX_TLS_CERT_FILE`, `DEX_TLS_PORT` | Also listen over https with this key and certificate | unset, unset, `8443` |
 
 ## Tests
 
@@ -66,8 +67,8 @@ scrypto/run.sh test                    # contract tests, including attempts to d
 
 The Radix Connector browser extension only runs on `https://` pages and on `http://localhost` or
 `http://127.0.0.1`. Opened by LAN address over plain http, the site reports the extension as
-missing. From another machine, forward the port (`ssh -L 8788:localhost:8788 user@host`) and
-open `http://localhost:8788`.
+missing. From another machine use the https listener (a self-signed
+certificate in `data/tls/` is enough for testing), or forward the port and open `http://localhost:8788`.
 
 ## Safety notes
 

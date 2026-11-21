@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer as createTlsServer } from 'node:https';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize, resolve } from 'node:path';
 
@@ -59,8 +60,9 @@ export class Api {
     }
   }
 
-  listen(port: number, host: string) {
-    const server = createServer(async (req, res) => {
+  /** Plain http, or https when a key and certificate are given. */
+  listen(port: number, host: string, tls?: { key: Buffer; cert: Buffer }) {
+    const handler = async (req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url ?? '/', 'http://localhost');
       const send = (status: number, body: unknown) => {
         res.writeHead(status, {
@@ -103,7 +105,8 @@ export class Api {
         console.error(`[http] ${req.method} ${url.pathname} failed:`, e);
         send(500, { error: 'Internal error' });
       }
-    });
+    };
+    const server = tls ? createTlsServer(tls, handler) : createServer(handler);
     server.listen(port, host);
     return server;
   }
