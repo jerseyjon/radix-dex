@@ -73,26 +73,40 @@ export function findCrosses(orders: OpenOrder[], feeBps: number, divisibility: (
 export const POOL_FILL_BUFFER_BPS = 5;
 
 /**
+ * Share of the network fee the solver will absorb on an order whose trigger is reached but whose
+ * signed allowance (trigger less minimum) falls a little short of the solver's current estimate.
+ * The trigger is the price the user was shown and promised; estimates move between signing and
+ * filling (a pool's swap cost changes with its state), so a small shortfall is the solver's to bear.
+ */
+export const GAS_SHORTFALL_TOLERANCE = 0.25;
+
+/**
  * Decide the solver's cut of a fill. `quotedOut` is everything the fill is expected to produce
  * for the order, `gasInBuyToken` the network fee expressed in the bought token.
  * The order fills only when the proceeds reach its trigger (`limitBuyAmount`, default the minimum).
- * The network fee always comes out of the proceeds. The service fee is cut back if needed so the
- * user stays above their signed minimum (plus `bufferBps`), and never takes them below it.
+ * The network fee comes out of the proceeds, never taking the user below their signed minimum
+ * (plus `bufferBps`). When that leaves less than the whole fee, the order still fills if the
+ * shortfall is within `gasShortfall` (a share of the fee) and the solver takes what there is.
+ * The service fee comes out of whatever is left after the network fee.
  */
-export function planPoolFill(o: { quotedOut: string; minBuyAmount: string; limitBuyAmount?: string; feeBps: number; gasInBuyToken: string; divisibility: number; bufferBps?: number }): { solverTake: string; userReceives: string } | undefined {
+export function planPoolFill(o: { quotedOut: string; minBuyAmount: string; limitBuyAmount?: string; feeBps: number; gasInBuyToken: string; divisibility: number; bufferBps?: number; gasShortfall?: number }): { solverTake: string; userReceives: string } | undefined {
   const out = new Decimal(o.quotedOut);
   if (o.limitBuyAmount !== undefined && out.lt(o.limitBuyAmount)) return undefined;
   const needed = new Decimal(o.minBuyAmount).mul(10_000 + (o.bufferBps ?? POOL_FILL_BUFFER_BPS)).div(10_000);
-  const surplus = out.minus(o.gasInBuyToken).minus(needed);
-  if (surplus.isNegative()) return undefined;
-  const fee = Decimal.min(out.mul(o.feeBps).div(10_000), surplus);
-  const take = floorTo(fee.plus(o.gasInBuyToken), o.divisibility);
+  const room = out.minus(needed);
+  const gas = new Decimal(o.gasInBuyToken);
+  const tolerance = Math.min(Math.max(o.gasShortfall ?? 0, 0), 1);
+  if (room.lt(gas.mul(1 - tolerance))) return undefined;
+  const gasTake = Decimal.min(gas, room);
+  const fee = Decimal.max(0, Decimal.min(out.mul(o.feeBps).div(10_000), room.minus(gasTake)));
+  const take = floorTo(fee.plus(gasTake), o.divisibility);
   return { solverTake: take.toFixed(), userReceives: out.minus(take).toFixed() };
 }
 
 /** The least a fill must produce, before fees, for `planPoolFill` to accept it. */
-export function grossNeeded(o: { minBuyAmount: string; limitBuyAmount?: string; gasInBuyToken: string; bufferBps?: number }): Decimal {
-  const floor = new Decimal(o.minBuyAmount).mul(10_000 + (o.bufferBps ?? POOL_FILL_BUFFER_BPS)).div(10_000).plus(o.gasInBuyToken);
+export function grossNeeded(o: { minBuyAmount: string; limitBuyAmount?: string; gasInBuyToken: string; bufferBps?: number; gasShortfall?: number }): Decimal {
+  const tolerance = Math.min(Math.max(o.gasShortfall ?? 0, 0), 1);
+  const floor = new Decimal(o.minBuyAmount).mul(10_000 + (o.bufferBps ?? POOL_FILL_BUFFER_BPS)).div(10_000).plus(new Decimal(o.gasInBuyToken).mul(1 - tolerance));
   return Decimal.max(floor, o.limitBuyAmount ?? 0);
 }
 
