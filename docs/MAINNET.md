@@ -45,3 +45,15 @@ from its own account, paying fees from the XRD sent to it.
 Split routing across several pools; splitting signed limit orders; an independent review of
 `OrderBook`; backups of the order database (`orders-mainnet.sqlite`: losing it loses open signed
 orders, not funds).
+
+## Taking out the solver's earnings
+
+The solver account's key is only on the server, so its funds are moved from there:
+
+    npx tsx scripts/mainnet-withdraw.ts            # balances and what would move; previewed, sends nothing
+    npx tsx scripts/mainnet-withdraw.ts --send     # send it to the owner account from the set-up
+
+It keeps 250 XRD in the solver (`--keep <n>` to change) as its float for network fees and for buying
+book orders, and sends the rest, with every other token collected as fees, to the owner account. The
+solver badge never moves. The balance can be watched at
+`https://dashboard.radixdlt.com/account/<solver account>`.
