@@ -133,6 +133,28 @@ export class Gateway {
   }
 
   /**
+   * Every fungible balance of an account, by resource address. Follows the pages: the entity-details
+   * call alone returns only the first hundred tokens, which for a busy account may not include XRD.
+   */
+  async fungibleBalances(account: string, maxPages = 20): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    const add = (items: any[]) => { for (const i of items ?? []) if (typeof i?.amount === 'string' && typeof i.resource_address === 'string') out[i.resource_address] = i.amount; };
+    const first = await this.post('/state/entity/details', { addresses: [account] });
+    const page = first.items?.[0]?.fungible_resources;
+    add(page?.items);
+    let cursor: string | undefined = page?.next_cursor ?? undefined;
+    const at = first.ledger_state?.state_version;
+    for (let n = 1; cursor && n < maxPages; n++) {
+      // Later pages must be read at the same ledger state as the first, or the cursor is refused.
+      const j = await this.post('/state/entity/page/fungibles/', { address: account, cursor, at_ledger_state: { state_version: at } });
+      add(j.items);
+      cursor = j.next_cursor ?? undefined;
+    }
+    if (cursor) throw new Error('Account holds more tokens than can be listed');
+    return out;
+  }
+
+  /**
    * An account's balance of one fungible resource, as a decimal string.
    * Asks for that resource's vaults directly, so it is right even for accounts holding hundreds of tokens
    * (the entity-details call only returns the first page of them).

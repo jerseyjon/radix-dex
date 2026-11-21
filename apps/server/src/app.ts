@@ -131,10 +131,7 @@ export async function createApp(config: Config) {
   api.on('GET', '/api/balances', async ({ url }) => {
     const account = need(url.searchParams.get('account'), 'account');
     if (!isAccount(account)) throw new HttpError(400, 'Bad account address');
-    const [d] = await gateway.entityDetails([account]);
-    const out: Record<string, string> = {};
-    for (const i of d?.fungible_resources?.items ?? []) if (typeof i.amount === 'string') out[i.resource_address] = i.amount;
-    return out;
+    return gateway.fungibleBalances(account);
   });
 
   api.on('GET', '/api/trades', ({ url }) => {
