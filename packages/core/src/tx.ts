@@ -1,5 +1,5 @@
 import {
-  PrivateKey, RadixEngineToolkit, TransactionV2Builder,
+  PrivateKey, RadixEngineToolkit, TransactionV2Builder, rawRadixEngineToolkit,
   type IntentCoreV2, type SignatureWithPublicKey, type SubintentV2,
 } from '@steleaio/radix-engine-toolkit';
 import type { Gateway } from './gateway.ts';
@@ -59,19 +59,30 @@ export interface DecodedOrder {
   /** Normalised manifest text as the toolkit prints it. */
   manifest: string;
   signedPartialTransactionHex: string;
+  /**
+   * The subintent exactly as signed, in the toolkit's raw form (64-bit numbers as text).
+   * `subintent` above goes through JavaScript numbers and loses precision on the intent
+   * discriminator, so it must never be hashed or re-encoded.
+   */
+  exactSubintent: unknown;
+  exactSignatures: unknown[];
 }
 
 /** Build and sign a subintent with a local key (tests, bots). Wallet users sign in the wallet instead. */
 export async function signSubintent(manifest: string, w: IntentWindow, key: Ed25519Key): Promise<DecodedOrder> {
-  const subintent: SubintentV2 = { intentCore: core(manifest, w) };
-  const hash = await RadixEngineToolkit.SubintentV2.hash(subintent);
-  const signature = key.signToSignatureWithPublicKey(hash.hash);
-  const compiled = await RadixEngineToolkit.SignedPartialTransactionV2.compile({
-    partialTransaction: { rootSubintent: subintent, nonRootSubintents: [] },
-    rootSubintentSignatures: [signature],
-    nonRootSubintentSignatures: [],
+  const raw = await rawRadixEngineToolkit;
+  const draft = await RadixEngineToolkit.SubintentV2.compile({ intentCore: core(manifest, w) });
+  const exact = raw.subintentV2Decompile({ compiled: toHex(draft), network_id: String(w.networkId) });
+  // A full 64-bit discriminator, as wallets produce.
+  exact.intent_core.header.intent_discriminator = BigInt('0x' + toHex(crypto.getRandomValues(new Uint8Array(8)))).toString();
+  const hash = raw.subintentV2Hash(exact);
+  const sig = key.signToSignatureWithPublicKey(fromHex(hash.hash)) as unknown as { signature: Uint8Array; publicKey: Uint8Array };
+  const compiled = raw.signedPartialTransactionV2Compile({
+    partial_transaction: { root_subintent: exact, non_root_subintents: [] },
+    root_subintent_signatures: [{ kind: 'Ed25519', value: { signature: toHex(sig.signature), public_key: toHex(sig.publicKey) } } as never],
+    non_root_subintent_signatures: [],
   });
-  return decodeSignedPartialTransaction(toHex(compiled), w.networkId);
+  return decodeSignedPartialTransaction(compiled, w.networkId);
 }
 
 /** Decompile what a wallet (or `signSubintent`) returned. Rejects anything with nested subintents. */
@@ -82,14 +93,20 @@ export async function decodeSignedPartialTransaction(hex: string, networkId: num
   if (subintent.intentCore.header.networkId !== networkId) throw new Error('Order is for a different network');
   if (subintent.intentCore.children.length !== 0) throw new Error('Orders must not declare children');
   if (subintent.intentCore.blobs.length !== 0) throw new Error('Orders must not carry blobs');
-  const hash = await RadixEngineToolkit.SubintentV2.hash(subintent);
+  // Hash the exact signed form, and insist the bytes are the canonical encoding of it.
+  const raw = await rawRadixEngineToolkit;
+  const exact = raw.signedPartialTransactionV2Decompile({ compiled: hex.toLowerCase(), network_id: String(networkId) });
+  if (raw.signedPartialTransactionV2Compile(exact).toLowerCase() !== hex.toLowerCase()) throw new Error('Order is not canonically encoded');
+  const hash = raw.subintentV2Hash(exact.partial_transaction.root_subintent);
   return {
     subintent,
     signatures: spt.rootSubintentSignatures,
-    hashHex: toHex(hash.hash),
+    hashHex: hash.hash.toLowerCase(),
     hashId: hash.id,
     manifest: subintent.intentCore.instructions,
     signedPartialTransactionHex: hex.toLowerCase(),
+    exactSubintent: exact.partial_transaction.root_subintent,
+    exactSignatures: exact.root_subintent_signatures,
   };
 }
 
@@ -117,15 +134,27 @@ export async function buildTransaction(o: {
 }): Promise<BuiltTransaction> {
   const children = Object.entries(o.children ?? {});
   const useChild = children.map(([name, c]) => `USE_CHILD NamedIntent("${name}") Intent("${c.hashId}");`);
-  const rootCore = core([...useChild, o.manifest].join('\n'), o.window, children.map(([, c]) => fromHex(c.hashHex)), o.blobs ?? []);
+  const rootManifest = [...useChild, o.manifest].join('\n');
+  const rootCore = core(rootManifest, o.window, children.map(([, c]) => fromHex(c.hashHex)), o.blobs ?? []);
   const builder = await TransactionV2Builder.new();
   let step = builder
     .header({ notaryPublicKey: o.notary.publicKey(), notaryIsSignatory: true, tipBasisPoints: o.tipBasisPoints ?? 0 })
     .rootIntentCore(rootCore);
   for (const [, c] of children) step = step.addSignedSubintent(c.subintent, c.signatures);
-  const notarized = await step.notarize(o.notary);
-  const hash = await RadixEngineToolkit.TransactionIntentV2.hash(notarized.signedTransactionIntent.transactionIntent);
-  return { hex: toHex(await RadixEngineToolkit.NotarizedTransactionV2.compile(notarized)), intentHashId: hash.id };
+  const draft = await RadixEngineToolkit.NotarizedTransactionV2.compile(await step.notarize(o.notary));
+  // The builder re-encodes the orders through JavaScript numbers. Put the exact signed orders
+  // back, then hash and notarise the result.
+  const raw = await rawRadixEngineToolkit;
+  const tx = raw.notarizedTransactionV2Decompile({ compiled: toHex(draft), network_id: String(o.window.networkId) });
+  const signed = tx.signed_transaction_intent;
+  // Decompiled text drops the USE_CHILD lines, so it would not compile again: use ours.
+  signed.transaction_intent.root_intent_core.instructions = rootManifest;
+  signed.transaction_intent.non_root_subintents = children.map(([, c]) => c.exactSubintent) as never;
+  signed.non_root_subintent_signatures = children.map(([, c]) => c.exactSignatures) as never;
+  const intentHash = raw.transactionIntentV2Hash(signed.transaction_intent);
+  const notarySig = o.notary.signToSignature(fromHex(raw.signedTransactionIntentV2Hash(signed).hash)) as unknown as { signature?: Uint8Array; bytes?: Uint8Array };
+  tx.notary_signature = { kind: 'Ed25519', value: toHex((notarySig.signature ?? notarySig.bytes)!) };
+  return { hex: raw.notarizedTransactionV2Compile(tx), intentHashId: intentHash.id };
 }
 
 export type TxOutcome = { status: 'CommittedSuccess' } | { status: 'CommittedFailure' | 'Rejected' | 'Timeout'; error: string };
