@@ -28,6 +28,8 @@ export interface OrderView {
   outlook?: { available: string; needed: string; at: number } | null;
 }
 
+/** One trade made on this exchange in a market; `side` is the base token's taker side. */
+export interface MarketTrade { txid: string; time: number; side: 'buy' | 'sell'; price: number; size: number }
 export interface TradeView { txid: string; time: number; sell: string; sellAmount: string; buy: string; buyAmount: string; feeXrd: string;
   /** Set when this is a sale from the account's order in the on-ledger book: the order's number there. */
   book?: number }
@@ -64,7 +66,7 @@ export const api = {
   balances: (account: string) => get<Record<string, string>>(`/api/balances?account=${q(account)}`),
   orders: (account: string) => get<OrderView[]>(`/api/orders?account=${q(account)}`),
   history: (account: string) => get<TradeView[]>(`/api/history?account=${q(account)}`),
-  trades: (id: string) => (STATIC ? Promise.resolve([] as OrderView[]) : get<OrderView[]>(`/api/trades?market=${q(id)}`)),
+  trades: (id: string) => (STATIC ? Promise.resolve([] as MarketTrade[]) : get<MarketTrade[]>(`/api/trades?market=${q(id)}`)),
   placeOrder: (body: unknown) => post<{ id: string; expiresAt: number }>('/api/orders', body),
   cancelOrder: (id: string, secret: string) => post<{ id: string }>(`/api/orders/${q(id)}/cancel`, { secret }),
 };

@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Depth } from '@radix-dex/core/browser';
-import { type Candle, type MarketSummary, type OrderView, type ServerConfig, type TradeView, STATIC, api } from './api';
+import { type Candle, type MarketSummary, type MarketTrade, type OrderView, type ServerConfig, type TradeView, STATIC, api } from './api';
 import { Book } from './Book';
 import { Chart } from './Chart';
+import { DepthChart } from './DepthChart';
 import { fmtPrice, fmtTime, fmtUsd, shortAddr } from './format';
 import { Markets } from './Markets';
 import { OrderForm } from './OrderForm';
@@ -37,6 +38,8 @@ export function App() {
   const [orders, setOrders] = useState<OrderView[]>([]);
   const [trades, setTrades] = useState<TradeView[]>([]);
   const [picked, setPicked] = useState<number>();
+  const [marketTrades, setMarketTrades] = useState<MarketTrade[]>();
+  const [chartTab, setChartTab] = useState<'price' | 'depth'>('price');
   const [toast, setToast] = useState<string>();
   const [fatal, setFatal] = useState<string>();
   const [showMarkets, setShowMarkets] = useState(false);
@@ -72,6 +75,13 @@ export function App() {
     const id = market.id;
     try { const d = await api.depth(id); setDepth((cur) => (id === market.id ? d : cur)); } catch { /* keep the last book */ }
   }, STATIC ? 3_600_000 : 20_000, [market?.id]);
+
+  useEffect(() => setMarketTrades(undefined), [market?.id]);
+  usePolling(async () => {
+    if (!market) return;
+    const id = market.id;
+    try { const t = await api.trades(id); setMarketTrades((cur) => (id === market.id ? t : cur)); } catch { /* keep the last list */ }
+  }, STATIC ? 3_600_000 : 10_000, [market?.id]);
 
   const refreshAccount = useCallback(async () => {
     if (!account || STATIC) { setBalances({}); setOrders([]); setTrades([]); return; }
@@ -129,16 +139,22 @@ export function App() {
       <main className="center">
         <section className="panel chart-panel">
           <header className="panel-head">
-            <h2>{market.base.symbol}/{market.quote.symbol}</h2>
-            <div className="seg mini">{RESOLUTIONS.map((r) => <button key={r} className={r === resolution ? 'on' : ''} onClick={() => setResolution(r)}>{r}</button>)}</div>
+            <div className="tabs" role="tablist">
+              <h2>{market.base.symbol}/{market.quote.symbol}</h2>
+              <button role="tab" aria-selected={chartTab === 'price'} className={chartTab === 'price' ? 'on' : ''} onClick={() => setChartTab('price')}>Price</button>
+              <button role="tab" aria-selected={chartTab === 'depth'} className={chartTab === 'depth' ? 'on' : ''} onClick={() => setChartTab('depth')}>Depth</button>
+            </div>
+            {chartTab === 'price'
+              ? <div className="seg mini">{RESOLUTIONS.map((r) => <button key={r} className={r === resolution ? 'on' : ''} onClick={() => setResolution(r)}>{r}</button>)}</div>
+              : <span className="muted small">cumulative {market.base.symbol} on offer, pools + limit orders</span>}
           </header>
-          <Chart candles={candles} loading={candlesLoading} />
+          {chartTab === 'price' ? <Chart candles={candles} loading={candlesLoading} /> : <DepthChart depth={depth} baseSymbol={market.base.symbol} onPick={setPicked} />}
         </section>
         <Orders orders={orders} trades={trades} explorer={config?.networkId === 1 ? 'https://dashboard.radixdlt.com' : 'https://stokenet-dashboard.radixdlt.com'} markets={markets} account={account} onChanged={refreshAccount} wallet={wallet} orderBook={config.orderBook} />
       </main>
 
       <div className="side">
-        <Book depth={depth} baseSymbol={market.base.symbol} quoteSymbol={market.quote.symbol} onPick={setPicked} />
+        <Book depth={depth} trades={marketTrades} explorer={config.networkId === 1 ? 'https://dashboard.radixdlt.com' : 'https://stokenet-dashboard.radixdlt.com'} baseSymbol={market.base.symbol} quoteSymbol={market.quote.symbol} onPick={setPicked} />
         <OrderForm market={market} depth={depth} config={config} wallet={wallet} account={account} balances={balances} pickedPrice={picked}
           onDone={(m) => { setToast(m); void refreshAccount(); }} />
       </div>

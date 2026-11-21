@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
 import { NETWORKS, accountOf, keyFromHex, limitOrderManifest, orderKeyFromSecret, signSubintent } from '@radix-dex/core';
-import { createApp, orderLevels } from '../src/app.ts';
+import { createApp, marketTrades, orderLevels } from '../src/app.ts';
 import { loadConfig } from '../src/config.ts';
 import { fillGasXrd } from '../src/solver.ts';
 
@@ -130,4 +130,18 @@ test('the network fee charged follows what the route costs to swap through', () 
   assert.equal(fillGasXrd(0, '0.92').toFixed(), '1.42', 'a costly pool is charged more');
   assert.equal(fillGasXrd(1, '0.5').toFixed(), '1.38');
   assert.equal(fillGasXrd(0, 'x').toFixed(), '1', 'an unreadable measurement falls back');
+});
+
+test('market trades: one row per transaction, priced in the quote token, on the side of whoever took it', () => {
+  const market = { id: 'm', base: { address: net.xrd, symbol: 'XRD', name: '' }, quote: { address: TUSD, symbol: 'TUSD', name: '' }, pools: [], tvlUsd: 0, volume24hUsd: 0 } as any;
+  const o = (kind: string, sell: string, sellAmount: string, received: string, fillTx: string, createdAt: number) => ({ kind, sell, buy: sell === net.xrd ? TUSD : net.xrd, sellAmount, received, fillTx, createdAt }) as any;
+  const trades = marketTrades(market,
+    [o('limit', TUSD, '10', '100', 'tx1', 5), o('market', net.xrd, '100', '10', 'tx1', 6), o('market', TUSD, '5', '40', 'tx2', 9)],
+    [{ id: 1, sell: TUSD, buy: net.xrd } as any],
+    [{ id: 1, txid: 'tx3', time: 7, sold: '2', paid: '25' }, { id: 1, txid: 'tx2', time: 9, sold: '1', paid: '10' }]);
+  assert.deepEqual(trades, [
+    { txid: 'tx2', time: 9, side: 'buy', price: 0.125, size: 40 },
+    { txid: 'tx3', time: 7, side: 'sell', price: 0.08, size: 25 },
+    { txid: 'tx1', time: 6, side: 'sell', price: 0.1, size: 100 },
+  ]);
 });

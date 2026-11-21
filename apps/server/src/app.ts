@@ -25,6 +25,36 @@ const publicOrder = (o: StoredOrder) => ({
   limitBuyAmount: o.limitBuyAmount, kind: o.kind, expiresAt: o.expiresAt, createdAt: o.createdAt, status: o.status, fillTx: o.fillTx, received: o.received,
 });
 
+export interface MarketTrade { txid: string; time: number; side: 'buy' | 'sell'; price: number; size: number }
+
+/**
+ * Trades made on this exchange in one market, newest first: filled signed orders and purchases
+ * from the on-ledger book. `side` is what the base token's seller or buyer did; one row per transaction.
+ */
+export function marketTrades(market: Market, filled: StoredOrder[], bookOrders: BookOrder[], bookFills: { id: number; txid: string; time: number; sold: string; paid: string }[], limit = 60): MarketTrade[] {
+  const base = market.base.address, quote = market.quote.address;
+  const row = (txid: string, time: number, sell: string, sold: number, got: number): MarketTrade | undefined => {
+    if (!(sold > 0) || !(got > 0)) return undefined;
+    return sell === base ? { txid, time, side: 'sell', price: got / sold, size: sold } : { txid, time, side: 'buy', price: sold / got, size: got };
+  };
+  const byTx = new Map<string, MarketTrade>();
+  // The order that took liquidity names the trade: a market order before the resting order it met.
+  for (const o of [...filled].sort((a, b) => Number(b.kind === 'market') - Number(a.kind === 'market'))) {
+    if (!o.fillTx || byTx.has(o.fillTx)) continue;
+    const t = row(o.fillTx, o.createdAt, o.sell, Number(o.sellAmount), Number(o.received));
+    if (t) byTx.set(o.fillTx, t);
+  }
+  const orders = new Map(bookOrders.map((o) => [o.id, o]));
+  for (const f of bookFills) {
+    const o = orders.get(f.id);
+    if (!o || byTx.has(f.txid) || !((o.sell === base && o.buy === quote) || (o.sell === quote && o.buy === base))) continue;
+    // The buyer took the resting order, so the trade is on the opposite side to the order.
+    const t = row(f.txid, f.time, o.sell, Number(f.sold), Number(f.paid));
+    if (t) byTx.set(f.txid, { ...t, side: t.side === 'sell' ? 'buy' : 'sell' });
+  }
+  return [...byTx.values()].sort((a, b) => b.time - a.time).slice(0, limit);
+}
+
 /** Resting orders as book levels for one market. */
 export function orderLevels(market: Market, open: StoredOrder[]): { bids: DepthLevel[]; asks: DepthLevel[] } {
   const bids: DepthLevel[] = [], asks: DepthLevel[] = [];
@@ -134,9 +164,10 @@ export async function createApp(config: Config) {
     return gateway.fungibleBalances(account);
   });
 
-  api.on('GET', '/api/trades', ({ url }) => {
+  api.on('GET', '/api/trades', async ({ url }) => {
     const market = marketOr404(need(url.searchParams.get('market'), 'market'));
-    return store.recentFills(market.base.address, market.quote.address).map(publicOrder);
+    await readBookSoon();
+    return marketTrades(market, store.recentFills(market.base.address, market.quote.address), book ? [...book.orders.values()] : [], book?.fills ?? []);
   });
 
   // The account's own trades, read from the ledger: market orders and limit-order fills alike.
