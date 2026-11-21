@@ -10,6 +10,9 @@ const net = NETWORKS.stokenet;
 const keys = JSON.parse(readFileSync('data/stokenet-keys.json', 'utf8'));
 writeFileSync('data/stokenet-solver.key', keys.solver, { mode: 0o600 });
 const app = await createApp(loadConfig({ DEX_NETWORK: 'stokenet', DEX_DATA_DIR: ':memory:', DEX_SOLVER_BADGE: keys.badge, DEX_SOLVER_KEY_FILE: 'data/stokenet-solver.key', DEX_FEE_BPS: '10', DEX_MAKER_FEE_BPS: '10' }));
+// The server only accepts orders in markets it lists. List XRD/TUSD with no pool, so the two orders
+// can only fill against each other (the figures checked below assume no pool leg).
+app.data.markets = [{ id: `${net.xrd}/${keys.tusd}`, base: { address: net.xrd, symbol: 'XRD', name: 'Radix' }, quote: { address: keys.tusd, symbol: 'TUSD', name: 'Test USD' }, pools: [], tvlUsd: 0, volume24hUsd: 0 }];
 const server = app.api.listen(0, '127.0.0.1');
 await new Promise((r) => server.once('listening', r));
 const base = `http://127.0.0.1:${(server.address() as any).port}`;

@@ -23,6 +23,8 @@ const app = await createApp(loadConfig({
   DEX_REGISTRY: s.registry, DEX_ORDER_BOOK: s.orderBookTest, DEX_MARKETS_FILE: 'data/stokenet-markets.json', DEX_TAKER_FEE_BPS: '10', DEX_MAKER_FEE_BPS: '0',
 }));
 await app.data.refresh();
+// Request handlers answer from the copy of the book they hold and never wait for the ledger: read it once first.
+await app.book!.refresh();
 const server = app.api.listen(0, '127.0.0.1');
 await new Promise((r) => server.once('listening', r));
 const base = 'http://127.0.0.1:' + (server.address() as any).port;

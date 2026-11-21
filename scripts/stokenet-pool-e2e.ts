@@ -115,8 +115,12 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
 
 // 3. Exchange-style limit order: it fills when the market reaches its price, and the fees come out of the proceeds.
 {
-  const q = Number((await json('/api/quote?sell=' + net.xrd + '&buy=' + s.tusd + '&amount=60')).buyAmount);
-  const terms = (gross: number) => ({ limitBuyAmount: n(gross), minBuyAmount: n(gross - gross / 60 - gross * 0.001) }); // less 1 XRD of network fee and 0.10%
+  const q60 = await json('/api/quote?sell=' + net.xrd + '&buy=' + s.tusd + '&amount=60');
+  const q = Number(q60.buyAmount);
+  // The signed minimum is the price less the network allowance the server quotes for this route (its fee estimate plus a margin) and 0.10%, as the site does.
+  const allowance = Number(q60.gasAllowanceInBuyToken);
+  expect(allowance > 0 && Number(q60.gasInBuyToken) > 0 && allowance > Number(q60.gasInBuyToken), 'the quote gives a network allowance (' + allowance.toFixed(6) + ' TUSD) above the fee estimate (' + Number(q60.gasInBuyToken).toFixed(6) + ')');
+  const terms = (gross: number) => ({ limitBuyAmount: n(gross), minBuyAmount: n(gross - allowance - gross * 0.001) });
   const above = await post(aliceKey, { sell: net.xrd, sellAmount: '60', buy: s.tusd, ...terms(q * 1.02) });
   const at = await post(aliceKey, { sell: net.xrd, sellAmount: '60', buy: s.tusd, ...terms(q * 0.9995) });
   const before = await balance(alice, s.tusd);
