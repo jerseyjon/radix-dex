@@ -223,7 +223,10 @@ export async function readBookEvents(gateway: Gateway, component: string, fromSt
       const time = Math.floor(Date.parse(t.confirmed_at ?? t.round_timestamp) / 1000);
       for (const e of t.receipt?.events ?? []) {
         // Only what the order book itself emitted: an event's name alone can be copied by any component.
+        // The component also emits events of its other modules (a metadata change, for one), which are not ours to read.
         if (e?.emitter?.entity?.entity_address !== component || !Array.isArray(e.data?.fields)) continue;
+        if (e.name !== 'OrderPlacedEvent' && e.name !== 'OrderFilledEvent') continue;
+        if (e.emitter.object_module_id && e.emitter.object_module_id !== 'Main') continue;
         const f = (name: string) => String(field(e.data.fields, name));
         const id = Number(f('id'));
         if (!Number.isSafeInteger(id)) continue;
