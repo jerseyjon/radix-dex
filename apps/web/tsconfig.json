@@ -4,5 +4,5 @@
     "jsx": "react-jsx", "strict": true, "noUncheckedIndexedAccess": true, "skipLibCheck": true,
     "allowImportingTsExtensions": true, "noEmit": true, "types": ["vite/client"]
   },
-  "include": ["src"]
+  "include": ["src", "test"]
 }
