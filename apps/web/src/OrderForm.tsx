@@ -218,7 +218,10 @@ export function OrderForm(props: {
           <div><dt>Moves into the order book</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>You receive, as it fills</dt><dd>{limitGross ? `${fmtAmount(Number(limitGross) * (1 - book.makerFeeBps / 10_000))} ${buyTok.symbol}` : '—'}</dd></div>
           <div><dt>Fee</dt><dd>{book.makerFeeBps > 0 ? pct(book.makerFeeBps) : 'None'}, plus the network fee to place it (about 0.8 XRD)</dd></div>
-          <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'The market already pays your price: it should fill soon' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
+          <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away, at your price' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
+          {fillsNow && quote && limitGross && (
+            <div><dt>Note</dt><dd className="warn">The market pays {fmtAmount(quote.buyAmount)} {buyTok.symbol} for this size now, more than the {fmtAmount(limitGross)} {buyTok.symbol} your price gives. An order filled in parts gets its own price and no better: the difference is kept by the exchange. For the market price, use a Market order{config.limitOrders.enabled ? ' or “Whole only”' : ''}.</dd></div>
+          )}
           <div><dt>Expires in</dt><dd><select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
         </dl>
       ) : (
