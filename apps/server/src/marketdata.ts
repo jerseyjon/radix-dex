@@ -116,8 +116,9 @@ export class MarketData {
 
   depth(market: Market): Promise<Depth> {
     return this.depthCache.get(market.id, async () => {
-      // Probe the two deepest pools; more would multiply Gateway load for little extra depth.
-      const pools = [...market.pools].sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 2);
+      // Probe the three deepest pools. Two was too few: a slightly smaller low-fee pool is where small
+      // orders really trade, and without it the book showed a spread nobody pays. More would multiply Gateway load.
+      const pools = [...market.pools].sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 3);
       const parts = await Promise.all(pools.map((p) => this.quoter.poolDepth(market, p).catch(() => ({ bids: [], asks: [] }))));
       return mergeDepth(market.id, parts);
     });
