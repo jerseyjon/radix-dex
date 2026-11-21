@@ -1,16 +1,24 @@
 import { useState } from 'react';
-import { type MarketSummary, type OrderView, api } from './api';
+import { type MarketSummary, type OrderView, type TradeView, api } from './api';
 import { fmtAmount, fmtPrice, fmtTime } from './format';
 import { secrets } from './OrderForm';
 
-export function Orders({ orders, markets, account, onChanged }: { orders: OrderView[]; markets: MarketSummary[]; account: string | undefined; onChanged: () => void }) {
-  const [tab, setTab] = useState<'open' | 'history'>('open');
+export function Orders({ orders, trades, explorer, markets, account, onChanged }: { orders: OrderView[]; trades: TradeView[]; explorer: string; markets: MarketSummary[]; account: string | undefined; onChanged: () => void }) {
+  const [tab, setTab] = useState<'open' | 'trades' | 'history'>('open');
   const [error, setError] = useState<string | undefined>();
   const symbol = new Map(markets.flatMap((m) => [[m.base.address, m.base.symbol], [m.quote.address, m.quote.symbol]] as [string, string][]));
   const sym = (a: string) => symbol.get(a) ?? a.slice(-6);
   const rows = orders.filter((o) => (tab === 'open' ? o.status === 'open' : o.status !== 'open'));
 
   // Show each order the way a trader reads it: side, price and size in the market's own terms.
+  // A completed trade from the ledger, in the market's own terms.
+  const describeTrade = (t: TradeView) => {
+    const m = markets.find((x) => (x.base.address === t.sell && x.quote.address === t.buy) || (x.base.address === t.buy && x.quote.address === t.sell));
+    const selling = m ? m.base.address === t.sell : true;
+    const size = Number(selling ? t.sellAmount : t.buyAmount), total = Number(selling ? t.buyAmount : t.sellAmount);
+    return { pair: m ? `${m.base.symbol}/${m.quote.symbol}` : `${sym(t.sell)}→${sym(t.buy)}`, side: selling ? 'Sell' : 'Buy', size, total, price: total / size, baseSym: m?.base.symbol ?? sym(t.sell), quoteSym: m?.quote.symbol ?? sym(t.buy) };
+  };
+
   const describe = (o: OrderView) => {
     const m = markets.find((x) => (x.base.address === o.sell && x.quote.address === o.buy) || (x.base.address === o.buy && x.quote.address === o.sell));
     const selling = m ? m.base.address === o.sell : true;
@@ -31,11 +39,35 @@ export function Orders({ orders, markets, account, onChanged }: { orders: OrderV
       <header className="panel-head">
         <div className="tabs">
           <button className={tab === 'open' ? 'on' : ''} onClick={() => setTab('open')}>Open orders ({orders.filter((o) => o.status === 'open').length})</button>
-          <button className={tab === 'history' ? 'on' : ''} onClick={() => setTab('history')}>Order history</button>
+          <button className={tab === 'trades' ? 'on' : ''} onClick={() => setTab('trades')}>Trades ({trades.length})</button>
+          <button className={tab === 'history' ? 'on' : ''} onClick={() => setTab('history')}>Limit order history</button>
         </div>
       </header>
       {error && <p className="error">{error}</p>}
-      {!account ? <p className="empty">Connect your wallet to see your orders.</p> : rows.length === 0 ? <p className="empty">{tab === 'open' ? 'No open orders.' : 'No past orders.'}</p> : (
+      {!account ? <p className="empty">Connect your wallet to see your orders.</p> : tab === 'trades' ? (trades.length === 0 ? <p className="empty">No completed trades yet.</p> : (
+        <div className="table-scroll">
+          <table>
+            <thead><tr><th>Time</th><th>Market</th><th>Side</th><th className="r">Price</th><th className="r">Size</th><th className="r">Total</th><th className="r">Network fee</th><th /></tr></thead>
+            <tbody>
+              {trades.map((t) => {
+                const d = describeTrade(t);
+                return (
+                  <tr key={t.txid}>
+                    <td>{fmtTime(t.time)}</td>
+                    <td>{d.pair}</td>
+                    <td className={d.side === 'Buy' ? 'up' : 'down'}>{d.side}</td>
+                    <td className="r">{fmtPrice(d.price)}</td>
+                    <td className="r">{fmtAmount(d.size)} {d.baseSym}</td>
+                    <td className="r">{fmtAmount(d.total)} {d.quoteSym}</td>
+                    <td className="r">{Number(t.feeXrd) > 0 ? `${fmtAmount(t.feeXrd)} XRD` : 'paid for you'}</td>
+                    <td className="r"><a className="link" href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer">View</a></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )) : rows.length === 0 ? <p className="empty">{tab === 'open' ? 'No open orders.' : 'No filled, cancelled or expired limit orders.'}</p> : (
         <div className="table-scroll">
           <table>
             <thead><tr><th>Placed</th><th>Market</th><th>Side</th><th className="r">Price</th><th className="r">Size</th><th>{tab === 'open' ? 'Expires' : 'Status'}</th><th /></tr></thead>

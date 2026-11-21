@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Depth } from '@radix-dex/core/browser';
-import { type Candle, type MarketSummary, type OrderView, type ServerConfig, STATIC, api } from './api';
+import { type Candle, type MarketSummary, type OrderView, type ServerConfig, type TradeView, STATIC, api } from './api';
 import { Book } from './Book';
 import { Chart } from './Chart';
 import { fmtPrice, fmtTime, fmtUsd, shortAddr } from './format';
@@ -35,6 +35,7 @@ export function App() {
   const [account, setAccount] = useState<string>();
   const [balances, setBalances] = useState<Record<string, string>>({});
   const [orders, setOrders] = useState<OrderView[]>([]);
+  const [trades, setTrades] = useState<TradeView[]>([]);
   const [picked, setPicked] = useState<number>();
   const [toast, setToast] = useState<string>();
   const [fatal, setFatal] = useState<string>();
@@ -73,8 +74,9 @@ export function App() {
   }, STATIC ? 3_600_000 : 20_000, [market?.id]);
 
   const refreshAccount = useCallback(async () => {
-    if (!account || STATIC) { setBalances({}); setOrders([]); return; }
-    const [b, o] = await Promise.allSettled([api.balances(account), api.orders(account)]);
+    if (!account || STATIC) { setBalances({}); setOrders([]); setTrades([]); return; }
+    const [b, o, t] = await Promise.allSettled([api.balances(account), api.orders(account), api.history(account)]);
+    if (t.status === 'fulfilled') setTrades(t.value);
     if (b.status === 'fulfilled') setBalances(b.value);
     if (o.status === 'fulfilled') setOrders(o.value);
   }, [account]);
@@ -131,7 +133,7 @@ export function App() {
           </header>
           <Chart candles={candles} loading={candlesLoading} />
         </section>
-        <Orders orders={orders} markets={markets} account={account} onChanged={refreshAccount} />
+        <Orders orders={orders} trades={trades} explorer={config?.networkId === 1 ? 'https://dashboard.radixdlt.com' : 'https://stokenet-dashboard.radixdlt.com'} markets={markets} account={account} onChanged={refreshAccount} />
       </main>
 
       <div className="side">

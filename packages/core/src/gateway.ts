@@ -71,6 +71,30 @@ export class Gateway {
   }
 
   /**
+   * The account's most recent committed transactions with its own net balance change per
+   * resource (network fees reported separately, in XRD).
+   */
+  async accountActivity(account: string, limit = 40): Promise<{ txid: string; time: number; changes: Record<string, string>; feeXrd: string }[]> {
+    const j = await this.post('/stream/transactions', {
+      affected_global_entities_filter: [account], order: 'desc', limit_per_page: Math.min(limit, 100), opt_ins: { balance_changes: true },
+    });
+    const out: { txid: string; time: number; changes: Record<string, string>; feeXrd: string }[] = [];
+    for (const t of j?.items ?? []) {
+      if (t?.transaction_status !== 'CommittedSuccess' || typeof t.intent_hash !== 'string') continue;
+      const changes: Record<string, string> = {};
+      for (const c of t.balance_changes?.fungible_balance_changes ?? []) {
+        if (c?.entity_address === account && typeof c.resource_address === 'string') changes[c.resource_address] = String(c.balance_change);
+      }
+      let fee = 0;
+      for (const c of t.balance_changes?.fungible_fee_balance_changes ?? []) {
+        if (c?.entity_address === account && c.type === 'FeePayment') fee += Math.abs(Number(c.balance_change));
+      }
+      out.push({ txid: t.intent_hash, time: Math.floor(Date.parse(t.confirmed_at ?? t.round_timestamp) / 1000), changes, feeXrd: String(fee) });
+    }
+    return out;
+  }
+
+  /**
    * Preview a V1 manifest with free fee credit and all signatures assumed.
    * Nothing is submitted. Used for quoting against real pools.
    */

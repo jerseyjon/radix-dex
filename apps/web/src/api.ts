@@ -16,6 +16,8 @@ export interface OrderView {
   expiresAt: number; createdAt: number; status: 'open' | 'filled' | 'cancelled' | 'expired'; fillTx: string | null; received: string | null;
 }
 
+export interface TradeView { txid: string; time: number; sell: string; sellAmount: string; buy: string; buyAmount: string; feeXrd: string }
+
 /** Static preview builds read pre-generated JSON instead of a live server. */
 export const STATIC = import.meta.env.VITE_STATIC === '1';
 const BASE = import.meta.env.BASE_URL;
@@ -47,6 +49,7 @@ export const api = {
   quote: (sell: string, buy: string, amount: string) => get<QuoteResult>(`/api/quote?sell=${q(sell)}&buy=${q(buy)}&amount=${q(amount)}`),
   balances: (account: string) => get<Record<string, string>>(`/api/balances?account=${q(account)}`),
   orders: (account: string) => get<OrderView[]>(`/api/orders?account=${q(account)}`),
+  history: (account: string) => get<TradeView[]>(`/api/history?account=${q(account)}`),
   trades: (id: string) => (STATIC ? Promise.resolve([] as OrderView[]) : get<OrderView[]>(`/api/trades?market=${q(id)}`)),
   placeOrder: (body: unknown) => post<{ id: string; expiresAt: number }>('/api/orders', body),
   cancelOrder: (id: string, secret: string) => post<{ id: string }>(`/api/orders/${q(id)}/cancel`, { secret }),

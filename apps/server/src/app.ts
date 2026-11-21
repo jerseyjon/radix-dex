@@ -101,6 +101,27 @@ export async function createApp(config: Config) {
     return store.recentFills(market.base.address, market.quote.address).map(publicOrder);
   });
 
+  // The account's own trades, read from the ledger: market orders and limit-order fills alike.
+  // A trade is a transaction where the account's balance of one listed token fell and another rose.
+  const historyCache = new Map<string, { at: number; value: unknown }>();
+  api.on('GET', '/api/history', async ({ url }) => {
+    const account = need(url.searchParams.get('account'), 'account');
+    if (!isAccount(account)) throw new HttpError(400, 'Bad account address');
+    const hit = historyCache.get(account);
+    if (hit && Date.now() - hit.at < 5_000) return hit.value;
+    const listed = new Set(data.markets.flatMap((m) => [m.base.address, m.quote.address]));
+    const trades = [];
+    for (const t of await gateway.accountActivity(account)) {
+      const moved = Object.entries(t.changes).filter(([r, v]) => listed.has(r) && Number(v) !== 0);
+      const out = moved.filter(([, v]) => Number(v) < 0), inn = moved.filter(([, v]) => Number(v) > 0);
+      if (out.length !== 1 || inn.length !== 1) continue;
+      trades.push({ txid: t.txid, time: t.time, sell: out[0]![0], sellAmount: out[0]![1].replace('-', ''), buy: inn[0]![0], buyAmount: inn[0]![1], feeXrd: t.feeXrd });
+    }
+    if (historyCache.size > 500) historyCache.clear();
+    historyCache.set(account, { at: Date.now(), value: trades });
+    return trades;
+  });
+
   api.on('GET', '/api/orders', ({ url }) => {
     const account = need(url.searchParams.get('account'), 'account');
     if (!isAccount(account)) throw new HttpError(400, 'Bad account address');
