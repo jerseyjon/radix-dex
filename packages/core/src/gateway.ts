@@ -26,22 +26,47 @@ export class Gateway {
   readonly network: NetworkConfig;
   private readonly fetchFn: FetchLike;
   private readonly url: string;
+  private readonly timeoutMs: number;
+  private readonly attempts: number;
+  /** Calls that failed after every retry, and the most recent such failure: for the operator's health view. */
+  failures = 0;
+  lastFailure: { at: number; path: string; message: string } | undefined;
 
-  constructor(network: NetworkConfig, opts: { url?: string; fetch?: FetchLike } = {}) {
+  /**
+   * `timeoutMs` and `attempts` bound how long one call can take: about attempts × timeoutMs plus
+   * short back-offs. Request handlers should use a client with small values, so a slow Gateway
+   * cannot hold a visitor's request for a minute.
+   */
+  constructor(network: NetworkConfig, opts: { url?: string; fetch?: FetchLike; timeoutMs?: number; attempts?: number } = {}) {
     this.network = network;
     this.url = (opts.url ?? network.gatewayUrl).replace(/\/$/, '');
     this.fetchFn = opts.fetch ?? (globalThis.fetch as unknown as FetchLike);
+    this.timeoutMs = opts.timeoutMs ?? 20_000;
+    this.attempts = Math.max(1, opts.attempts ?? 3);
   }
 
   async post(path: string, body: unknown): Promise<any> {
+    try {
+      return await this.postOnce(path, body);
+    } catch (e) {
+      // A 4xx is the caller's mistake (or a normal "not found"), not the Gateway failing.
+      if (!(e instanceof GatewayError && e.status < 500 && e.status !== 429)) {
+        this.failures++;
+        this.lastFailure = { at: Date.now(), path, message: String((e as Error)?.message ?? e).slice(0, 300) };
+      }
+      throw e;
+    }
+  }
+
+  private async postOnce(path: string, body: unknown): Promise<any> {
     let lastErr: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < this.attempts; attempt++) {
       try {
         const res = await this.fetchFn(this.url + path, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(20_000),
+          signal: AbortSignal.timeout(this.timeoutMs),
         });
         const text = await res.text();
         if (!res.ok) {
@@ -55,7 +80,7 @@ export class Gateway {
         if (e instanceof GatewayError && e.status < 500 && e.status !== 429) throw e;
         lastErr = e;
       }
-      await new Promise((r) => setTimeout(r, 300 * 2 ** attempt));
+      if (attempt + 1 < this.attempts) await new Promise((r) => setTimeout(r, 300 * 2 ** attempt));
     }
     throw lastErr;
   }
@@ -71,17 +96,20 @@ export class Gateway {
   }
 
   /**
-   * The account's most recent committed transactions with its own net balance change per
-   * resource (network fees reported separately, in XRD).
+   * Recent swaps between `base` and `quote` in transactions that touched `component` (a pool), newest first.
+   * Only movements of `holders` count as the pool's side of a trade (see `swapsInTransaction`).
    */
-  /** Recent swaps between `base` and `quote` in transactions that touched `component` (a pool), newest first. */
-  async swapsAt(component: string, base: string, quote: string, limit = 30): Promise<LedgerSwap[]> {
+  async swapsAt(component: string, base: string, quote: string, limit = 30, holders: string[] = [component]): Promise<LedgerSwap[]> {
     const j = await this.post('/stream/transactions', {
       affected_global_entities_filter: [component], order: 'desc', limit_per_page: Math.min(limit, 100), opt_ins: { balance_changes: true },
     });
-    return (j?.items ?? []).flatMap((t: any) => swapsInTransaction(t, base, quote));
+    return (j?.items ?? []).flatMap((t: any) => swapsInTransaction(t, base, quote, new Set(holders)));
   }
 
+  /**
+   * The account's most recent committed transactions with its own net balance change per
+   * resource (network fees reported separately, in XRD).
+   */
   async accountActivity(account: string, limit = 40): Promise<{ txid: string; time: number; changes: Record<string, string>; feeXrd: string }[]> {
     const j = await this.post('/stream/transactions', {
       affected_global_entities_filter: [account], order: 'desc', limit_per_page: Math.min(limit, 100), opt_ins: { balance_changes: true },
@@ -129,6 +157,52 @@ export class Gateway {
       }
     }
     return { ok, error: ok ? undefined : String(receipt.error_message ?? receipt.status), feeXrd: fee.toFixed(6), changes, raw: j };
+  }
+
+  /**
+   * Preview a whole V2 transaction exactly as it would be submitted (a compiled PreviewTransactionV2,
+   * see `BuiltTransaction.previewHex`): the same root intent, the same signed children, signers given
+   * by public key. No free credit and no assumed signatures, so the fee lock and every withdrawal
+   * are checked as they would be on ledger. Nothing is submitted.
+   */
+  async previewV2(previewHex: string): Promise<{ ok: boolean; status: string; error?: string; feeXrd: string }> {
+    const j = await this.post('/transaction/preview-v2', {
+      preview_transaction: { type: 'Compiled', preview_transaction_hex: previewHex },
+      flags: { use_free_credit: false, assume_all_signature_proofs: false, skip_epoch_check: false, disable_auth_checks: false },
+      opt_ins: { core_api_receipt: true },
+    });
+    const receipt = j?.receipt;
+    if (!receipt || typeof receipt.status !== 'string') throw new Error('Preview response has no receipt');
+    const fs = receipt.fee_summary ?? {};
+    const fee = ['xrd_total_execution_cost', 'xrd_total_finalization_cost', 'xrd_total_royalty_cost', 'xrd_total_storage_cost', 'xrd_total_tipping_cost']
+      .reduce((a, k) => a + Number(fs[k] ?? 0), 0);
+    const ok = receipt.status === 'Succeeded';
+    return { ok, status: receipt.status, error: ok ? undefined : String(receipt.error_message ?? receipt.status), feeXrd: fee.toFixed(6) };
+  }
+
+  /** Hand a notarised transaction to the network. Throws if the Gateway refuses it or cannot be reached. */
+  async submitTransaction(hex: string): Promise<void> {
+    await this.post('/transaction/submit', { notarized_transaction_hex: hex });
+  }
+
+  /**
+   * Where a transaction stands. `Pending` covers everything not yet final, including "not seen":
+   * only the intent's expiry turns that into a certain "never committed".
+   */
+  async transactionStatus(intentHashId: string): Promise<{ status: 'CommittedSuccess' | 'CommittedFailure' | 'Rejected' | 'Pending'; error?: string }> {
+    const s = await this.post('/transaction/status', { intent_hash: intentHashId });
+    const error = String(s?.error_message ?? s?.intent_status_description ?? '');
+    if (s?.intent_status === 'CommittedSuccess') return { status: 'CommittedSuccess' };
+    if (s?.intent_status === 'CommittedFailure') return { status: 'CommittedFailure', error };
+    if (s?.intent_status === 'PermanentlyRejected') return { status: 'Rejected', error };
+    return { status: 'Pending', error };
+  }
+
+  /** The network fee a committed transaction paid, in XRD, or undefined if the Gateway does not say. */
+  async committedFee(intentHashId: string): Promise<string | undefined> {
+    const j = await this.post('/transaction/committed-details', { intent_hash: intentHashId, opt_ins: {} });
+    const fee = j?.transaction?.fee_paid;
+    return typeof fee === 'string' && /^\d+(\.\d+)?$/.test(fee) ? fee : undefined;
   }
 
   async entityDetails(addresses: string[]): Promise<any[]> {
@@ -190,16 +264,20 @@ export interface LedgerSwap { txid: string; time: number; side: 'buy' | 'sell'; 
 
 /**
  * The swaps between `base` and `quote` inside one transaction of the Gateway's stream (with
- * balance changes): every non-account entity whose holdings of the two moved in opposite
- * directions took one side of a trade. Adding or removing liquidity moves both the same way and is ignored.
+ * balance changes): an entity in `holders` (a pool's own component, or the native pool that holds
+ * its funds) whose holdings of the two moved in opposite directions took one side of a trade.
+ * Any other component is ignored: an aggregator or arbitrage contract passing both tokens through
+ * on a longer route is not a trade in this market. Adding or removing liquidity moves both the
+ * same way and is ignored. Without `holders`, every non-account entity counts (old behaviour).
  */
-export function swapsInTransaction(t: any, base: string, quote: string): LedgerSwap[] {
+export function swapsInTransaction(t: any, base: string, quote: string, holders?: Set<string>): LedgerSwap[] {
   if (t?.transaction_status !== 'CommittedSuccess' || typeof t.intent_hash !== 'string') return [];
   const time = Math.floor(Date.parse(t.confirmed_at ?? t.round_timestamp) / 1000);
   const net = new Map<string, { b: number; q: number }>();
   for (const c of t.balance_changes?.fungible_balance_changes ?? []) {
     const entity = c?.entity_address, resource = c?.resource_address, change = Number(c?.balance_change);
     if (typeof entity !== 'string' || entity.startsWith('account_') || !Number.isFinite(change) || (resource !== base && resource !== quote)) continue;
+    if (holders && !holders.has(entity)) continue;
     const n = net.get(entity) ?? { b: 0, q: 0 };
     if (resource === base) n.b += change; else n.q += change;
     net.set(entity, n);

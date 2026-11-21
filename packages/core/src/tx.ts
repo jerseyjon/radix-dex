@@ -121,6 +121,48 @@ export interface BuiltTransaction {
   hex: string;
   /** txid_… */
   intentHashId: string;
+  /**
+   * The same transaction as a compiled PreviewTransactionV2 (for the Gateway's /transaction/preview-v2):
+   * the exact intent, root and children, with each child's signer given by public key.
+   */
+  previewHex: string;
+}
+
+/** LEB128 length prefix, as SBOR writes sizes. */
+const sborSize = (n: number): number[] => {
+  const out: number[] = [];
+  do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n);
+  return out;
+};
+
+/** Manifest SBOR body of a PublicKey::Ed25519 enum value inside an array of enums (no value kind byte). */
+const ed25519KeyBody = (key: Uint8Array): number[] => {
+  if (key.length !== 32) throw new Error('Ed25519 public key must be 32 bytes');
+  // Variant 1 (Ed25519), one field: [u8; 32] as Array<U8>.
+  return [0x01, 0x01, 0x20, 0x07, ...sborSize(32), ...key];
+};
+
+/**
+ * Compile a PreviewTransactionV2 payload (radix-transactions `PreviewTransactionV2`) from a compiled
+ * TransactionIntentV2. The toolkit has no function for it, so it is written out here:
+ *   0x4d (manifest SBOR) 0x22 (enum) 0x0f (V2PreviewTransaction) 3 fields:
+ *     transaction_intent as a tuple, root_signer_public_keys: Array<PublicKey>,
+ *     non_root_subintent_signer_public_keys: Array<Array<PublicKey>>.
+ * The notary needs no entry: the node adds it when the header says it is a signatory.
+ */
+export function previewTransactionV2Hex(compiledIntentHex: string, rootSigners: Uint8Array[], childSigners: Uint8Array[][]): string {
+  const intent = fromHex(compiledIntentHex);
+  // A compiled TransactionIntentV2 is 0x4d 0x22 0x09 then its fields; inside another value it is a tuple.
+  if (intent[0] !== 0x4d || intent[1] !== 0x22 || intent[2] !== 0x09) throw new Error('Not a compiled TransactionIntentV2');
+  const bytes: number[] = [0x4d, 0x22, 0x0f, 0x03, 0x21, ...intent.subarray(3)];
+  bytes.push(0x20, 0x22, ...sborSize(rootSigners.length));
+  for (const k of rootSigners) bytes.push(...ed25519KeyBody(k));
+  bytes.push(0x20, 0x20, ...sborSize(childSigners.length));
+  for (const keys of childSigners) {
+    bytes.push(0x22, ...sborSize(keys.length));
+    for (const k of keys) bytes.push(...ed25519KeyBody(k));
+  }
+  return toHex(Uint8Array.from(bytes));
 }
 
 /**
@@ -154,7 +196,14 @@ export async function buildTransaction(o: {
   const intentHash = raw.transactionIntentV2Hash(signed.transaction_intent);
   const notarySig = o.notary.signToSignature(fromHex(raw.signedTransactionIntentV2Hash(signed).hash)) as unknown as { signature?: Uint8Array; bytes?: Uint8Array };
   tx.notary_signature = { kind: 'Ed25519', value: toHex((notarySig.signature ?? notarySig.bytes)!) };
-  return { hex: raw.notarizedTransactionV2Compile(tx), intentHashId: intentHash.id };
+  // Each child is signed by one Ed25519 key (the order validator insists on it); preview with that key.
+  const childSigners = children.map(([, c]) => c.signatures.map((s) => {
+    const sig = s as { curve?: string; publicKey?: Uint8Array };
+    if (sig.curve !== 'Ed25519' || !(sig.publicKey instanceof Uint8Array)) throw new Error('Only Ed25519-signed children can be previewed');
+    return sig.publicKey;
+  }));
+  const previewHex = previewTransactionV2Hex(raw.transactionIntentV2Compile(signed.transaction_intent), [], childSigners);
+  return { hex: raw.notarizedTransactionV2Compile(tx), intentHashId: intentHash.id, previewHex };
 }
 
 export type TxOutcome = { status: 'CommittedSuccess' } | { status: 'CommittedFailure' | 'Rejected' | 'Timeout'; error: string };

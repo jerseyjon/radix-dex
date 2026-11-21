@@ -40,6 +40,8 @@ export class Quoter {
   private epoch: { value: number; at: number } | undefined;
   /** Why the most recent failed simulation failed; for diagnostics only. */
   lastFailure: string | undefined;
+  /** Quotes that could not be made because a call failed (as opposed to finding no route). Only ever grows. */
+  errors = 0;
 
   constructor(gateway: Gateway) {
     this.gateway = gateway;
@@ -136,7 +138,7 @@ export class Quoter {
   /** Best single route by amount received. */
   async best(pools: Pool[], sell: string, buy: string, sellAmount: string | Decimal, hub: string): Promise<Quote | undefined> {
     const routes = this.candidateRoutes(pools, sell, buy, hub);
-    const quotes = await Promise.all(routes.map((r) => this.simulate(r, sell, sellAmount).catch(() => undefined)));
+    const quotes = await Promise.all(routes.map((r) => this.simulate(r, sell, sellAmount).catch((e) => { this.errors++; this.lastFailure = String((e as Error)?.message ?? e).slice(0, 200); return undefined; })));
     let best: Quote | undefined;
     for (const q of quotes) if (q && (!best || new Decimal(q.buyAmount).gt(best.buyAmount))) best = q;
     return best;

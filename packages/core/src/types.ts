@@ -46,6 +46,12 @@ export interface Pool {
   volume24hUsd: number;
   /** Roughly half the pool's value expressed in tokens[0] and in tokens[1]. Used only to size depth probes. */
   reserves: [number, number];
+  /**
+   * Native pool entities (`pool_…`) named in the component's own state, which hold its funds for
+   * it (Ociswap basic pools, DefiPlaza pairs). Read from the ledger; used to recognise the pool's
+   * side of a trade in a transaction.
+   */
+  holders?: string[];
 }
 
 export interface Market {

@@ -117,7 +117,21 @@ export async function filterAllowedPools(gateway: Gateway, pools: Pool[], allowe
     const rule = allowed[d?.details?.package_address];
     if (rule && rule.blueprint === d?.details?.blueprint_name) ok.add(d.address);
   }
-  return pools.filter((p) => ok.has(p.address) && allowed[detailsPackage(details, p.address)]?.venue === p.venue);
+  return pools.filter((p) => ok.has(p.address) && allowed[detailsPackage(details, p.address)]?.venue === p.venue)
+    .map((p) => ({ ...p, holders: nativePoolsIn(details.find((d) => d.address === p.address)) }));
+}
+
+/** Every native pool address (`pool_…`) the component's state names: the pools that hold its funds. */
+export function nativePoolsIn(detail: any): string[] {
+  const found = new Set<string>();
+  const walk = (v: unknown, depth: number) => {
+    if (depth > 12) return;
+    if (typeof v === 'string') { if (/^pool_(rdx|tdx_2_|sim)1[a-z0-9]{20,80}$/.test(v)) found.add(v); return; }
+    if (Array.isArray(v)) { for (const x of v) walk(x, depth + 1); return; }
+    if (v && typeof v === 'object') for (const x of Object.values(v)) walk(x, depth + 1);
+  };
+  walk(detail?.details?.state, 0);
+  return [...found];
 }
 
 function detailsPackage(details: any[], address: string): string {

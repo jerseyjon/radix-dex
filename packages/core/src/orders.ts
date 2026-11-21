@@ -1,3 +1,4 @@
+import type { Gateway } from './gateway.ts';
 import { Decimal, addr, bucket, dec } from './manifest.ts';
 import type { Pool } from './types.ts';
 import { routeInstructions, routePath } from './quote.ts';
@@ -46,6 +47,22 @@ export function limitOrderManifest(p: LimitOrderParams): string {
     `YIELD_TO_PARENT;`,
   );
   return lines.join('\n');
+}
+
+/**
+ * Has this order key been cancelled in the on-ledger registry? Asks the ledger by previewing the
+ * very call every order makes (`assert_live`), so nothing is assumed about the registry's storage.
+ * Undefined when the answer could not be had (Gateway error, or the preview failed for another reason).
+ */
+export async function orderKeyCancelled(gateway: Gateway, registry: string, orderKeyHex: string, epoch?: number): Promise<boolean | undefined> {
+  if (!HEX32.test(orderKeyHex)) throw new Error('order key must be 32 bytes of lowercase hex');
+  try {
+    const res = await gateway.preview(`CALL_METHOD ${addr(registry)} "assert_live" Bytes("${orderKeyHex}");`, epoch ?? (await gateway.status()).epoch);
+    if (res.ok) return false;
+    return /cancelled/i.test(res.error ?? '') ? true : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface MarketOrderParams {
