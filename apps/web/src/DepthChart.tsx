@@ -1,9 +1,10 @@
 import { useEffect, useRef } from 'react';
 import type { Depth } from '@radix-dex/core/browser';
 import { fmtAmount, fmtPrice } from './format';
+import { chartTheme, tag } from './theme';
 
 // Cumulative depth on a canvas: bids stepping down to the left of the mid price, asks stepping up to the right.
-const UP = '#1fbf8f', DOWN = '#f0506e', GRID = '#171c25', AXIS = '#1e2430', TEXT = '#7a8494';
+// Colours come from styles.css through chartTheme().
 const AXIS_W = 72, AXIS_H = 22, PAD_TOP = 14;
 
 interface Step { price: number; total: number }
@@ -47,19 +48,21 @@ export function DepthChart({ depth, baseSymbol, onPick }: { depth: Depth | undef
       const x = (p: number) => ((p - lo) / (hi - lo)) * plotW;
       const y = (t: number) => plotH - (t / top) * (plotH - PAD_TOP);
 
-      g.font = '11px Inter, system-ui, sans-serif';
+      const th = chartTheme(cv);
+      g.font = '11px ' + th.font;
       g.textBaseline = 'middle';
+      g.lineWidth = 1;
       for (let i = 1; i <= 4; i++) {
         const t = (top / 1.08) * (i / 4), yy = Math.round(y(t)) + 0.5;
-        g.strokeStyle = GRID; g.beginPath(); g.moveTo(0, yy); g.lineTo(plotW, yy); g.stroke();
-        g.fillStyle = TEXT; g.textAlign = 'left'; g.fillText(fmtAmount(t), plotW + 8, yy);
+        g.strokeStyle = th.grid; g.beginPath(); g.moveTo(0, yy); g.lineTo(plotW, yy); g.stroke();
+        g.fillStyle = th.text; g.textAlign = 'left'; g.fillText(fmtAmount(t), plotW + 8, yy);
       }
       g.textAlign = 'center';
       for (let i = 0; i <= 4; i++) {
         const p = lo + ((hi - lo) * i) / 4, xx = Math.min(plotW - 30, Math.max(30, x(p)));
-        g.fillStyle = TEXT; g.fillText(fmtPrice(p), xx, plotH + AXIS_H / 2);
+        g.fillStyle = th.text; g.fillText(fmtPrice(p), xx, plotH + AXIS_H / 2 + 1);
       }
-      g.strokeStyle = AXIS; g.beginPath(); g.moveTo(0, plotH + 0.5); g.lineTo(w, plotH + 0.5); g.moveTo(plotW + 0.5, 0); g.lineTo(plotW + 0.5, plotH); g.stroke();
+      g.strokeStyle = th.axis; g.beginPath(); g.moveTo(0, plotH + 0.5); g.lineTo(w, plotH + 0.5); g.moveTo(plotW + 0.5, 0); g.lineTo(plotW + 0.5, plotH); g.stroke();
 
       // A level's size is on offer from the previous level's price out to its own: draw each as a step.
       const area = (steps: Step[], colour: string) => {
@@ -77,12 +80,12 @@ export function DepthChart({ depth, baseSymbol, onPick }: { depth: Depth | undef
         }
         g.strokeStyle = colour; g.lineWidth = 1.5; g.stroke(); g.lineWidth = 1;
         g.lineTo(px, y(0)); g.closePath();
-        g.globalAlpha = 0.14; g.fillStyle = colour; g.fill(); g.globalAlpha = 1;
+        g.globalAlpha = 0.12; g.fillStyle = colour; g.fill(); g.globalAlpha = 1;
       };
-      area(bids, UP);
-      area(asks, DOWN);
+      area(bids, th.up);
+      area(asks, th.down);
 
-      g.setLineDash([3, 3]); g.strokeStyle = TEXT; g.beginPath(); g.moveTo(Math.round(x(mid)) + 0.5, 0); g.lineTo(Math.round(x(mid)) + 0.5, plotH); g.stroke(); g.setLineDash([]);
+      g.setLineDash([2, 3]); g.strokeStyle = th.crosshair; g.beginPath(); g.moveTo(Math.round(x(mid)) + 0.5, 0); g.lineTo(Math.round(x(mid)) + 0.5, plotH); g.stroke(); g.setLineDash([]);
 
       const m = mouse.current;
       if (m && m.x >= 0 && m.x <= plotW) {
@@ -90,11 +93,13 @@ export function DepthChart({ depth, baseSymbol, onPick }: { depth: Depth | undef
         const side = price < mid ? bids : asks;
         const reached = side.filter((s) => (price < mid ? s.price >= price : s.price <= price)).at(-1);
         const total = reached?.total ?? 0;
-        g.strokeStyle = TEXT; g.beginPath(); g.moveTo(Math.round(m.x) + 0.5, 0); g.lineTo(Math.round(m.x) + 0.5, plotH); g.stroke();
+        g.strokeStyle = th.crosshair; g.setLineDash([3, 3]);
+        g.beginPath(); g.moveTo(Math.round(m.x) + 0.5, 0); g.lineTo(Math.round(m.x) + 0.5, plotH); g.stroke(); g.setLineDash([]);
         const label = `${fmtPrice(price)}  ·  ${fmtAmount(total)} ${baseSymbol}`;
-        const tw = g.measureText(label).width + 14, lx = Math.max(4, Math.min(plotW - tw - 4, m.x - tw / 2));
-        g.fillStyle = '#161b24'; g.fillRect(lx, 4, tw, 20); g.strokeStyle = AXIS; g.strokeRect(lx + 0.5, 4.5, tw, 20);
-        g.fillStyle = '#d9dee7'; g.textAlign = 'left'; g.fillText(label, lx + 7, 14);
+        const tw = g.measureText(label).width + 16, lx = Math.max(4, Math.min(plotW - tw - 4, m.x - tw / 2));
+        g.fillStyle = th.label; tag(g, lx, 6, tw, 22, 4);
+        g.fillStyle = price < mid ? th.up : th.down; g.fillRect(lx, 10, 2, 14);
+        g.fillStyle = th.strong; g.textAlign = 'left'; g.fillText(label, lx + 8, 17);
       }
     };
     redraw.current = draw;
@@ -120,7 +125,7 @@ export function DepthChart({ depth, baseSymbol, onPick }: { depth: Depth | undef
   return (
     <div className="chart-wrap">
       <canvas ref={canvas} className="chart" aria-label="Depth chart: cumulative size on offer at each price" />
-      {!depth && <div className="chart-note">Loading depth…</div>}
+      {!depth && <div className="chart-note"><span className="loader" aria-hidden="true" />Loading depth</div>}
       {empty && <div className="chart-note">No liquidity found for this market</div>}
     </div>
   );

@@ -10,7 +10,7 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "test": "tsx --test packages/core/test/*.test.ts apps/server/test/*.test.ts",
+    "test": "tsx --test packages/core/test/*.test.ts apps/server/test/*.test.ts apps/web/test/*.test.ts",
     "server": "tsx apps/server/src/main.ts",
     "web": "npm run dev -w apps/web",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p scripts/tsconfig.json --noEmit",

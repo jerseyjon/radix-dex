@@ -3,14 +3,19 @@ import { bookCancelManifest } from '@radix-dex/core/browser';
 import { type MarketSummary, type OrderView, type ServerConfig, type TradeView, api } from './api';
 import { fmtAmount, fmtPrice, fmtTime } from './format';
 import { secrets } from './OrderForm';
+import { registryCancelManifest } from './registry';
+import { Empty, Icon, TabPanel, Tabs } from './ui';
 import type { Wallet } from './wallet';
 
-export function Orders({ orders, trades, explorer, markets, account, onChanged, wallet, orderBook }: {
+export function Orders({ orders, trades, explorer, markets, account, onChanged, wallet, orderBook, registry }: {
   orders: OrderView[]; trades: TradeView[]; explorer: string; markets: MarketSummary[]; account: string | undefined; onChanged: () => void;
   wallet?: Wallet; orderBook?: ServerConfig['orderBook'];
+  /** The hard-cancel registry signed orders check (`assert_live`), if the server uses one. */
+  registry?: string | null;
 }) {
   const [tab, setTab] = useState<'open' | 'trades' | 'history'>('open');
   const [error, setError] = useState<string | undefined>();
+  const [note, setNote] = useState<string | undefined>();
   const symbol = new Map(markets.flatMap((m) => [[m.base.address, m.base.symbol], [m.quote.address, m.quote.symbol]] as [string, string][]));
   const sym = (a: string) => symbol.get(a) ?? a.slice(-6);
   // An expired book order still holds its unsold tokens, so it stays with the open orders until cancelled.
@@ -51,8 +56,23 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
       : `market charges ${fmtPrice(have)} for this size; fills at ${fmtPrice(want)}`;
   };
 
+  // Signed orders can also be cancelled on the ledger, from the wallet, when this browser holds the
+  // order's cancel secret: then no one can fill it, whatever the server does.
+  const canLedgerCancel = (o: OrderView) => o.kind !== 'book' && o.kind !== 'market' && o.status === 'open' && Boolean(registry && wallet && secrets.get(o.id));
+  async function cancelOnLedger(o: OrderView) {
+    setError(undefined); setNote(undefined);
+    const secret = secrets.get(o.id);
+    if (!registry || !wallet || !secret) { setError('This order\'s cancel key is not in this browser, so it cannot be cancelled on the ledger from here.'); return; }
+    try {
+      await wallet.sendTransaction(registryCancelManifest(registry, secret), 'Cancel signed limit order on the ledger');
+    } catch (e) { setError((e as Error).message); return; }
+    // The ledger now refuses the order; tell the server too so it leaves the book at once.
+    try { await api.cancelOrder(o.id, secret); } catch { setNote('Cancelled on the ledger. The server has not caught up yet; the order cannot be filled.'); }
+    onChanged();
+  }
+
   async function cancel(o: OrderView) {
-    setError(undefined);
+    setError(undefined); setNote(undefined);
     if (o.kind === 'book') {
       // Cancelling a book order is a transaction: it burns the receipt and returns what has not sold.
       if (!wallet || !orderBook || !account || o.bookId === undefined) { setError('Connect the wallet that holds this order\'s receipt to cancel it.'); return; }
@@ -60,21 +80,23 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
       return;
     }
     const secret = secrets.get(o.id);
-    if (!secret) { setError('This order was placed from another browser, so it cannot be cancelled here. It will expire on its own.'); return; }
+    if (!secret) { setError('This order\'s cancel key is not in this browser (it was placed from another browser, or site data was cleared), so it cannot be cancelled here. It will expire on its own.'); return; }
     try { await api.cancelOrder(o.id, secret); onChanged(); } catch (e) { setError((e as Error).message); }
   }
 
   return (
     <section className="panel orders">
       <header className="panel-head">
-        <div className="tabs">
-          <button className={tab === 'open' ? 'on' : ''} onClick={() => setTab('open')}>Open orders ({orders.filter(isOpen).length})</button>
-          <button className={tab === 'trades' ? 'on' : ''} onClick={() => setTab('trades')}>Trades ({trades.length})</button>
-          <button className={tab === 'history' ? 'on' : ''} onClick={() => setTab('history')}>Order history</button>
-        </div>
+        <Tabs label="Your orders" value={tab} onChange={setTab} panelId="orders-panel" items={[
+          ['open', <>Open orders <span className="badge">{orders.filter(isOpen).length}</span></>],
+          ['trades', <>Trades <span className="badge">{trades.length}</span></>],
+          ['history', 'Order history'],
+        ]} />
       </header>
-      {error && <p className="error">{error}</p>}
-      {!account ? <p className="empty">Connect your wallet to see your orders.</p> : tab === 'trades' ? (trades.length === 0 ? <p className="empty">No completed trades yet.</p> : (
+      {error && <p className="error" role="alert">{error}</p>}
+      {note && <p className="error notice" role="status">{note}</p>}
+      <TabPanel id="orders-panel" value={tab}>
+      {!account ? <Empty>Connect your wallet to see your orders.</Empty> : tab === 'trades' ? (trades.length === 0 ? <Empty>No completed trades yet.</Empty> : (
         <div className="table-scroll">
           <table>
             <thead><tr><th>Time</th><th>Market</th><th>Side</th><th className="r">Price</th><th className="r">Size</th><th className="r">Total</th><th className="r">Network fee</th><th /></tr></thead>
@@ -86,18 +108,18 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
                     <td>{fmtTime(t.time)}</td>
                     <td>{d.pair}</td>
                     <td className={d.side === 'Buy' ? 'up' : 'down'}>{d.side}{t.book ? ` (order #${t.book})` : ''}</td>
-                    <td className="r">{fmtPrice(d.price)}</td>
+                    <td className="r num">{fmtPrice(d.price)}</td>
                     <td className="r">{fmtAmount(d.size)} {d.baseSym}</td>
                     <td className="r">{fmtAmount(d.total)} {d.quoteSym}</td>
                     <td className="r">{t.book ? 'none' : Number(t.feeXrd) > 0 ? `${fmtAmount(t.feeXrd)} XRD` : 'paid for you'}</td>
-                    <td className="r"><a className="link" href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer">View</a></td>
+                    <td className="r"><a className="link" href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer">View <Icon name="external" size={11} /></a></td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
         </div>
-      )) : rows.length === 0 ? <p className="empty">{tab === 'open' ? 'No open orders.' : 'No filled, cancelled or expired orders.'}</p> : (
+      )) : rows.length === 0 ? <Empty>{tab === 'open' ? 'No open orders.' : 'No filled, cancelled or expired orders.'}</Empty> : (
         <div className="table-scroll">
           <table>
             <thead><tr><th>Placed</th><th>Market</th><th>Side</th><th className="r">Price</th><th className="r">Size</th>{tab === 'open' && <th>Fills when</th>}<th>{tab === 'open' ? 'Expires' : 'Status'}</th><th /></tr></thead>
@@ -112,8 +134,11 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
                     <td className="r">{o.kind === 'market' ? 'Market' : fmtPrice(d.price)}</td>
                     <td className="r">{fmtAmount(d.size)} {d.baseSym}</td>
                     {tab === 'open' && <td className="muted">{waiting(o)}</td>}
-                    <td>{tab === 'open' ? (o.expiresAt ? fmtTime(o.expiresAt) : 'Never') : o.status === 'filled' ? `Filled, received ${fmtAmount(o.received)} ${sym(o.buy)}` : o.status[0]!.toUpperCase() + o.status.slice(1) + (o.kind === 'book' && Number(o.sold) > 0 ? `, after ${fmtAmount(o.sold)} ${sym(o.sell)} sold for ${fmtAmount(o.received)} ${sym(o.buy)}` : '')}</td>
-                    <td className="r">{tab === 'open' && <button className="link" onClick={() => cancel(o)}>Cancel</button>}</td>
+                    <td>{tab === 'open' ? (o.expiresAt ? fmtTime(o.expiresAt) : 'Never') : o.status === 'filled' ? `Filled${typeof o.filledAt === 'number' && o.filledAt > 0 ? ` ${fmtTime(o.filledAt)}` : ''}, received ${fmtAmount(o.received)} ${sym(o.buy)}` : o.status[0]!.toUpperCase() + o.status.slice(1) + (o.kind === 'book' && Number(o.sold) > 0 ? `, after ${fmtAmount(o.sold)} ${sym(o.sell)} sold for ${fmtAmount(o.received)} ${sym(o.buy)}` : '')}</td>
+                    <td className="r actions">{tab === 'open' && <>
+                      <button className="btn-ghost" onClick={() => cancel(o)} title={o.kind === 'book' ? 'Cancel with a wallet transaction and take back what has not sold' : 'Ask the server to drop this order (free)'}>Cancel</button>
+                      {canLedgerCancel(o) && <button className="btn-ghost" onClick={() => cancelOnLedger(o)} title="Record the cancel on the ledger with a wallet transaction (small network fee): the order can then never be filled, whatever the server does">On ledger</button>}
+                    </>}</td>
                   </tr>
                 );
               })}
@@ -121,6 +146,7 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
           </table>
         </div>
       )}
+      </TabPanel>
     </section>
   );
 }
