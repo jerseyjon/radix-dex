@@ -35,7 +35,8 @@ export function routeInstructions(route: Pool[], sell: string): string[] {
  */
 export class Quoter {
   private readonly gateway: Gateway;
-  private readonly funders = new Map<string, Promise<{ address: string; amount: Decimal }[]>>();
+  /** Large holders of each token, used to fund preview quotes. Re-read hourly: holders move their funds. */
+  private readonly funders = new Map<string, { at: number; list: Promise<{ address: string; amount: Decimal }[]> }>();
   private readonly divisibilities = new Map<string, Promise<number>>();
   private epoch: { value: number; at: number } | undefined;
   /** Why the most recent failed simulation failed; for diagnostics only. */
@@ -70,15 +71,14 @@ export class Quoter {
   }
 
   private fundersFor(resource: string) {
-    let p = this.funders.get(resource);
-    if (!p) {
-      p = this.gateway.resourceHolders(resource, 30).then((hs) =>
-        hs.filter((h) => h.address.startsWith('account_')).map((h) => ({ address: h.address, amount: new Decimal(h.amount) })),
-      );
-      p.catch(() => this.funders.delete(resource));
-      this.funders.set(resource, p);
-    }
-    return p;
+    const hit = this.funders.get(resource);
+    if (hit && Date.now() - hit.at < 3_600_000) return hit.list;
+    const list = this.gateway.resourceHolders(resource, 30).then((hs) =>
+      hs.filter((h) => h.address.startsWith('account_')).map((h) => ({ address: h.address, amount: new Decimal(h.amount) })),
+    );
+    list.catch(() => this.funders.delete(resource));
+    this.funders.set(resource, { at: Date.now(), list });
+    return list;
   }
 
   /** Simulate selling `sellAmount` of `sell` along `route`. Returns undefined if no funder can cover it or the swap fails. */

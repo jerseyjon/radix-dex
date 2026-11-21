@@ -129,8 +129,8 @@ export class Solver {
   /** Per open order: what the pools would pay it right now after the network fee, and what it needs. */
   readonly outlook = new Map<string, { available: string; needed: string; at: number }>();
 
-  // For /api/health and the logs.
-  lastTickAt = 0;
+  // For /api/health and the logs. A new solver counts as having just finished a pass.
+  lastTickAt = Date.now();
   lastTickMs = 0;
   lastXrd: { at: number; amount: string } | undefined;
   breaker = { open: false, failedFeesXrd: '0', since: 0 };
@@ -404,7 +404,10 @@ export class Solver {
   private async fillOnce(o: StoredOrder, open: StoredOrder[], liveBook: BookOrder[], now: number, done: Set<string>, skip: { orders: Set<string>; book: Set<number> }):
     Promise<{ kind: 'noPlan' } | { kind: 'dead' } | { kind: 'unfunded' } | { kind: 'sent'; res: SendResult; makers: StoredOrder[]; bookIds: number[]; exec: Execution }> {
     const resting = open.filter((m) => m.kind !== 'market' && !done.has(m.id) && !skip.orders.has(m.id) && m.pendingTx === null && m.retryAt <= now);
-    const exec = await this.bestExecution(o, resting, liveBook.filter((b) => !skip.book.has(b.id)), now);
+    const book = liveBook.filter((b) => !skip.book.has(b.id));
+    // Orders can arrive during a pass: make sure every token in play is known (cached after the first time).
+    await this.loadDivisibility([o, ...resting, ...book].flatMap((x) => [x.sell, x.buy]));
+    const exec = await this.bestExecution(o, resting, book, now);
     if (!exec) { this.outlook.delete(o.id); return { kind: 'noPlan' }; }
     const { gasInBuyToken } = exec;
     // With no pool leg the outcome is exact, so no margin is needed.
@@ -712,7 +715,9 @@ export class Solver {
         for (const second of seconds) {
           if (this.stopped) return;
           if (crossed.has(first.id) || crossed.has(second.id)) continue;
-          if (!planBookCross(first, second, '1e30', '0', this.divisibility)) break;
+          // Prices that do not cross now will not cross for any dearer second order.
+          if (!new Decimal(first.price).mul(second.price).lt(1)) break;
+          if (!planBookCross(first, second, '1e30', '0', this.divisibility)) continue;
           const pairKey = `cross:${first.id}:${second.id}`;
           if (!this.mayTry(pairKey, `${first.remaining}|${second.remaining}`)) continue;
           try {
