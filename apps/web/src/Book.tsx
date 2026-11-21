@@ -3,6 +3,7 @@ import type { Depth } from '@radix-dex/core/browser';
 import type { MarketTrade } from './api';
 import { ladder } from './book';
 import { fmtAmount, fmtPrice } from './format';
+import { Empty, SkeletonRows } from './ui';
 
 const ROWS = 11;
 const clock = (sec: number) => {
@@ -24,41 +25,41 @@ export function Book({ depth, trades, explorer, baseSymbol, quoteSymbol, onPick 
       <span className="bar" style={{ width: `${(l.total / max) * 100}%` }} />
       <span className="p">{fmtPrice(l.price)}</span>
       <span>{fmtAmount(l.size)}</span>
-      <span className="src">{l.sources[0] === 'orders' ? '●' : ''}{fmtAmount(l.total)}</span>
+      <span className="src">{l.sources[0] === 'orders' ? <i className="here" aria-label="limit order">●</i> : ''}{fmtAmount(l.total)}</span>
     </button>
   );
 
   return (
     <section className="panel book">
       <header className="panel-head">
-        <div className="tabs" role="tablist">
+        <div className="tabs" role="tablist" aria-label="Market activity">
           <button role="tab" aria-selected={tab === 'book'} className={tab === 'book' ? 'on' : ''} onClick={() => setTab('book')}>Order book</button>
           <button role="tab" aria-selected={tab === 'trades'} className={tab === 'trades' ? 'on' : ''} onClick={() => setTab('trades')}>Trades</button>
         </div>
-        <span className="muted small">{tab === 'book' ? 'pools + limit orders' : '● made here'}</span>
+        <span className="head-note">{tab === 'book' ? 'pools + limit orders' : <><i className="here">●</i> made here</>}</span>
       </header>
       {tab === 'book' ? <>
-        <div className="book-cols small muted"><span>Price ({quoteSymbol})</span><span>Size ({baseSymbol})</span><span>Total</span></div>
-        <div className="book-side asks">{[...asks].reverse().map(row('ask'))}</div>
+        <div className="book-cols"><span>Price ({quoteSymbol})</span><span>Size ({baseSymbol})</span><span>Total</span></div>
+        <div className="book-side asks">{depth ? [...asks].reverse().map(row('ask')) : <SkeletonRows rows={ROWS} label="Loading the order book" />}</div>
         <div className="book-mid">
-          <strong>{fmtPrice(depth?.mid)}</strong>
-          <span className="muted small">{spread === undefined ? (depth ? 'one-sided' : 'loading…') : `spread ${spread.toFixed(2)}%`}</span>
+          <strong>{depth ? fmtPrice(depth.mid) : <span className="skeleton mid" />}</strong>
+          <span className="head-note">{spread === undefined ? (depth ? 'one-sided' : 'loading…') : <>spread <b>{spread.toFixed(2)}%</b></>}</span>
         </div>
-        <div className="book-side bids">{bids.map(row('bid'))}</div>
-        {depth && !asks.length && !bids.length && <p className="empty">No liquidity found for this market.</p>}
+        <div className="book-side bids">{depth ? bids.map(row('bid')) : <SkeletonRows rows={ROWS} label="Loading the order book" />}</div>
+        {depth && !asks.length && !bids.length && <Empty>No liquidity found for this market.</Empty>}
       </> : <>
-        <div className="book-cols small muted"><span>Price ({quoteSymbol})</span><span>Size ({baseSymbol})</span><span>Time</span></div>
+        <div className="book-cols"><span>Price ({quoteSymbol})</span><span>Size ({baseSymbol})</span><span>Time</span></div>
         <div className="trade-list">
           {(trades ?? []).map((t, i) => (
             <a key={t.txid + i} className={`book-row ${t.side === 'buy' ? 'bid' : 'ask'}`} href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer"
               title={`${t.side === 'buy' ? 'Bought' : 'Sold'} ${baseSymbol} ${t.venue === 'here' ? 'on this exchange' : 'on ' + t.venue}. Open the transaction.`}>
               <span className="p">{fmtPrice(t.price)}</span>
               <span>{fmtAmount(t.size)}</span>
-              <span className="src">{t.venue === 'here' ? '●' : ''}{clock(t.time)}</span>
+              <span className="src">{t.venue === 'here' ? <i className="here" aria-label="made here">●</i> : ''}{clock(t.time)}</span>
             </a>
           ))}
-          {trades === undefined && <p className="empty">Loading…</p>}
-          {trades?.length === 0 && <p className="empty">No recent trades in this market.</p>}
+          {trades === undefined && <SkeletonRows rows={14} label="Loading trades" />}
+          {trades?.length === 0 && <Empty>No recent trades in this market.</Empty>}
         </div>
       </>}
     </section>

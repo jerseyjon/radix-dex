@@ -8,6 +8,7 @@ import { fmtPrice, fmtTime, fmtUsd, shortAddr } from './format';
 import { Markets } from './Markets';
 import { OrderForm } from './OrderForm';
 import { Orders } from './Orders';
+import { Icon, Logo, Mark } from './ui';
 import { type WalletAccount, getWallet } from './wallet';
 
 const RESOLUTIONS = ['15m', '1h', '4h', '1d', '1w'];
@@ -94,30 +95,39 @@ export function App() {
 
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(undefined), 6000); return () => clearTimeout(t); }, [toast]);
 
-  if (fatal) return <div className="fatal"><h1>Radix DEX</h1><p>Could not load market data: {fatal}</p><button onClick={() => location.reload()}>Try again</button></div>;
-  if (!config || !market) return <div className="fatal"><p className="muted">{config && markets.length === 0 ? 'No markets are available right now.' : 'Loading markets…'}</p></div>;
+  if (fatal) return <div className="fatal"><Logo /><h1>Market data is unavailable</h1><p className="muted">Could not load market data: {fatal}</p><button className="btn-primary" onClick={() => location.reload()}>Try again</button></div>;
+  if (!config || !market) {
+    const none = config && markets.length === 0;
+    return <div className="fatal" role="status"><span className={none ? 'fatal-mark' : 'fatal-mark pulse'}><Mark size={28} /></span><p className="muted">{none ? 'No markets are available right now.' : 'Loading markets…'}</p></div>;
+  }
 
   const last = candles[candles.length - 1], first = candles[0];
   const change = last && first ? (last.close / first.open - 1) * 100 : undefined;
+  const changeDir = change === undefined ? '' : change >= 0 ? 'up' : 'down';
 
   return (
     <div className={`app ${showMarkets ? 'show-markets' : ''}`}>
       <header className="top">
-        <div className="brand"><span className="logo">◆</span> Radix DEX</div>
-        <button className="pair-btn" onClick={() => setShowMarkets((v) => !v)} aria-expanded={showMarkets}>
-          <strong>{market.base.symbol}</strong>/{market.quote.symbol} <span className="caret">▾</span>
+        <Logo />
+        <button className="pair-btn" onClick={() => setShowMarkets((v) => !v)} aria-expanded={showMarkets} aria-label={`${market.base.symbol}/${market.quote.symbol}: choose a market`}>
+          <span className="pair-base">{market.base.symbol}</span><span className="pair-quote">/{market.quote.symbol}</span> <span className="caret"><Icon name="chevron" size={14} /></span>
         </button>
-        <div className="stats">
-          <div><span className="muted small">Price</span><strong>{fmtPrice(depth?.mid ?? last?.close)}</strong></div>
-          <div><span className="muted small">Change (chart)</span><strong className={change === undefined ? '' : change >= 0 ? 'up' : 'down'}>{change === undefined ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`}</strong></div>
-          <div><span className="muted small">Liquidity</span><strong>{fmtUsd(market.tvlUsd)}</strong></div>
-          <div><span className="muted small">24h volume</span><strong>{fmtUsd(market.volume24hUsd)}</strong></div>
-          <div><span className="muted small">Venues</span><strong>{market.venues.join(', ') || 'orders only'}</strong></div>
+        <div className="ticker">
+          <span className="sr-only">Price</span>
+          <span className="ticker-price">{fmtPrice(depth?.mid ?? last?.close)}</span>
+          <span className={`ticker-change ${changeDir}`} title="Change over the chart's range">
+            <span className="sr-only">Change (chart)</span>{change === undefined ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`}
+          </span>
         </div>
+        <dl className="stats">
+          <div><dt>Liquidity</dt><dd>{fmtUsd(market.tvlUsd)}</dd></div>
+          <div><dt>24h volume</dt><dd>{fmtUsd(market.volume24hUsd)}</dd></div>
+          <div className="venues"><dt>Venues</dt><dd>{market.venues.join(', ') || 'orders only'}</dd></div>
+        </dl>
         <div className="right">
-          <span className={`net ${config.network}`}>{config.network}</span>
+          <span className={`net ${config.network}`}><span className="dot" aria-hidden="true" />{config.network}</span>
           {accounts.length > 1 && (
-            <select value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Account">
+            <select className="account" value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Account">
               {accounts.map((a) => <option key={a.address} value={a.address}>{a.label || shortAddr(a.address)}</option>)}
             </select>
           )}
@@ -127,26 +137,32 @@ export function App() {
       </header>
 
       {(STATIC || config.warning || (config.network === 'mainnet' && wallet)) && (
-        <div className="banner">
-          {config.network === 'mainnet' && wallet && !STATIC && <>Early release with real funds. This software and its contracts have not been independently audited: trade only what you can afford to lose. </>}
-          {STATIC && <>Read-only preview. Market data is a snapshot taken {config.snapshotAt ? fmtTime(config.snapshotAt) : 'earlier'}; trading is switched off. </>}
-          {config.warning && <>Some market data could not be refreshed ({config.warning}).</>}
+        <div className="banner" role="note">
+          <Icon name="warn" size={15} />
+          <p>
+            {config.network === 'mainnet' && wallet && !STATIC && <><strong>Early release with real funds.</strong> This software and its contracts have not been independently audited: trade only what you can afford to lose. </>}
+            {STATIC && <><strong>Read-only preview.</strong> Market data is a snapshot taken {config.snapshotAt ? fmtTime(config.snapshotAt) : 'earlier'}; trading is switched off. </>}
+            {config.warning && <>Some market data could not be refreshed ({config.warning}).</>}
+          </p>
         </div>
       )}
 
+      {showMarkets && <div className="scrim" onClick={() => setShowMarkets(false)} aria-hidden="true" />}
       <Markets markets={markets} selected={market.id} onSelect={(id) => { setSelected(id); setShowMarkets(false); }} />
 
       <main className="center">
         <section className="panel chart-panel">
           <header className="panel-head">
-            <div className="tabs" role="tablist">
-              <h2>{market.base.symbol}/{market.quote.symbol}</h2>
-              <button role="tab" aria-selected={chartTab === 'price'} className={chartTab === 'price' ? 'on' : ''} onClick={() => setChartTab('price')}>Price</button>
-              <button role="tab" aria-selected={chartTab === 'depth'} className={chartTab === 'depth' ? 'on' : ''} onClick={() => setChartTab('depth')}>Depth</button>
+            <div className="head-left">
+              <h2 className="panel-title">{market.base.symbol}<span>/{market.quote.symbol}</span></h2>
+              <div className="tabs" role="tablist" aria-label="Chart">
+                <button role="tab" aria-selected={chartTab === 'price'} className={chartTab === 'price' ? 'on' : ''} onClick={() => setChartTab('price')}>Price</button>
+                <button role="tab" aria-selected={chartTab === 'depth'} className={chartTab === 'depth' ? 'on' : ''} onClick={() => setChartTab('depth')}>Depth</button>
+              </div>
             </div>
             {chartTab === 'price'
-              ? <div className="seg mini">{RESOLUTIONS.map((r) => <button key={r} className={r === resolution ? 'on' : ''} onClick={() => setResolution(r)}>{r}</button>)}</div>
-              : <span className="muted small">cumulative {market.base.symbol} on offer, pools + limit orders</span>}
+              ? <div className="seg mini" role="group" aria-label="Candle interval">{RESOLUTIONS.map((r) => <button key={r} className={r === resolution ? 'on' : ''} aria-pressed={r === resolution} onClick={() => setResolution(r)}>{r}</button>)}</div>
+              : <span className="head-note">cumulative {market.base.symbol} on offer, pools + limit orders</span>}
           </header>
           {chartTab === 'price' ? <Chart candles={candles} loading={candlesLoading} /> : <DepthChart depth={depth} baseSymbol={market.base.symbol} onPick={setPicked} />}
         </section>
@@ -158,7 +174,7 @@ export function App() {
         <OrderForm market={market} depth={depth} config={config} wallet={wallet} account={account} balances={balances} pickedPrice={picked}
           onDone={(m) => { setToast(m); void refreshAccount(); }} />
       </div>
-      {toast && <div className="toast" role="status">{toast}</div>}
+      {toast && <div className="toast" role="status"><Icon name="info" size={15} /><span>{toast}</span></div>}
     </div>
   );
 }

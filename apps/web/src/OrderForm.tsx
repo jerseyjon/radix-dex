@@ -3,6 +3,7 @@ import { type Depth, bookPlaceManifest, limitOrderManifest, marketOrderManifest,
 import { type MarketSummary, type QuoteResult, type ServerConfig, STATIC, api } from './api';
 import { estimate } from './book';
 import { cleanAmount, fmtAmount, fmtPrice, toPlain } from './format';
+import { Icon } from './ui';
 import type { Wallet } from './wallet';
 
 type Side = 'buy' | 'sell';
@@ -181,15 +182,17 @@ export function OrderForm(props: {
   const num = (set: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => set(e.target.value.replace(/[^0-9.]/g, ''));
 
   return (
-    <section className="panel form">
-      <div className="seg sides">
-        <button className={side === 'buy' ? 'on buy' : ''} onClick={() => setSide('buy')}>Buy {base.symbol}</button>
-        <button className={side === 'sell' ? 'on sell' : ''} onClick={() => setSide('sell')}>Sell {base.symbol}</button>
+    <section className={`panel form ${side}`} aria-label="Place an order">
+      <div className="sides" role="group" aria-label="Side">
+        <button className={side === 'buy' ? 'on buy' : 'buy'} aria-pressed={side === 'buy'} onClick={() => setSide('buy')}>Buy {base.symbol}</button>
+        <button className={side === 'sell' ? 'on sell' : 'sell'} aria-pressed={side === 'sell'} onClick={() => setSide('sell')}>Sell {base.symbol}</button>
       </div>
-      <div className="tabs">
-        <button className={kind === 'market' ? 'on' : ''} onClick={() => setKind('market')}>Market</button>
-        <button className={kind === 'limit' ? 'on' : ''} onClick={() => setKind('limit')}>Limit</button>
-        <span className="muted small bal">Available: {fmtAmount(sellBalance)} {sellTok.symbol}</span>
+      <div className="form-row">
+        <div className="tabs" role="tablist" aria-label="Order type">
+          <button role="tab" aria-selected={kind === 'market'} className={kind === 'market' ? 'on' : ''} onClick={() => setKind('market')}>Market</button>
+          <button role="tab" aria-selected={kind === 'limit'} className={kind === 'limit' ? 'on' : ''} onClick={() => setKind('limit')}>Limit</button>
+        </div>
+        <span className="bal">Available <b>{fmtAmount(sellBalance)} {sellTok.symbol}</b></span>
       </div>
 
       {kind === 'limit' && (
@@ -201,7 +204,7 @@ export function OrderForm(props: {
       {kind === 'market' && side === 'buy' && (
         <label className="field"><span>Spend</span><input inputMode="decimal" value={total} onChange={num(setTotal)} placeholder="0.0" /><em>{quoteTok.symbol}</em></label>
       )}
-      <div className="pcts">{[0.25, 0.5, 0.75, 1].map((p) => <button key={p} onClick={() => setPct(p)} disabled={!(sellBalance > 0)}>{p * 100}%</button>)}</div>
+      <div className="pcts" role="group" aria-label="Share of available balance">{[0.25, 0.5, 0.75, 1].map((p) => <button key={p} onClick={() => setPct(p)} disabled={!(sellBalance > 0)}>{p * 100}%</button>)}</div>
 
       {kind === 'market' ? (
         <dl className="summary">
@@ -211,11 +214,11 @@ export function OrderForm(props: {
           {marketFees
             ? <div><dt>Fees, already taken off</dt><dd>{fmtAmount(marketFees.network + marketFees.service)} {buyTok.symbol} (network fee + {pct(config.feeBps)})</dd></div>
             : <div><dt>Route</dt><dd>{quote ? quote.route.map((p) => p.venue).join(' → ') : '—'}</dd></div>}
-          <div><dt>Max slippage</dt><dd className="seg mini">{SLIPPAGES.map((s) => <button key={s} className={s === slippage ? 'on' : ''} onClick={() => setSlippage(s)}>{s}%</button>)}</dd></div>
+          <div><dt>Max slippage</dt><dd className="seg mini">{SLIPPAGES.map((s) => <button key={s} className={s === slippage ? 'on' : ''} aria-pressed={s === slippage} onClick={() => setSlippage(s)}>{s}%</button>)}</dd></div>
         </dl>
       ) : useBook && book ? (
         <dl className="summary">
-          <div><dt>Fills</dt><dd className="seg mini"><button className="on">In parts</button>{config.limitOrders.enabled && <button onClick={() => setInBook(false)}>Whole only</button>}</dd></div>
+          <div><dt>Fills</dt><dd className="seg mini"><button className="on" aria-pressed="true">In parts</button>{config.limitOrders.enabled && <button aria-pressed="false" onClick={() => setInBook(false)}>Whole only</button>}</dd></div>
           <div><dt>Moves into the order book</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>You receive, as it fills</dt><dd>{limitGross ? `${fmtAmount(Number(limitGross) * (1 - book.makerFeeBps / 10_000))} ${buyTok.symbol}` : '—'}</dd></div>
           <div><dt>Fee</dt><dd>{book.makerFeeBps > 0 ? pct(book.makerFeeBps) : 'None'}, plus the network fee to place it (about 0.8 XRD)</dd></div>
@@ -223,33 +226,33 @@ export function OrderForm(props: {
           {fillsNow && quote && limitGross && (
             <div><dt>Note</dt><dd className="warn">The market pays {fmtAmount(quote.buyAmount)} {buyTok.symbol} for this size now, more than the {fmtAmount(limitGross)} {buyTok.symbol} your price gives. An order filled in parts gets its own price and no better: the difference is kept by the exchange. For the market price, use a Market order{config.limitOrders.enabled ? ' or “Whole only”' : ''}.</dd></div>
           )}
-          <div><dt>Expires in</dt><dd><select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
+          <div><dt>Expires in</dt><dd><select className="select" value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
         </dl>
       ) : (
         <dl className="summary">
-          {book && <div><dt>Fills</dt><dd className="seg mini"><button onClick={() => setInBook(true)}>In parts</button><button className="on">Whole only</button></dd></div>}
+          {book && <div><dt>Fills</dt><dd className="seg mini"><button aria-pressed="false" onClick={() => setInBook(true)}>In parts</button><button className="on" aria-pressed="true">Whole only</button></dd></div>}
           <div><dt>You pay</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>At your price you get</dt><dd>{limitGross ? `${fmtAmount(limitGross)} ${buyTok.symbol}` : '—'}</dd></div>
           <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(limitFees.network + limitFees.service)} ${buyTok.symbol} (network fee + ${pct(config.feeBps)})` : '—'}</dd></div>
           <div><dt>If another trader takes it</dt><dd>{(config.makerFeeBps ?? 0) > 0 ? `Fee ${pct(config.makerFeeBps ?? 0)}, no network fee` : 'No fee: you get your full price'}</dd></div>
           <div><dt>You receive at least</dt><dd>{limitMinBuy && Number(limitMinBuy) > 0 ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
           <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
-          <div><dt>Expires in</dt><dd><select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
+          <div><dt>Expires in</dt><dd><select className="select" value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
         </dl>
       )}
 
-      <button className={`submit ${side}`} disabled={Boolean(blocker) || busy} onClick={submit}>
+      <button className={`submit ${side}${busy ? ' busy' : ''}`} disabled={Boolean(blocker) || busy} onClick={submit}>
         {busy ? 'Working…' : blocker ?? `${side === 'buy' ? 'Buy' : 'Sell'} ${base.symbol}`}
       </button>
       {error && <p className="error">{error}</p>}
       {kind === 'market' && viaSolver && (
-        <p className="note">Your wallet will ask you to approve a pre-authorization. The order is then filled for you within a few seconds at the best price from the order book and the pools, and you pay no separate network fee.</p>
+        <p className="note"><Icon name="info" size={13} />Your wallet will ask you to approve a pre-authorization. The order is then filled for you within a few seconds at the best price from the order book and the pools, and you pay no separate network fee.</p>
       )}
       {useBook && (
-        <p className="note">Your tokens move into the order book contract, where the ledger enforces your price. Other traders can buy any part of the order, and each part is paid straight to your account at your price. You can cancel at any time and take back what has not sold. This contract has not been audited.</p>
+        <p className="note"><Icon name="info" size={13} />Your tokens move into the order book contract, where the ledger enforces your price. Other traders can buy any part of the order, and each part is paid straight to your account at your price. You can cancel at any time and take back what has not sold. This contract has not been audited.</p>
       )}
       {kind === 'limit' && !useBook && (
-        <p className="note">A limit order is a signed permission, not a transaction: placing it is free and your funds stay in your account until it fills. It fills in full or not at all, as soon as the market reaches your price. The fees come out of what you receive, and you never get less than the “at least” amount, which is what your wallet shows.</p>
+        <p className="note"><Icon name="info" size={13} />A limit order is a signed permission, not a transaction: placing it is free and your funds stay in your account until it fills. It fills in full or not at all, as soon as the market reaches your price. The fees come out of what you receive, and you never get less than the “at least” amount, which is what your wallet shows.</p>
       )}
     </section>
   );

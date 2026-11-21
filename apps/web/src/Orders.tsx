@@ -3,6 +3,7 @@ import { bookCancelManifest } from '@radix-dex/core/browser';
 import { type MarketSummary, type OrderView, type ServerConfig, type TradeView, api } from './api';
 import { fmtAmount, fmtPrice, fmtTime } from './format';
 import { secrets } from './OrderForm';
+import { Empty, Icon } from './ui';
 import type { Wallet } from './wallet';
 
 export function Orders({ orders, trades, explorer, markets, account, onChanged, wallet, orderBook }: {
@@ -67,14 +68,14 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
   return (
     <section className="panel orders">
       <header className="panel-head">
-        <div className="tabs">
-          <button className={tab === 'open' ? 'on' : ''} onClick={() => setTab('open')}>Open orders ({orders.filter(isOpen).length})</button>
-          <button className={tab === 'trades' ? 'on' : ''} onClick={() => setTab('trades')}>Trades ({trades.length})</button>
-          <button className={tab === 'history' ? 'on' : ''} onClick={() => setTab('history')}>Order history</button>
+        <div className="tabs" role="tablist" aria-label="Your orders">
+          <button role="tab" aria-selected={tab === 'open'} className={tab === 'open' ? 'on' : ''} onClick={() => setTab('open')}>Open orders <span className="badge">{orders.filter(isOpen).length}</span></button>
+          <button role="tab" aria-selected={tab === 'trades'} className={tab === 'trades' ? 'on' : ''} onClick={() => setTab('trades')}>Trades <span className="badge">{trades.length}</span></button>
+          <button role="tab" aria-selected={tab === 'history'} className={tab === 'history' ? 'on' : ''} onClick={() => setTab('history')}>Order history</button>
         </div>
       </header>
       {error && <p className="error">{error}</p>}
-      {!account ? <p className="empty">Connect your wallet to see your orders.</p> : tab === 'trades' ? (trades.length === 0 ? <p className="empty">No completed trades yet.</p> : (
+      {!account ? <Empty>Connect your wallet to see your orders.</Empty> : tab === 'trades' ? (trades.length === 0 ? <Empty>No completed trades yet.</Empty> : (
         <div className="table-scroll">
           <table>
             <thead><tr><th>Time</th><th>Market</th><th>Side</th><th className="r">Price</th><th className="r">Size</th><th className="r">Total</th><th className="r">Network fee</th><th /></tr></thead>
@@ -86,18 +87,18 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
                     <td>{fmtTime(t.time)}</td>
                     <td>{d.pair}</td>
                     <td className={d.side === 'Buy' ? 'up' : 'down'}>{d.side}{t.book ? ` (order #${t.book})` : ''}</td>
-                    <td className="r">{fmtPrice(d.price)}</td>
+                    <td className="r num">{fmtPrice(d.price)}</td>
                     <td className="r">{fmtAmount(d.size)} {d.baseSym}</td>
                     <td className="r">{fmtAmount(d.total)} {d.quoteSym}</td>
                     <td className="r">{t.book ? 'none' : Number(t.feeXrd) > 0 ? `${fmtAmount(t.feeXrd)} XRD` : 'paid for you'}</td>
-                    <td className="r"><a className="link" href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer">View</a></td>
+                    <td className="r"><a className="link" href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer">View <Icon name="external" size={11} /></a></td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
         </div>
-      )) : rows.length === 0 ? <p className="empty">{tab === 'open' ? 'No open orders.' : 'No filled, cancelled or expired orders.'}</p> : (
+      )) : rows.length === 0 ? <Empty>{tab === 'open' ? 'No open orders.' : 'No filled, cancelled or expired orders.'}</Empty> : (
         <div className="table-scroll">
           <table>
             <thead><tr><th>Placed</th><th>Market</th><th>Side</th><th className="r">Price</th><th className="r">Size</th>{tab === 'open' && <th>Fills when</th>}<th>{tab === 'open' ? 'Expires' : 'Status'}</th><th /></tr></thead>
@@ -113,7 +114,7 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
                     <td className="r">{fmtAmount(d.size)} {d.baseSym}</td>
                     {tab === 'open' && <td className="muted">{waiting(o)}</td>}
                     <td>{tab === 'open' ? (o.expiresAt ? fmtTime(o.expiresAt) : 'Never') : o.status === 'filled' ? `Filled, received ${fmtAmount(o.received)} ${sym(o.buy)}` : o.status[0]!.toUpperCase() + o.status.slice(1) + (o.kind === 'book' && Number(o.sold) > 0 ? `, after ${fmtAmount(o.sold)} ${sym(o.sell)} sold for ${fmtAmount(o.received)} ${sym(o.buy)}` : '')}</td>
-                    <td className="r">{tab === 'open' && <button className="link" onClick={() => cancel(o)}>Cancel</button>}</td>
+                    <td className="r">{tab === 'open' && <button className="btn-ghost" onClick={() => cancel(o)}>Cancel</button>}</td>
                   </tr>
                 );
               })}
