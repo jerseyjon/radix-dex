@@ -234,6 +234,8 @@ export class Solver {
   private async send(manifest: string, children: Record<string, DecodedOrder>, record: { kind: 'fill' | 'book'; orders: { id: string; received: string; gross: string }[]; bookIds: number[] }): Promise<SendResult> {
     if (this.stopped) return { kind: 'blocked', error: 'solver is stopping' };
     if (this.breaker.open || this.updateBreaker()) return { kind: 'blocked', error: 'loss limit reached' };
+    // Without enough XRD for the fee lock every preview would fail, and the orders would be blamed for it.
+    if (this.lastXrd && new Decimal(this.lastXrd.amount).lt(new Decimal(FEE_LOCK_XRD).plus(1))) return { kind: 'blocked', error: 'solver XRD below the fee lock' };
     const window = await this.window();
     const tx = await buildTransaction({ manifest, window, notary: this.key, children });
     let preview;
@@ -241,6 +243,12 @@ export class Solver {
       preview = await this.gateway.previewV2(tx.previewHex);
     } catch (e) {
       return { kind: 'blocked', error: `preview could not be run: ${errText(e)}` };
+    }
+    // "Rejected" means the transaction failed before its fee was secured: the solver's own fee lock
+    // (too little XRD, say), not anything an order did. Nobody's order is charged with that.
+    if (preview.status === 'Rejected') {
+      console.error(`[solver] preview REJECTED (the solver's own fee lock failed?): ${String(preview.error).slice(0, 200)}`);
+      return { kind: 'blocked', error: `preview rejected: ${preview.error ?? ''}` };
     }
     if (!preview.ok) return { kind: 'previewFailed', error: `preview ${preview.status}: ${preview.error ?? ''}` };
     this.store.recordSent({ intentHash: tx.intentHashId, kind: record.kind, orders: record.orders, bookIds: record.bookIds, createdAt: Math.floor(Date.now() / 1000), expiresAt: window.expiresAt });

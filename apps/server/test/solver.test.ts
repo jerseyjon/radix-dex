@@ -302,3 +302,23 @@ test('an order whose account is short of funds is held, not charged', async () =
   assert.ok(o.retryAt > Date.now() / 1000);
   assert.equal(gateway.calls.previewV2, 0);
 });
+
+test('a preview rejected for the solver\'s own fee lock is not blamed on the order', async () => {
+  const gateway = fakeGateway({ previews: [{ ok: false, status: 'Rejected', error: 'ErrorBeforeLoanAndDeferredCostsRepaid', feeXrd: '0' }] });
+  const { store, solver } = await setup({ gateway });
+  const bob = await bobsOrder(store);
+  await solver.tick();
+  assert.equal(gateway.calls.submit, 0);
+  assert.equal(store.get(bob.id)!.failures, 0);
+  assert.equal(store.accountFailuresSince(bob.account, 0), 0);
+});
+
+test('nothing is sent while the solver holds too little XRD for the fee lock', async () => {
+  const gateway = fakeGateway({ balances: { [XRD]: '5' } });
+  const { store, solver } = await setup({ gateway });
+  const bob = await bobsOrder(store);
+  await solver.tick();
+  assert.equal(gateway.calls.previewV2, 0);
+  assert.equal(store.get(bob.id)!.failures, 0);
+  assert.equal(solver.health().xrd, 'low');
+});
