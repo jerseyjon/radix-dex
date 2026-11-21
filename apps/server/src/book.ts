@@ -10,7 +10,10 @@ export class BookWatcher {
   readonly fills: BookFill[] = [];
   readonly placedAt = new Map<number, number>();
   private eventsFrom = 1;
-  private refreshedAt = 0;
+  /** When the book was last read successfully (ms), and when a read last failed. */
+  refreshedAt = 0;
+  failedAt = 0;
+  lastError: string | undefined;
   private running: Promise<void> | undefined;
 
   constructor(gateway: Gateway, component: string) {
@@ -37,13 +40,28 @@ export class BookWatcher {
           const ev = await readBookEvents(this.gateway, this.component, this.eventsFrom);
           for (const p of ev.placed) this.placedAt.set(p.id, p.time);
           this.fills.push(...ev.fills);
+          // History is for display; keep it bounded.
+          if (this.fills.length > 5000) this.fills.splice(0, this.fills.length - 5000);
           this.eventsFrom = ev.next;
         } catch (e) { console.warn('[book] events not read:', String((e as Error).message ?? e).slice(0, 200)); }
+      } catch (e) {
+        this.failedAt = Date.now();
+        this.lastError = String((e as Error)?.message ?? e).slice(0, 200);
+        throw e;
       } finally {
         this.running = undefined;
       }
     })();
     return this.running;
+  }
+
+  /**
+   * For request handlers: never wait. Start a read in the background if the copy is older than
+   * `maxAgeMs` (and the last failed read was not in the last 30 s), and answer from the copy held now.
+   */
+  refreshInBackground(maxAgeMs: number): void {
+    if (Date.now() - this.refreshedAt < maxAgeMs || this.running || Date.now() - this.failedAt < 30_000) return;
+    this.refresh().catch((e) => console.warn('[book] not read:', String((e as Error)?.message ?? e).slice(0, 200)));
   }
 
   /** Orders that can be bought from now. */

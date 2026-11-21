@@ -4,6 +4,8 @@ import { randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
 import { NETWORKS, accountOf, keyFromHex, limitOrderManifest, orderKeyFromSecret, signSubintent, swapsInTransaction } from '@radix-dex/core';
 import { createApp, marketTrades, orderLevels } from '../src/app.ts';
+import { rateKey } from '../src/http.ts';
+import { normaliseCandle } from '../src/marketdata.ts';
 import { loadConfig } from '../src/config.ts';
 import { fillGasXrd } from '../src/solver.ts';
 
@@ -14,6 +16,9 @@ let server: Server, base: string, app: Awaited<ReturnType<typeof createApp>>;
 
 before(async () => {
   app = await createApp(loadConfig({ DEX_NETWORK: 'stokenet', DEX_DATA_DIR: ':memory:', DEX_SOLVER_BADGE: BADGE, DEX_MAX_OPEN_ORDERS: '2' }));
+  // Offline: one listed market, and token divisibility without asking the ledger.
+  app.data.markets = [{ id: `${net.xrd}/${TUSD}`, base: { address: net.xrd, symbol: 'XRD', name: '' }, quote: { address: TUSD, symbol: 'TUSD', name: '' }, pools: [], tvlUsd: 0, volume24hUsd: 0 }];
+  app.data.quoter.divisibility = async (r: string) => (r === TUSD ? 6 : 18);
   server = app.api.listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${(server.address() as any).port}`;
@@ -25,9 +30,9 @@ const call = async (method: string, path: string, body?: unknown) => {
   return { status: res.status, json: await res.json() as any };
 };
 
-async function order(secret = randomBytes(32).toString('hex'), key = keyFromHex(randomBytes(32).toString('hex'))) {
+async function order(secret = randomBytes(32).toString('hex'), key = keyFromHex(randomBytes(32).toString('hex')), over: { sell?: string; sellAmount?: string; buy?: string } = {}) {
   const account = await accountOf(key, net.networkId);
-  const p = { account, sell: net.xrd, sellAmount: '100', buy: TUSD, minBuyAmount: '9' };
+  const p = { account, sell: over.sell ?? net.xrd, sellAmount: over.sellAmount ?? '100', buy: over.buy ?? TUSD, minBuyAmount: '9' };
   const signed = await signSubintent(limitOrderManifest({ ...p, solverBadge: BADGE }), { networkId: net.networkId, startEpoch: 1, endEpoch: 100, expiresAt: Math.floor(Date.now() / 1000) + 3600 }, key);
   return { secret, key, account, body: { ...p, orderKeyHex: orderKeyFromSecret(secret), signedPartialTransactionHex: signed.signedPartialTransactionHex } };
 }
@@ -158,4 +163,95 @@ test('swaps are read from a transaction: opposite moves in a pool are a trade, l
   ] } };
   assert.deepEqual(swapsInTransaction(tx, net.xrd, TUSD), [{ txid: 'tx', time: 1795298400, side: 'sell', price: 0.096, size: 100, entity: 'pool_1' }]);
   assert.deepEqual(swapsInTransaction({ ...tx, transaction_status: 'CommittedFailure' }, net.xrd, TUSD), []);
+});
+
+test('orders outside the listed markets, with too many decimals, or with a used key are refused', async () => {
+  const OTHER = 'resource_tdx_2_1t5jcmwqx39ym7fw0hrlpnxwechr0mzlgulcfcye59qm9y9fa5uvdrd';
+  assert.equal((await call('POST', '/api/orders', (await order(undefined, undefined, { buy: OTHER })).body)).status, 400, 'unlisted pair');
+  // TUSD has 6 decimal places here: 7 cannot be withdrawn.
+  assert.equal((await call('POST', '/api/orders', (await order(undefined, undefined, { sell: TUSD, buy: net.xrd, sellAmount: '1.1234567' })).body)).status, 400, 'too many decimals');
+  assert.equal((await call('POST', '/api/orders', (await order(undefined, undefined, { sell: TUSD, buy: net.xrd, sellAmount: '1.123456' })).body)).status, 200, 'six are fine');
+  const secret = randomBytes(32).toString('hex');
+  const first = await call('POST', '/api/orders', (await order(secret)).body);
+  assert.equal(first.status, 200);
+  assert.equal((await call('POST', '/api/orders', (await order(secret)).body)).status, 409, 'a second order with the same key is refused');
+});
+
+test('an account whose orders keep failing may not post more for a day', async () => {
+  const key = keyFromHex(randomBytes(32).toString('hex'));
+  const o = await order(undefined, key);
+  for (let i = 0; i < app.config.accountFailureLimit; i++) app.store.noteAccountFailure(o.account, 'x', 'boom');
+  assert.equal((await call('POST', '/api/orders', o.body)).status, 429);
+});
+
+test('malformed requests get a 4xx, not a 500', async () => {
+  assert.equal((await call('GET', '/api/quote?sell=' + net.xrd + '&buy=' + TUSD + '&amount=0x10')).status, 400);
+  assert.equal((await call('GET', '/api/quote?sell=' + net.xrd + '&buy=' + TUSD + '&amount=1e-19')).status, 400);
+  const market = encodeURIComponent(app.data.markets[0]!.id);
+  assert.equal((await call('GET', `/api/candles?market=${market}&resolution=7x`)).status, 400);
+  assert.equal((await call('GET', `/api/candles?market=${market}&resolution=__proto__`)).status, 400);
+  assert.equal((await call('POST', '/api/orders/abc/cancel', null)).status, 400);
+  assert.equal((await fetch(base + '/api/orders/%ZZ/cancel', { method: 'POST', body: '{}' })).status, 400);
+});
+
+test('responses carry headers that refuse framing and sniffing', async () => {
+  const res = await fetch(base + '/api/config');
+  assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(res.headers.get('content-security-policy'), "frame-ancestors 'none'");
+  assert.equal(res.headers.get('x-frame-options'), 'DENY');
+});
+
+test('health answers without the ledger and says what is wrong', async () => {
+  const r = await call('GET', '/api/health');
+  // Markets were set by hand, never refreshed: the monitor is told.
+  assert.equal(r.status, 503);
+  assert.deepEqual(r.json.problems, ['markets not loaded']);
+  assert.equal(r.json.solver, null);
+});
+
+test('IPv6 clients are rate-limited per /64', () => {
+  assert.equal(rateKey('2001:db8:1:2:3:4:5:6'), '2001:db8:1:2::/64');
+  assert.equal(rateKey('2001:db8:1:2::9'), '2001:db8:1:2::/64');
+  assert.equal(rateKey('::ffff:10.0.0.1'), '10.0.0.1');
+  assert.equal(rateKey('10.0.0.1'), '10.0.0.1');
+});
+
+test('candles are made self-consistent', () => {
+  assert.deepEqual(normaliseCandle({ time: 1, open: 0.25, high: 0.26, low: 0.26, close: 0.26, volume: 1 }), { time: 1, open: 0.25, high: 0.26, low: 0.25, close: 0.26, volume: 1 });
+});
+
+test('only a market pool\'s own holdings count as a trade, not a component passing tokens through', () => {
+  const ch = (entity_address: string, resource_address: string, balance_change: string) => ({ entity_address, resource_address, balance_change });
+  const tx = { transaction_status: 'CommittedSuccess', intent_hash: 'tx', confirmed_at: '2026-11-21T22:00:00.000Z', balance_changes: { fungible_balance_changes: [
+    ch('pool_native', net.xrd, '100'), ch('pool_native', TUSD, '-9.6'),
+    ch('component_arb', net.xrd, '-200'), ch('component_arb', TUSD, '9.6'),
+  ] } };
+  assert.deepEqual(swapsInTransaction(tx, net.xrd, TUSD, new Set(['component_pool', 'pool_native'])).map((s) => s.entity), ['pool_native']);
+});
+
+test('an order whose key is already cancelled in the registry is refused at submission', async () => {
+  const registry = await accountOf(keyFromHex(randomBytes(32).toString('hex')), net.networkId);
+  const app2 = await createApp(loadConfig({ DEX_NETWORK: 'stokenet', DEX_DATA_DIR: ':memory:', DEX_SOLVER_BADGE: BADGE, DEX_REGISTRY: registry }));
+  app2.data.markets = app.data.markets;
+  app2.data.quoter.divisibility = async () => 18;
+  const dead = new Set<string>();
+  app2.readGateway.status = async () => ({ epoch: 1, stateVersion: 1, timestamp: '' });
+  app2.readGateway.preview = async (manifest: string) => (dead.has(/Bytes\("([0-9a-f]{64})"\)/.exec(manifest)?.[1] ?? '')
+    ? { ok: false, error: 'Order has been cancelled', feeXrd: '0', changes: [], raw: {} } : { ok: true, feeXrd: '0', changes: [], raw: {} });
+  const s2 = app2.api.listen(0, '127.0.0.1');
+  await new Promise((r) => s2.once('listening', r));
+  try {
+    const post = async (cancelled: boolean) => {
+      const key = keyFromHex(randomBytes(32).toString('hex'));
+      const account = await accountOf(key, net.networkId);
+      const orderKeyHex = orderKeyFromSecret(randomBytes(32).toString('hex'));
+      if (cancelled) dead.add(orderKeyHex);
+      const p = { account, sell: net.xrd, sellAmount: '100', buy: TUSD, minBuyAmount: '9' };
+      const signed = await signSubintent(limitOrderManifest({ ...p, solverBadge: BADGE, registry: { component: registry, orderKeyHex } }), { networkId: net.networkId, startEpoch: 1, endEpoch: 100, expiresAt: Math.floor(Date.now() / 1000) + 3600 }, key);
+      const res = await fetch(`http://127.0.0.1:${(s2.address() as any).port}/api/orders`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...p, orderKeyHex, signedPartialTransactionHex: signed.signedPartialTransactionHex }) });
+      return res.status;
+    };
+    assert.equal(await post(true), 400);
+    assert.equal(await post(false), 200);
+  } finally { s2.close(); app2.store.close(); }
 });
