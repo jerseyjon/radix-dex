@@ -13,7 +13,8 @@
     "test": "tsx --test packages/core/test/*.test.ts apps/server/test/*.test.ts",
     "server": "tsx apps/server/src/main.ts",
     "web": "npm run dev -w apps/web",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p scripts/tsconfig.json --noEmit",
+    "backup": "tsx scripts/backup-db.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

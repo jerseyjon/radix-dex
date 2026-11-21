@@ -1,3 +1,9 @@
+// FIRST VERSION, KEPT ONLY TO CREATE THE TEST KEYS. It exercises the first-version manifests
+// (inventoryFillManifest, crossFillManifest) that the server no longer uses; the tests of what runs
+// today are stokenet-server-e2e.ts, stokenet-pool-e2e.ts and stokenet-book-e2e.ts. It is still the
+// script that creates data/stokenet-keys.json, which stokenet-setup.ts and those tests need. Once key
+// creation moves into stokenet-setup.ts it can be deleted.
+//
 // End-to-end test of subintent limit orders on Stokenet with throwaway keys.
 // Usage: tsx scripts/stokenet-e2e.ts      (keys are kept in data/stokenet-keys.json, which is git-ignored)
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -38,7 +44,7 @@ const balance = async (account: string, resource: string): Promise<string> => {
 const expect = (cond: boolean, what: string) => { console.log(`${cond ? 'PASS' : 'FAIL'}  ${what}`); if (!cond) process.exitCode = 1; };
 
 const solverKey = key('solver'), aliceKey = key('alice'), bobKey = key('bob');
-const [solver, alice, bob] = await Promise.all([solverKey, aliceKey, bobKey].map((k) => accountOf(k, net.networkId)));
+const [solver, alice, bob] = (await Promise.all([solverKey, aliceKey, bobKey].map((k) => accountOf(k, net.networkId)))) as [string, string, string];
 console.log({ solver, alice, bob });
 
 // 1. Fund the three accounts from the faucet if they are short of XRD.

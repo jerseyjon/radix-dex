@@ -7,8 +7,9 @@
 // The solver keeps `--keep` XRD as its float for network fees and for buying book orders. Everything
 // above that, and every other token it has collected as fees, goes to the owner. The solver badge never moves.
 import { readFileSync } from 'node:fs';
-import Decimal from 'decimal.js';
-import { Gateway, NETWORKS, accountOf, addr, buildTransaction, dec, isAccount, keyFromHex, submitAndWait } from '../packages/core/src/index.ts';
+// Core's Decimal (60 digits, rounding down), never decimal.js's defaults, which could round a balance up.
+import { Decimal, Gateway, NETWORKS, accountOf, addr, buildTransaction, dec, isAccount, keyFromHex, submitAndWait } from '../packages/core/src/index.ts';
+import { planWithdrawal } from '../apps/server/src/withdrawal.ts';
 
 const net = NETWORKS.mainnet, gw = new Gateway(net);
 const state = JSON.parse(readFileSync('data/mainnet-setup.json', 'utf8')) as Record<string, string>;
@@ -25,18 +26,14 @@ const keep = new Decimal(flag('--keep') ?? '250');
 if (!keep.isFinite() || keep.lt(20)) throw new Error('--keep must be at least 20 XRD, or the solver cannot pay network fees');
 
 const balances = await gw.fungibleBalances(solver);
-const moves: [string, Decimal][] = [];
 console.log('Solver ' + solver);
 for (const [resource, amount] of Object.entries(balances)) {
-  const have = new Decimal(amount);
-  if (!have.gt(0)) continue;
+  if (!new Decimal(amount).gt(0)) continue;
   const label = resource === net.xrd ? 'XRD' : resource === state.solverBadge ? 'solver badge (stays)' : resource;
-  console.log('  ' + have.toFixed() + '  ' + label);
-  if (resource === state.solverBadge) continue;
-  // One XRD is left over the float for this transaction's own fee.
-  const move = resource === net.xrd ? have.minus(keep).minus(1) : have;
-  if (move.gt(0)) moves.push([resource, move]);
+  console.log('  ' + new Decimal(amount).toFixed() + '  ' + label);
 }
+// One XRD is left over the float for this transaction's own fee.
+const moves = planWithdrawal(balances, { xrd: net.xrd, badge: state.solverBadge!, keep: keep.toFixed() });
 if (!moves.length) { console.log(`\nNothing to withdraw: the solver holds no more than the ${keep.toFixed()} XRD it keeps.`); process.exit(0); }
 
 const manifest = [
