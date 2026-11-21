@@ -69,7 +69,9 @@ const orderState = async (id: string) => (await json('/api/orders?account=' + al
 const markets = await json('/api/markets');
 expect(markets.length === 1 && markets[0].venues[0] === 'radixdex', 'server lists the XRD/TUSD market on our own pool');
 const quote = await json('/api/quote?sell=' + net.xrd + '&buy=' + s.tusd + '&amount=100');
-expect(Number(quote.buyAmount) > 9 && Number(quote.buyAmount) < 10, 'quote for 100 XRD is ' + quote.buyAmount + ' TUSD');
+expect(Number(quote.buyAmount) > 5 && Number(quote.buyAmount) < 15, 'quote for 100 XRD is ' + quote.buyAmount + ' TUSD');
+// A minimum 5% under what the pool pays now, whatever the price has drifted to.
+const low = (Number(quote.buyAmount) * 0.95).toFixed(6);
 const depth = await json('/api/depth?market=' + encodeURIComponent(markets[0].id));
 expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth.bids.length + ' bids and ' + depth.asks.length + ' asks from the pool');
 
@@ -77,7 +79,7 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
 {
   const before = { xrd: await balance(alice, net.xrd), tusd: await balance(alice, s.tusd) };
   const far = await place('100', '20');   // 0.2 TUSD per XRD: twice the market, must stay open
-  const o = await place('100', '9');      // 0.09 TUSD per XRD: below the market, fills
+  const o = await place('100', low);      // 0.09 TUSD per XRD: below the market, fills
   const tick = await app.solver!.tick();
   expect(tick.poolFilled === 1, 'solver filled exactly one order through the pool (poolFilled=' + tick.poolFilled + ')');
   const st = await orderState(o.id);
@@ -85,7 +87,7 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
   const got = (await balance(alice, s.tusd)) - before.tusd;
   const paid = before.xrd - (await balance(alice, net.xrd));
   expect(Math.abs(paid - 100) < 1e-9, 'user paid exactly 100 XRD, no network fee (paid ' + paid + ')');
-  expect(got > 9 && got < Number(quote.buyAmount), 'user received ' + got.toFixed(6) + ' TUSD: above the 9 minimum, below the gross quote (fee and gas taken)');
+  expect(got > Number(low) && got < Number(quote.buyAmount), 'user received ' + got.toFixed(6) + ' TUSD: above the minimum, below the gross quote (fee and gas taken)');
   expect((await orderState(far.id))?.status === 'open', 'the order priced away from the market is still open');
   const book = await json('/api/depth?market=' + encodeURIComponent(markets[0].id));
   expect(book.asks.some((l: any) => l.source === 'orders' && Math.abs(l.price - 0.2) < 1e-9), 'that open order shows in the book as an ask at 0.2');
@@ -94,7 +96,7 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
 
 // 2. Hard cancel. The order stays on the server (as if the server ignored the user), but the ledger refuses it.
 {
-  const o = await place('100', '9');
+  const o = await place('100', low);
   const { epoch } = await gw.status();
   // Anyone holding the secret can cancel; here Alice does, paying her own fee.
   const cancelTx = await buildTransaction({
@@ -133,12 +135,12 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
 // 4. A market order takes a resting limit order that beats the pool, and the pool for the rest, in one transaction.
 {
   // Fresh prices from the pool itself: what it pays for 50 XRD, and what it charges someone buying about that much.
-  const sellPrice = Number((await json('/api/quote?sell=' + net.xrd + '&buy=' + s.tusd + '&amount=50')).buyAmount) / 50;
-  const buyPrice = 5 / Number((await json('/api/quote?sell=' + s.tusd + '&buy=' + net.xrd + '&amount=5')).buyAmount);
+  const sellPrice = Number((await json('/api/quote?sell=' + net.xrd + '&buy=' + s.tusd + '&amount=150')).buyAmount) / 150;
+  const buyPrice = 15 / Number((await json('/api/quote?sell=' + s.tusd + '&buy=' + net.xrd + '&amount=15')).buyAmount);
   const mid = (sellPrice + buyPrice) / 2;
-  // Alice offers 50 XRD at the mid price: better for a buyer than the pool, but the pool will not pay it, so it rests.
-  const gross = 50 * mid;
-  const maker = await post(aliceKey, { sell: net.xrd, sellAmount: '50', buy: s.tusd, limitBuyAmount: n(gross), minBuyAmount: n(gross - gross / 50 - gross * 0.001) });
+  // Alice offers 150 XRD at the mid price: better for a buyer than the pool, but the pool will not pay it, so it rests.
+  const gross = 150 * mid;
+  const maker = await post(aliceKey, { sell: net.xrd, sellAmount: '150', buy: s.tusd, limitBuyAmount: n(gross), minBuyAmount: n(gross - gross / 150 - gross * 0.001) });
   expect((await app.solver!.tick()).poolFilled === 0, 'a sell at the mid price rests: the pool does not pay that much');
   // Bob buys with enough TUSD to take all of it and a little more from the pool.
   const spend = n(gross + 1);
@@ -153,10 +155,11 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
   expect(stT?.status === 'filled' && stM?.status === 'filled' && stT.fillTx === stM.fillTx, 'market order and resting order filled in the same transaction (' + stT?.status + ', ' + stM?.status + '), fee paid by solver: ' + (stT?.fillTx ? await feeOf(stT.fillTx) : '?') + ' XRD');
   const bobGot = (await balance(bob, net.xrd)) - before.bx, bobPaid = before.bt - (await balance(bob, s.tusd));
   const aliceGot = (await balance(alice, s.tusd)) - before.at, alicePaid = before.ax - (await balance(alice, net.xrd));
-  expect(Math.abs(bobPaid - Number(spend)) < 1e-9 && Math.abs(alicePaid - 50) < 1e-9, 'Bob paid exactly ' + spend + ' TUSD and Alice exactly 50 XRD');
+  expect(Math.abs(bobPaid - Number(spend)) < 1e-9 && Math.abs(alicePaid - 150) < 1e-9, 'Bob paid exactly ' + spend + ' TUSD and Alice exactly 150 XRD');
   expect(Math.abs(aliceGot - gross * 0.999) < 1e-6, 'Alice received her price less 0.10%: ' + aliceGot.toFixed(6) + ' TUSD');
   const bobGross = bobGot + 1.35 + (bobGot + 1.35) / 0.999 * 0.001;
-  expect(bobGross > poolOnly, 'Bob got ' + bobGot.toFixed(4) + ' XRD after fees (' + bobGross.toFixed(4) + ' before), better than the pool alone at ' + poolOnly.toFixed(4));
+  // Better even after the dearer network fee: 1.35 XRD against 1 XRD for the pool alone.
+  expect(bobGot > (poolOnly - 1) * 0.999, 'Bob got ' + bobGot.toFixed(4) + ' XRD after fees (' + bobGross.toFixed(4) + ' before), better than the pool alone at ' + poolOnly.toFixed(4));
 }
 server.close();
 console.log(process.exitCode ? 'SOME CHECKS FAILED' : 'ALL CHECKS PASSED');

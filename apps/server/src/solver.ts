@@ -32,6 +32,8 @@ interface Execution {
   route: Pool[];
   /** Everything the taker's sale produces, before the network fee and our fee. */
   total: Decimal;
+  /** The network fee for this execution, in the token the taker buys. */
+  gasInBuyToken: string;
 }
 
 /**
@@ -136,7 +138,10 @@ export class Solver {
           makers = [{ order: first.order, cost: cost.toFixed(), pay: pay.toFixed() }, ...makers.slice(1)];
         }
       }
-      if (!best || total.gt(best.total)) best = { makers, poolIn, route, total };
+      // Each resting order adds to the network fee the taker pays, so compare what is left after it.
+      const gasXrd = new Decimal(GAS_XRD).mul(1 + GAS_PER_MAKER * makers.length);
+      const gasInBuyToken = taker.buy === xrd ? gasXrd.toFixed() : taker.sell === xrd ? total.div(taker.sellAmount).mul(gasXrd).toFixed(18) : '0';
+      if (!best || total.minus(gasInBuyToken).gt(best.total.minus(best.gasInBuyToken))) best = { makers, poolIn, route, total, gasInBuyToken };
     }
     return best;
   }
@@ -159,17 +164,18 @@ export class Solver {
       await this.account();
       const solver = this.identity!;
       await this.loadDivisibility(open.flatMap((o) => [o.sell, o.buy]));
-      const xrd = this.config.network.xrd;
       const done = new Set<string>();
 
       for (const o of open) {
         if (done.has(o.id)) continue;
         let involved: StoredOrder[] = [o];
+        // When a fill that used resting orders fails, hold those back and let the taker try again
+        // at once without them: a resting order cancelled on the ledger must not strand a market order.
+        let blame: StoredOrder[] = [o];
         try {
           const exec = await this.bestExecution(o, open.filter((m) => m.kind !== 'market' && !done.has(m.id)));
           if (!exec) { this.outlook.delete(o.id); continue; }
-          const gasXrd = new Decimal(GAS_XRD).mul(1 + GAS_PER_MAKER * exec.makers.length);
-          const gasInBuyToken = o.buy === xrd ? gasXrd.toFixed() : o.sell === xrd ? exec.total.div(o.sellAmount).mul(gasXrd).toFixed(18) : '0';
+          const { gasInBuyToken } = exec;
           // With no pool leg the outcome is exact, so no margin is needed.
           const terms = { minBuyAmount: o.minBuyAmount, limitBuyAmount: limitOf(o).toFixed(), gasInBuyToken, bufferBps: exec.route.length ? undefined : 0 };
           this.outlook.set(o.id, { available: exec.total.toFixed(), needed: grossNeeded(terms).toFixed(), at: now });
@@ -177,6 +183,7 @@ export class Solver {
           if (!plan) continue;
           const makers = exec.makers.map((m) => m.order as StoredOrder);
           involved = [o, ...makers];
+          if (makers.length) blame = makers;
           let unfunded = false;
           for (const x of involved) if (!(await this.funded(x))) { this.fail([x], 'account no longer holds the sell amount'); unfunded = true; }
           if (unfunded) continue;
@@ -185,13 +192,13 @@ export class Solver {
           const res = await this.submit(
             takeFillManifest({ solver, feeLockXrd: FEE_LOCK_XRD, sell: o.sell, buy: o.buy, makerPays: exec.makers.map((m) => m.pay), poolIn: exec.poolIn, route: exec.route, solverTake: plan.solverTake }),
             children);
-          if (!res.ok) { this.fail(involved, res.error); continue; }
+          if (!res.ok) { this.fail(blame, res.error); continue; }
           this.store.markFilled(o.id, res.txid, plan.userReceives);
           exec.makers.forEach((m) => this.store.markFilled(m.order.id, res.txid, m.pay));
           involved.forEach((x) => done.add(x.id));
           if (makers.length) result.crossed += involved.length; else result.poolFilled += 1;
           console.log(`[solver] filled ${o.kind} ${o.id.slice(-8)}${makers.length ? ' against ' + makers.map((m) => m.id.slice(-8)).join('+') : ''}${exec.route.length ? ' through ' + exec.route.map((p) => p.venue).join('>') : ''} in ${res.txid}`);
-        } catch (e) { this.fail(involved, String((e as Error).message ?? e)); }
+        } catch (e) { this.fail(blame, String((e as Error).message ?? e)); }
       }
       return result;
     } finally {
