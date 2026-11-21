@@ -272,3 +272,23 @@ export function planBookCross(first: BookOrder, second: BookOrder, float: string
   if (pay.gt(float) || !back.minus(pay).minus(gas).gt(0)) return undefined;
   return { pay: pay.toFixed(), middle: middle.toFixed(), back: back.toFixed() };
 }
+
+/**
+ * The same trade as `bookArbManifest` for a solver that holds the token the order sells rather
+ * than the one it wants: sell `sellIn` of it through pools first, pay everything that returns
+ * into the order, and require at least `minBack` of the starting token at the end.
+ */
+export function bookArbPoolFirstManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; id: number; startResource: string; sellIn: string; payResource: string; route: Pool[]; minBack: string }): string {
+  const path = routePath(o.route, o.startResource);
+  if (path[path.length - 1] !== o.payResource) throw new Error('route does not reach the payment token');
+  return [
+    `CALL_METHOD ${addr(o.solver.account)} "lock_fee" ${dec(o.feeLockXrd)};`,
+    `CALL_METHOD ${addr(o.solver.account)} "withdraw" ${addr(o.startResource)} ${dec(o.sellIn)};`,
+    `TAKE_ALL_FROM_WORKTOP ${addr(o.startResource)} ${bucket('in0')};`,
+    ...routeInstructions(o.route, o.startResource),
+    `TAKE_ALL_FROM_WORKTOP ${addr(o.payResource)} ${bucket('pay')};`,
+    `CALL_METHOD ${addr(o.book)} "fill" ${u64(o.id)} ${bucket('pay')};`,
+    `ASSERT_WORKTOP_CONTAINS ${addr(o.startResource)} ${dec(o.minBack)};`,
+    `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
+  ].join('\n');
+}

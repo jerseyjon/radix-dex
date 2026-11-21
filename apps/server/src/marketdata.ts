@@ -1,7 +1,6 @@
 import {
   type Depth, type Gateway, type Market, type Pool, type Quote, type Token,
-  Quoter, buildMarkets, filterAllowedPools, listDefiPlaza, listOciswap, mergeDepth, tokensFromLedger, defaultJsonFetch,
-} from '@radix-dex/core';
+  Quoter, buildMarkets, filterAllowedPools, listDefiPlaza, listOciswap, mergeDepth, tokensFromLedger, defaultJsonFetch, Decimal } from '@radix-dex/core';
 import { readFileSync } from 'node:fs';
 import type { Config } from './config.ts';
 
@@ -89,6 +88,26 @@ export class MarketData {
 
   market(id: string): Market | undefined {
     return this.markets.find((m) => m.id === id);
+  }
+
+  private readonly xrdRates = new Map<string, { at: number; perXrd: Decimal | undefined }>();
+
+  /**
+   * What `xrdAmount` of XRD is worth in `resource`, at what pools pay for XRD now. Used to charge
+   * the network fee, which the solver pays in XRD, in whatever token an order buys.
+   * Undefined when no pool route prices the token: such an order cannot be charged, so it is not filled.
+   */
+  async xrdValueIn(resource: string, xrdAmount: string | number | Decimal): Promise<string | undefined> {
+    const xrd = this.config.network.xrd;
+    if (resource === xrd) return new Decimal(xrdAmount).toFixed();
+    let rate = this.xrdRates.get(resource);
+    if (!rate || Date.now() - rate.at > 120_000) {
+      const probe = '10';
+      const q = await this.quoter.best(this.pools, xrd, resource, probe, xrd).catch(() => undefined);
+      rate = { at: Date.now(), perXrd: q ? new Decimal(q.buyAmount).div(probe) : undefined };
+      this.xrdRates.set(resource, rate);
+    }
+    return rate.perXrd?.mul(xrdAmount).toFixed(18);
   }
 
   quote(sell: string, buy: string, amount: string): Promise<Quote | undefined> {

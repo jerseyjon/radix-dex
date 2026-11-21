@@ -29,6 +29,10 @@ export interface Config {
   marketsFile: string | undefined;
   /** dApp definition account the wallet checks the site against. Without it the site is read-only. */
   dAppDefinition: string | undefined;
+  /** Header carrying the visitor's address when the server sits behind a proxy (for example `cf-connecting-ip` behind Cloudflare). */
+  clientIpHeader: string | undefined;
+  /** Requests allowed per visitor per minute. */
+  ratePerMinute: number;
   /** Optional second listener over https (the Radix Connector extension needs https off localhost). */
   tls: { port: number; keyFile: string; certFile: string } | undefined;
 }
@@ -68,6 +72,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxOpenOrdersPerAccount: Number(env.DEX_MAX_OPEN_ORDERS ?? 50),
     marketsFile: env.DEX_MARKETS_FILE,
     dAppDefinition: env.DEX_DAPP_DEFINITION,
+    clientIpHeader: env.DEX_CLIENT_IP_HEADER,
+    ratePerMinute: Number(env.DEX_RATE_PER_MINUTE ?? 240),
     tls: env.DEX_TLS_KEY_FILE && env.DEX_TLS_CERT_FILE
       ? { port: Number(env.DEX_TLS_PORT ?? 8443), keyFile: env.DEX_TLS_KEY_FILE, certFile: env.DEX_TLS_CERT_FILE } : undefined,
   };

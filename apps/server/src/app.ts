@@ -71,7 +71,11 @@ export async function createApp(config: Config) {
   const solver = config.solverBadge && config.solverKeyFile
     ? new Solver({ config, gateway, store, data, key: loadSolverKey(config.solverKeyFile), badge: config.solverBadge, book })
     : undefined;
-  const api = new Api({ staticDir: config.webDir });
+  const api = new Api({
+    staticDir: config.webDir, clientIpHeader: config.clientIpHeader, ratePerMinute: config.ratePerMinute,
+    // The Radix Wallet fetches this from the site to confirm the dApp definition really claims it.
+    documents: config.dAppDefinition ? { '/.well-known/radix.json': { dApps: [{ dAppDefinitionAddress: config.dAppDefinition }] } } : {},
+  });
 
   const marketOr404 = (id: string) => {
     const m = data.market(id);
@@ -120,7 +124,8 @@ export async function createApp(config: Config) {
     if (!d.isFinite() || !d.gt(0) || d.gt('1e30')) throw new HttpError(400, 'Bad amount');
     const q = await data.quote(sell, buy, d.toDecimalPlaces(18).toFixed());
     if (!q) throw new HttpError(404, 'No route with enough liquidity');
-    return q;
+    // The network fee of a plain fill, in the token being bought, so the site can show it before an order is signed.
+    return { ...q, gasInBuyToken: (await data.xrdValueIn(buy, GAS_XRD).catch(() => undefined)) ?? null };
   });
 
   api.on('GET', '/api/balances', async ({ url }) => {

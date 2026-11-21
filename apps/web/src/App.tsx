@@ -116,8 +116,9 @@ export function App() {
         </div>
       </header>
 
-      {(STATIC || config.warning) && (
+      {(STATIC || config.warning || (config.network === 'mainnet' && wallet)) && (
         <div className="banner">
+          {config.network === 'mainnet' && wallet && !STATIC && <>Early release with real funds. This software and its contracts have not been independently audited: trade only what you can afford to lose. </>}
           {STATIC && <>Read-only preview. Market data is a snapshot taken {config.snapshotAt ? fmtTime(config.snapshotAt) : 'earlier'}; trading is switched off. </>}
           {config.warning && <>Some market data could not be refreshed ({config.warning}).</>}
         </div>

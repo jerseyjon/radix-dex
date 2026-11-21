@@ -85,7 +85,8 @@ export function OrderForm(props: {
   const viaSolver = Boolean(lo?.filling);
   const feesOn = (gross: number | undefined) => {
     if (gross === undefined || !lo || !sellAmount) return undefined;
-    const network = buyTok.address === config.xrd ? Number(lo.gasXrd) : sellTok.address === config.xrd ? gross / Number(sellAmount) * Number(lo.gasXrd) : 0;
+    const network = quote?.gasInBuyToken != null ? Number(quote.gasInBuyToken)
+      : buyTok.address === config.xrd ? Number(lo.gasXrd) : sellTok.address === config.xrd ? gross / Number(sellAmount) * Number(lo.gasXrd) : 0;
     return { network, service: gross * config.feeBps / 10_000 };
   };
   const limitFees = feesOn(limitGross ? Number(limitGross) : undefined);

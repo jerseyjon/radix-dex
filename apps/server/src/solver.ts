@@ -2,7 +2,7 @@ import { readFileSync, statSync } from 'node:fs';
 import {
   type DecodedOrder, type Ed25519Key, type Gateway, type SolverIdentity, Decimal,
   type BookOrder, type LiquidityItem, type Pool,
-  accountOf, bookArbManifest, bookCrossManifest, buildTransaction, decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, payout,
+  accountOf, bookArbManifest, bookArbPoolFirstManifest, bookCrossManifest, buildTransaction, decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, payout,
   pickLiquidity, planBookCross, planPoolFill, submitAndWait, takeFillManifest,
 } from '@radix-dex/core';
 import type { BookWatcher } from './book.ts';
@@ -125,9 +125,9 @@ export class Solver {
     console.warn(`[solver] ${orders.map((o) => o.id.slice(-8)).join('+')}: ${error.slice(0, 200)}`);
   }
 
-  private gasIn(resource: string, counter: string, perCounter: Decimal, gasXrd: Decimal): string {
-    const xrd = this.config.network.xrd;
-    return resource === xrd ? gasXrd.toFixed() : counter === xrd ? perCounter.mul(gasXrd).toFixed(18) : '0';
+  /** The network fee, which the solver pays in XRD, valued in `resource`. Undefined if no pool prices that token. */
+  private gasIn(resource: string, gasXrd: Decimal): Promise<string | undefined> {
+    return this.data.xrdValueIn(resource, gasXrd);
   }
 
   /**
@@ -161,7 +161,8 @@ export class Solver {
       }
       // Each order taken adds to the network fee the taker pays, so compare what is left after it.
       const gasXrd = fillGasXrd(items.length, route.length > 0);
-      const gasInBuyToken = this.gasIn(taker.buy, taker.sell, total.div(taker.sellAmount), gasXrd);
+      const gasInBuyToken = await this.gasIn(taker.buy, gasXrd);
+      if (gasInBuyToken === undefined) continue; // the fee cannot be charged in this token: do not fill for nothing
       if (!best || total.minus(gasInBuyToken).gt(best.total.minus(best.gasInBuyToken))) best = { items, poolIn, route, total, gasInBuyToken };
     }
     return best;
@@ -181,7 +182,9 @@ export class Solver {
       const quote = await this.data.quoter.best(this.data.pools, b.sell, b.buy, q.toFixed(), xrd).catch(() => undefined);
       if (!quote) return undefined;
       const cost = q.mul(b.price).toDecimalPlaces(buyDiv, Decimal.ROUND_UP);
-      const gas = mustCoverGas ? new Decimal(this.gasIn(b.buy, b.sell, new Decimal(quote.buyAmount).div(q), new Decimal(GAS_XRD))) : new Decimal(0);
+      const priced = mustCoverGas ? await this.gasIn(b.buy, new Decimal(GAS_XRD)) : '0';
+      if (priced === undefined) return undefined;
+      const gas = new Decimal(priced);
       return new Decimal(quote.buyAmount).minus(cost).minus(gas).gt(0) ? { q, cost, route: quote.route } : undefined;
     };
     // One cheap look first: if even a small part does not sell for more than it costs, nothing will.
@@ -196,6 +199,29 @@ export class Solver {
       }), {});
       if (!res.ok) { this.bookRetryAt.set(b.id, Date.now() + 60_000); console.warn(`[solver] book order ${b.id}: ${res.error.slice(0, 200)}`); return false; }
       console.log(`[solver] bought ${plan.q.toFixed()} from book order ${b.id} and sold it through ${plan.route.map((p) => p.venue).join('>')} in ${res.txid}`);
+      return true;
+    }
+
+    // Not enough of the token the order wants (a solver that holds only XRD, say). Do it the other
+    // way round with the token the order sells: sell some through the pool, pay the proceeds into
+    // the order, and end with more of that token than it started with.
+    const start = await this.balance(solver.account, b.sell);
+    const gasPriced = await this.gasIn(b.sell, new Decimal(GAS_XRD));
+    if (gasPriced === undefined) return false;
+    for (const share of ARB_SHARES) {
+      const x = new Decimal(b.remaining).mul(share).toDecimalPlaces(sellDiv, Decimal.ROUND_DOWN);
+      if (!x.gt(0) || x.gt(start)) continue;
+      const quote = await this.data.quoter.best(this.data.pools, b.sell, b.buy, x.toFixed(), xrd).catch(() => undefined);
+      if (!quote) continue;
+      // What the pool's proceeds buy from the order, by the component's own sum.
+      const back = Decimal.min(new Decimal(quote.buyAmount).div(b.price).toDecimalPlaces(sellDiv, Decimal.ROUND_DOWN), b.remaining);
+      if (!back.minus(x).minus(gasPriced).gt(0)) continue;
+      const res = await this.submit(bookArbPoolFirstManifest({
+        solver, feeLockXrd: FEE_LOCK_XRD, book: this.book!.component, id: b.id, startResource: b.sell, sellIn: x.toFixed(),
+        payResource: b.buy, route: quote.route, minBack: x.toFixed(),
+      }), {});
+      if (!res.ok) { this.bookRetryAt.set(b.id, Date.now() + 60_000); console.warn(`[solver] book order ${b.id}: ${res.error.slice(0, 200)}`); return false; }
+      console.log(`[solver] sold ${x.toFixed()} through ${quote.route.map((p) => p.venue).join('>')} and bought ${back.toFixed()} from book order ${b.id} in ${res.txid}`);
       return true;
     }
     return false;
@@ -277,7 +303,8 @@ export class Solver {
             // A free look first: most pairs do not cross, and that needs no balance from the ledger.
             if (!planBookCross(first, second, '1e30', '0', this.divisibility)) continue;
             const float = await this.balance(solver.account, first.buy);
-            const gas = this.gasIn(first.buy, first.sell, new Decimal(first.price), new Decimal(GAS_XRD));
+            const gas = await this.gasIn(first.buy, new Decimal(GAS_XRD));
+            if (gas === undefined) continue;
             const plan = planBookCross(first, second, float.toFixed(), gas, this.divisibility);
             if (!plan) continue;
             const res = await this.submit(bookCrossManifest({

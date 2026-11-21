@@ -23,10 +23,16 @@ const MAX_BODY = 64 * 1024;
 export class Api {
   private readonly routes: Route[] = [];
   private readonly hits = new Map<string, { count: number; windowStart: number }>();
-  private readonly opts: { staticDir?: string; ratePerMinute: number; allowOrigin: string };
+  private readonly opts: { staticDir?: string; ratePerMinute: number; allowOrigin: string; clientIpHeader?: string; documents: Record<string, unknown> };
 
-  constructor(opts: { staticDir?: string; ratePerMinute?: number; allowOrigin?: string } = {}) {
-    this.opts = { staticDir: opts.staticDir && resolve(opts.staticDir), ratePerMinute: opts.ratePerMinute ?? 240, allowOrigin: opts.allowOrigin ?? '*' };
+  /**
+   * `clientIpHeader`: behind a proxy every request arrives from the proxy's address, so the rate
+   * limit must read the visitor's address from the header the proxy sets. Only set it when the
+   * server cannot be reached except through that proxy, or anyone could forge the header.
+   * `documents`: fixed JSON served at exact paths outside /api.
+   */
+  constructor(opts: { staticDir?: string; ratePerMinute?: number; allowOrigin?: string; clientIpHeader?: string; documents?: Record<string, unknown> } = {}) {
+    this.opts = { staticDir: opts.staticDir && resolve(opts.staticDir), ratePerMinute: opts.ratePerMinute ?? 240, allowOrigin: opts.allowOrigin ?? '*', clientIpHeader: opts.clientIpHeader?.toLowerCase(), documents: opts.documents ?? {} };
   }
 
   on(method: string, path: string, handler: Handler): void {
@@ -77,11 +83,14 @@ export class Api {
       };
       try {
         if (req.method === 'OPTIONS') return send(204, null);
+        if (req.method === 'GET' && url.pathname in this.opts.documents) return send(200, this.opts.documents[url.pathname]);
         if (!url.pathname.startsWith('/api/')) {
           if (req.method === 'GET' && (await this.serveStatic(url.pathname, res))) return;
           return send(404, { error: 'Not found' });
         }
-        if (this.limited(req.socket.remoteAddress ?? '?')) return send(429, { error: 'Too many requests' });
+        const forwarded = this.opts.clientIpHeader ? req.headers[this.opts.clientIpHeader] : undefined;
+        const client = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(',')[0]?.trim() || req.socket.remoteAddress || '?';
+        if (this.limited(client)) return send(429, { error: 'Too many requests' });
         for (const route of this.routes) {
           if (route.method !== req.method) continue;
           const m = route.pattern.exec(url.pathname);

@@ -1,0 +1,24 @@
+# systemd unit for the mainnet site and solver. Copy to /etc/systemd/system/, adjust User and paths,
+# put the settings printed by "tsx scripts/mainnet-setup.ts status" in /etc/radix-dex.env, then:
+#   systemctl daemon-reload && systemctl enable --now radix-dex
+# The server listens on 127.0.0.1 only; Cloudflare Tunnel (cloudflared) is the only way in.
+[Unit]
+Description=Radix DEX site and solver (mainnet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=radixdex
+WorkingDirectory=/opt/radix-dex
+EnvironmentFile=/etc/radix-dex.env
+Environment=DEX_HOST=127.0.0.1 DEX_PORT=8787 DEX_WEB_DIR=apps/web/dist DEX_DATA_DIR=/var/lib/radix-dex
+ExecStart=/usr/bin/npx tsx apps/server/src/main.ts
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/radix-dex
+
+[Install]
+WantedBy=multi-user.target

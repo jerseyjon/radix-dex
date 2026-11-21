@@ -172,5 +172,29 @@ const id = await placeInBook('300', mid);
   expect(placed?.createdAt > Date.now() / 1000 - 600, 'the order shows the time it was placed');
   await walletTx(aliceKey, alice, bookCancelManifest({ account: alice, book: s.orderBookTest, receipts: s.orderReceiptsTest, id: ask }));
 }
+
+// 7. A solver that holds none of the token an order wants (on mainnet it will hold only XRD):
+// it sells XRD through the pool first and pays the proceeds into the order.
+{
+  const solverKey = keyFromHex(s.solver), solverAccount = await app.solver!.account();
+  const held = Math.floor(await balance(solverAccount, s.tusd));
+  const move = async (key: Ed25519Key, from: string, to: string, amount: number) => { if (amount > 0) await walletTx(key, from, 'CALL_METHOD ' + addr(from) + ' "withdraw" ' + addr(s.tusd) + ' Decimal("' + amount + '");\nCALL_METHOD ' + addr(to) + ' "try_deposit_batch_or_abort" Expression("ENTIRE_WORKTOP") None;'); };
+  await move(solverKey, solverAccount, bob, held); // park the solver's TUSD with the test buyer
+  try {
+    const price = Number(n(((await quote(net.xrd, s.tusd, '200')) / 200) * 0.96));
+    const cheap = await placeInBook('200', price);
+    const before = { at: await balance(alice, s.tusd), sx: await balance(solverAccount, net.xrd) };
+    let bought = 0;
+    for (let i = 0; i < 6 && (await bookOrder(cheap))?.status === 'open'; i++) bought += (await app.solver!.tick()).bookBought;
+    const o = await bookOrder(cheap);
+    const gain = (await balance(solverAccount, net.xrd)) - before.sx;
+    expect(bought >= 1 && Number(o?.sold) > 0, 'with no TUSD of its own the solver still filled the order (' + o?.sold + ' of 200 XRD sold, ' + bought + ' purchase(s))');
+    expect(Math.abs((await balance(alice, s.tusd)) - before.at - Number(o?.sold) * price) < 1e-6, 'the maker got exactly her price');
+    expect(gain > -1.5 * bought, 'the solver ended with ' + gain.toFixed(4) + ' XRD more, after network fees');
+    if (o?.status === 'open') await walletTx(aliceKey, alice, bookCancelManifest({ account: alice, book: s.orderBookTest, receipts: s.orderReceiptsTest, id: cheap }));
+  } finally {
+    await move(bobKey, bob, solverAccount, held);
+  }
+}
 server.close();
 console.log(process.exitCode ? 'SOME CHECKS FAILED' : 'ALL CHECKS PASSED');

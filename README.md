@@ -53,6 +53,8 @@ depth and quotes but cannot trade.
 | `DEX_REGISTRY` | `OrderRegistry` component, to enable hard cancels | unset |
 | `DEX_MARKETS_FILE` | JSON of tokens and pools, for networks with no venue API | unset |
 | `DEX_DAPP_DEFINITION` | dApp definition account, so the wallet will connect | unset |
+| `DEX_CLIENT_IP_HEADER` | Header with the visitor's address when behind a proxy, for the rate limit (`cf-connecting-ip` behind Cloudflare) | unset |
+| `DEX_RATE_PER_MINUTE` | API requests allowed per visitor per minute | `240` |
 | `DEX_TLS_KEY_FILE`, `DEX_TLS_CERT_FILE`, `DEX_TLS_PORT` | Also listen over https with this key and certificate | unset, unset, `8443` |
 
 ## Tests

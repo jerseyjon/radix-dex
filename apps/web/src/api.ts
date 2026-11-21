@@ -14,7 +14,9 @@ export interface ServerConfig {
   /** Set by the static preview build: data is a snapshot taken at this time and nothing can be traded. */
   snapshotAt?: number;
 }
-export interface QuoteResult { sell: string; buy: string; sellAmount: string; buyAmount: string; price: string; route: Pool[]; networkFeeXrd: string }
+export interface QuoteResult { sell: string; buy: string; sellAmount: string; buyAmount: string; price: string; route: Pool[]; networkFeeXrd: string;
+  /** The network fee of a plain fill, valued in the token being bought; null if no pool prices that token. */
+  gasInBuyToken?: string | null }
 export interface OrderView {
   id: string; account: string; sell: string; sellAmount: string; buy: string; minBuyAmount: string;
   /** Gross amount at which the order fills (price times size); the signed minimum is this less the fee allowance. */
