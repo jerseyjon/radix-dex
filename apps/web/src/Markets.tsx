@@ -10,7 +10,7 @@ export function Markets({ markets, selected, onSelect }: { markets: MarketSummar
     return f ? markets.filter((m) => `${m.base.symbol}/${m.quote.symbol} ${m.base.name}`.toLowerCase().includes(f)) : markets;
   }, [markets, filter]);
   return (
-    <aside className="panel markets" aria-label="Markets">
+    <aside className="panel markets" id="markets-panel" aria-label="Markets">
       <header className="panel-head"><h2 className="panel-title">Markets</h2><span className="count">{markets.length}</span></header>
       <label className="search">
         <Icon name="search" size={14} />

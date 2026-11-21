@@ -52,3 +52,34 @@ export function SkeletonRows({ rows, label }: { rows: number; label: string }) {
     </div>
   );
 }
+
+/**
+ * A row of tabs with the keyboard behaviour screen-reader users expect: one tab stop, arrow keys
+ * (and Home/End) move between tabs, and each tab names the panel it controls.
+ */
+export function Tabs<T extends string>({ label, value, onChange, items, panelId }: {
+  label: string; value: T; onChange: (v: T) => void; items: [T, React.ReactNode][]; panelId: string;
+}) {
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const i = items.findIndex(([k]) => k === value);
+    const next = e.key === 'ArrowRight' ? i + 1 : e.key === 'ArrowLeft' ? i - 1 : e.key === 'Home' ? 0 : e.key === 'End' ? items.length - 1 : undefined;
+    if (next === undefined || i < 0) return;
+    e.preventDefault();
+    const k = items[(next + items.length) % items.length]![0];
+    onChange(k);
+    e.currentTarget.querySelector<HTMLButtonElement>(`[data-tab="${k}"]`)?.focus();
+  };
+  return (
+    <div className="tabs" role="tablist" aria-label={label} onKeyDown={onKeyDown}>
+      {items.map(([k, content]) => (
+        <button key={k} role="tab" data-tab={k} id={`${panelId}-tab-${k}`} aria-selected={k === value} aria-controls={panelId}
+          tabIndex={k === value ? 0 : -1} className={k === value ? 'on' : ''} onClick={() => onChange(k)}>{content}</button>
+      ))}
+    </div>
+  );
+}
+
+/** The panel a `Tabs` row controls. It adds no box of its own, so the panel's layout is unchanged. */
+export function TabPanel({ id, value, children }: { id: string; value: string; children: React.ReactNode }) {
+  return <div className="tabpanel" role="tabpanel" id={id} aria-labelledby={`${id}-tab-${value}`}>{children}</div>;
+}

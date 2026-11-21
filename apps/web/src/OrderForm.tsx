@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { type Depth, bookPlaceManifest, limitOrderManifest, marketOrderManifest, newCancelSecret, orderKeyFromSecret } from '@radix-dex/core/browser';
+import { type Depth, Decimal, bookPlaceManifest, limitOrderManifest, marketOrderManifest, newCancelSecret, orderKeyFromSecret, routePath } from '@radix-dex/core/browser';
 import { type MarketSummary, type QuoteResult, type ServerConfig, STATIC, api } from './api';
 import { estimate } from './book';
-import { cleanAmount, fmtAmount, fmtPrice, toPlain } from './format';
+import { cleanAmount, fmtAmount, fmtPrice } from './format';
+import {
+  bookContractPrice, exceeds, limitTerms, minAfterFees, normaliseInput, numberToPlain, parsePlain, placesFor, shareOf,
+  solverFees, toPlain, withSlippage,
+} from './money';
 import { Icon } from './ui';
 import type { Wallet } from './wallet';
 
@@ -18,9 +22,15 @@ export const secrets = {
   set: (id: string, secret: string) => { try { localStorage.setItem(`dex.cancel.${id}`, secret); } catch { /* private window: soft cancel unavailable */ } },
 };
 
+/** Does this quote answer the question the form is asking now (same tokens, same amount)? */
+function quoteFor(q: QuoteResult | undefined, sell: string, buy: string, amount: string | undefined): QuoteResult | undefined {
+  if (!q || !amount || q.sell !== sell || q.buy !== buy) return undefined;
+  try { return new Decimal(q.sellAmount).eq(amount) ? q : undefined; } catch { return undefined; }
+}
+
 export function OrderForm(props: {
   market: MarketSummary; depth: Depth | undefined; config: ServerConfig; wallet: Wallet | undefined; account: string | undefined;
-  balances: Record<string, string>; pickedPrice: number | undefined; onDone: (message: string) => void;
+  balances: Record<string, string>; picked: { price: number; n: number } | undefined; onDone: (message: string) => void;
 }) {
   const { market, depth, config, wallet, account, balances } = props;
   const [side, setSide] = useState<Side>('buy');
@@ -32,35 +42,30 @@ export function OrderForm(props: {
   const [slippage, setSlippage] = useState(1);
   // Limit orders: in the on-ledger order book (fills in part) or signed and kept in the wallet (fills whole).
   const [inBook, setInBook] = useState(true);
-  const [quote, setQuote] = useState<QuoteResult | undefined>();
+  const [rawQuote, setQuote] = useState<QuoteResult | undefined>();
   const [quoteError, setQuoteError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  const [hint, setHint] = useState<string | undefined>();
 
   const base = market.base, quoteTok = market.quote;
   const sellTok = side === 'buy' ? quoteTok : base, buyTok = side === 'buy' ? base : quoteTok;
-  const sellBalance = Number(balances[sellTok.address] ?? 0);
+  const balanceStr = balances[sellTok.address] ?? '0';
+  const sellBalance = Number(balanceStr); // display and enabling only
   const book = config.orderBook ?? undefined;
   const useBook = kind === 'limit' && inBook && Boolean(book);
   const limitsOn = config.limitOrders.enabled || Boolean(book);
+  const sellPlaces = placesFor(sellTok, config.xrd);
 
-  useEffect(() => { setAmount(''); setTotal(''); setPrice(''); setQuote(undefined); setError(undefined); }, [market.id]);
-  useEffect(() => { if (props.pickedPrice) { setKind('limit'); setPrice(fmtPrice(props.pickedPrice).replace(/,/g, '')); } }, [props.pickedPrice]);
+  useEffect(() => { setAmount(''); setTotal(''); setPrice(''); setQuote(undefined); setError(undefined); setHint(undefined); }, [market.id]);
+  // A picked book level fills the price exactly; picking the same level again re-fills it.
+  useEffect(() => { if (props.picked) { setKind('limit'); setPrice(numberToPlain(props.picked.price)); } }, [props.picked?.n]);
 
+  // A limit order's terms, worked out exactly: what is sold, and the price times size it must fetch.
+  const terms = useMemo(() => (kind === 'limit' ? limitTerms(side, price, amount, sellPlaces) : undefined), [kind, side, price, amount, sellPlaces]);
   // What the user is selling, as a clean decimal string.
-  const sellAmount = useMemo(() => {
-    if (kind === 'market') return cleanAmount(side === 'buy' ? total : amount);
-    const p = Number(price), a = Number(amount);
-    if (!(p > 0) || !(a > 0)) return undefined;
-    return side === 'buy' ? cleanAmount(toPlain(p * a)) : cleanAmount(amount);
-  }, [kind, side, price, amount, total]);
-
-  // A limit order's price times its size: what the market must pay, before fees, for it to fill.
-  const limitGross = useMemo(() => {
-    const p = Number(price), a = Number(amount);
-    if (kind !== 'limit' || !(p > 0) || !(a > 0)) return undefined;
-    return side === 'buy' ? cleanAmount(amount) : cleanAmount(toPlain(p * a));
-  }, [kind, side, price, amount]);
+  const sellAmount = kind === 'market' ? cleanAmount(side === 'buy' ? total : amount) : terms?.sellAmount;
+  const limitGross = terms?.gross;
 
   const bookEstimate = kind === 'market' && sellAmount ? estimate(depth, side, Number(sellAmount)) : undefined;
 
@@ -74,6 +79,7 @@ export function OrderForm(props: {
     }, 450);
     return () => { live = false; clearTimeout(t); };
   }, [kind, sellAmount, sellTok.address, buyTok.address]);
+  const quote = quoteFor(rawQuote, sellTok.address, buyTok.address, sellAmount);
 
   const execPrice = quote && sellAmount
     ? (side === 'buy' ? Number(sellAmount) / Number(quote.buyAmount) : Number(quote.buyAmount) / Number(sellAmount))
@@ -81,28 +87,50 @@ export function OrderForm(props: {
   const impact = execPrice && depth?.mid ? ((side === 'buy' ? execPrice / depth.mid : depth.mid / execPrice) - 1) * 100 : undefined;
 
   // Orders are filled for the user by the solver, which pays the network fee and takes it,
-  // with the service fee, out of what the order buys.
+  // with the service fee, out of what the order buys. All of this is exact decimal arithmetic.
   const lo = config.limitOrders.enabled ? config.limitOrders : undefined;
   const viaSolver = Boolean(lo?.filling);
-  const feesOn = (gross: number | undefined) => {
+  const feesOn = (gross: string | undefined) => {
     if (gross === undefined || !lo || !sellAmount) return undefined;
-    const network = quote?.gasInBuyToken != null ? Number(quote.gasInBuyToken)
-      : buyTok.address === config.xrd ? Number(lo.gasXrd) : sellTok.address === config.xrd ? gross / Number(sellAmount) * Number(lo.gasXrd) : 0;
-    return { network, service: gross * config.feeBps / 10_000 };
+    return solverFees({ gross, feeBps: config.feeBps, gasInBuyToken: quote?.gasInBuyToken, gasXrd: lo.gasXrd,
+      buyIsXrd: buyTok.address === config.xrd, sellIsXrd: sellTok.address === config.xrd, sellAmount });
   };
-  const limitFees = feesOn(limitGross ? Number(limitGross) : undefined);
-  const limitMinBuy = limitGross && limitFees ? cleanAmount(toPlain(Number(limitGross) - limitFees.network - limitFees.service)) : undefined;
-  const fillsNow = kind === 'limit' && quote && limitGross ? Number(quote.buyAmount) >= Number(limitGross) : undefined;
-  const marketFees = kind === 'market' && viaSolver && quote ? feesOn(Number(quote.buyAmount)) : undefined;
-  const marketNet = marketFees ? Number(quote!.buyAmount) - marketFees.network - marketFees.service : undefined;
-  const expectedOut = marketNet ?? (quote ? Number(quote.buyAmount) : bookEstimate?.received);
+  const limitFees = feesOn(limitGross);
+  const limitMinBuy = limitGross && limitFees ? minAfterFees(limitGross, limitFees) : undefined;
+  const fillsNow = kind === 'limit' && quote && limitGross ? new Decimal(quote.buyAmount).gte(limitGross) : undefined;
+  const marketFees = kind === 'market' && viaSolver && quote ? feesOn(quote.buyAmount) : undefined;
+  const marketNet = marketFees && quote ? minAfterFees(quote.buyAmount, marketFees) : undefined;
+  const marketMinBuy = kind === 'market' && viaSolver && marketNet ? withSlippage(marketNet, slippage) : undefined;
+  const expectedOut = marketNet !== undefined ? Number(marketNet) : marketFees ? 0 : quote ? Number(quote.buyAmount) : bookEstimate?.received;
+  const feeTotal = (f: { network: InstanceType<typeof Decimal>; service: InstanceType<typeof Decimal> } | undefined) => (f ? f.network.plus(f.service).toNumber() : undefined);
 
-  const setPct = (pct: number) => {
+  // Without a solver the market order is an ordinary transaction along the server's route: the route
+  // must start at the token sold and end at the token the user chose, or we refuse to sign it.
+  const routeProblem = useMemo(() => {
+    if (kind !== 'market' || viaSolver || !quote) return undefined;
+    try {
+      const path = routePath(quote.route, sellTok.address);
+      return path[path.length - 1] === buyTok.address ? undefined : `The quoted route does not end in ${buyTok.symbol}; not signing it`;
+    } catch { return 'The quoted route does not connect the two tokens; not signing it'; }
+  }, [kind, viaSolver, quote, sellTok.address, buyTok.address, buyTok.symbol]);
+
+  // The order-book contract's price for this order, or why it cannot be expressed.
+  const bookPrice = useBook && price ? bookContractPrice(side, price) : undefined;
+
+  const setPct = (share: number) => {
+    setHint(undefined);
     if (!(sellBalance > 0)) return;
-    const v = sellBalance * pct;
-    if (kind === 'market') (side === 'buy' ? setTotal : setAmount)(toPlain(v, 8));
-    else if (side === 'sell') setAmount(toPlain(v, 8));
-    else if (Number(price) > 0) setAmount(toPlain(v / Number(price), 8));
+    if (kind === 'market' || side === 'sell') {
+      // Rounded down to the sell token's places; 100% is the balance exactly.
+      const v = shareOf(balanceStr, share, placesFor(sellTok, config.xrd, balanceStr)) ?? '';
+      (kind === 'market' && side === 'buy' ? setTotal : setAmount)(v);
+      return;
+    }
+    // Limit buy: the size the share of the quote balance buys at the typed price, rounded down,
+    // so price × size never exceeds that share.
+    const p = parsePlain(price), spend = shareOf(balanceStr, share, placesFor(sellTok, config.xrd, balanceStr));
+    if (!p || p.lte(0) || !spend) { setHint('Enter a price first'); return; }
+    setAmount(toPlain(new Decimal(spend).div(p), placesFor(base, config.xrd)));
   };
 
   let blocker: string | undefined;
@@ -110,12 +138,16 @@ export function OrderForm(props: {
   else if (!wallet) blocker = 'Wallet connection not configured';
   else if (!account) blocker = 'Connect your Radix Wallet';
   else if (kind === 'limit' && !limitsOn) blocker = 'Limit orders are not enabled';
+  else if (kind === 'limit' && !parsePlain(price)?.gt(0)) blocker = 'Enter a price';
   else if (!sellAmount) blocker = 'Enter an amount';
-  else if (Number(sellAmount) > sellBalance) blocker = `Not enough ${sellTok.symbol}`;
+  else if (exceeds(sellAmount, balanceStr)) blocker = `Not enough ${sellTok.symbol}`;
   else if (kind === 'market' && !quote) blocker = quoteError ?? 'Getting a quote…';
-  else if (kind === 'market' && marketNet !== undefined && !(marketNet > 0)) blocker = 'Too small to cover the network fee';
+  else if (kind === 'market' && marketFees && !marketNet) blocker = 'Too small to cover the network fee';
+  else if (kind === 'market' && viaSolver && !marketMinBuy) blocker = 'Too small for the slippage limit';
+  else if (routeProblem) blocker = 'Route refused';
   else if (kind === 'limit' && !useBook && !config.limitOrders.enabled) blocker = 'Only order-book orders are enabled';
-  else if (kind === 'limit' && !useBook && limitGross && !(Number(limitMinBuy) > 0)) blocker = 'Too small to cover the network fee';
+  else if (kind === 'limit' && !useBook && limitGross && !limitMinBuy) blocker = 'Too small to cover the network fee';
+  else if (bookPrice && !bookPrice.ok) blocker = 'Price cannot be held exactly';
 
   async function submit() {
     if (blocker || !wallet || !account || !sellAmount) return;
@@ -135,11 +167,10 @@ export function OrderForm(props: {
         secrets.set(placed.id, secret);
         return placed;
       };
-      if (kind === 'market' && viaSolver && lo && marketNet) {
+      if (kind === 'market' && viaSolver && lo) {
         // Filled by the solver so it can take limit orders in the book as well as the pools.
-        const minBuy = cleanAmount(toPlain(marketNet * (1 - slippage / 100)));
-        if (!minBuy) return;
-        const placed = await sign(minBuy, minBuy, 'market', lo.marketOrderLifetimeSec, `Market ${side} ${base.symbol}`);
+        if (!marketMinBuy) { setError('This order is too small for the slippage limit after fees.'); return; }
+        const placed = await sign(marketMinBuy, marketMinBuy, 'market', lo.marketOrderLifetimeSec, `Market ${side} ${base.symbol}`);
         props.onDone('Market order sent, filling…');
         const deadline = placed.expiresAt * 1000;
         let outcome = 'Market order not filled: the price moved beyond your slippage limit';
@@ -151,22 +182,23 @@ export function OrderForm(props: {
         }
         props.onDone(outcome);
       } else if (kind === 'market') {
-        const minBuy = toPlain(Number(quote!.buyAmount) * (1 - slippage / 100));
+        if (!quote || routeProblem) { setError(routeProblem ?? 'The quote has changed; try again.'); return; }
+        const minBuy = withSlippage(quote.buyAmount, slippage);
+        if (!minBuy) { setError('This order is too small for the slippage limit.'); return; }
         const txid = await wallet.sendTransaction(
-          marketOrderManifest({ account, sell: sellTok.address, sellAmount, minBuyAmount: minBuy, route: quote!.route }),
+          marketOrderManifest({ account, sell: sellTok.address, sellAmount, minBuyAmount: minBuy, route: quote.route }),
           `${side === 'buy' ? 'Buy' : 'Sell'} ${base.symbol}`);
         props.onDone(`Market order submitted: ${txid}`);
       } else if (useBook && book) {
         // The contract's price is what the order is owed for each token it sells.
-        const p = Number(price);
-        const perSell = cleanAmount(side === 'sell' ? price : toPlain(1 / p));
-        if (!perSell) return;
+        const bp = bookContractPrice(side, price);
+        if (!bp.ok) { setError(bp.reason); return; }
         await wallet.sendTransaction(
-          bookPlaceManifest({ account, book: book.component, sell: sellTok.address, sellAmount, buy: buyTok.address, price: perSell, expiresAt: Math.floor(Date.now() / 1000) + expiry }),
+          bookPlaceManifest({ account, book: book.component, sell: sellTok.address, sellAmount, buy: buyTok.address, price: bp.price, expiresAt: Math.floor(Date.now() / 1000) + expiry }),
           `Limit ${side} ${base.symbol} @ ${price}`);
         props.onDone('Limit order placed in the order book');
       } else {
-        if (!limitMinBuy || !limitGross) return;
+        if (!limitMinBuy || !limitGross) { setError('This order is too small to cover the network fee.'); return; }
         await sign(limitMinBuy, limitGross, 'limit', expiry, `Limit ${side} ${base.symbol} @ ${price}`);
         props.onDone('Limit order placed');
       }
@@ -179,7 +211,14 @@ export function OrderForm(props: {
     }
   }
 
-  const num = (set: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => set(e.target.value.replace(/[^0-9.]/g, ''));
+  // Keep what was typed unless the new text is a number: never delete characters silently
+  // (pasting "1e-5" gives 0.00001, not 15; "-5" is refused, not turned into 5).
+  const num = (set: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = normaliseInput(e.target.value);
+    if (v === undefined) { setHint('Numbers only: digits and one decimal point'); return; }
+    setHint(undefined); set(v);
+  };
+  const partial = bookEstimate && !bookEstimate.filledAll && !quote;
 
   return (
     <section className={`panel form ${side}`} aria-label="Place an order">
@@ -188,63 +227,70 @@ export function OrderForm(props: {
         <button className={side === 'sell' ? 'on sell' : 'sell'} aria-pressed={side === 'sell'} onClick={() => setSide('sell')}>Sell {base.symbol}</button>
       </div>
       <div className="form-row">
-        <div className="tabs" role="tablist" aria-label="Order type">
-          <button role="tab" aria-selected={kind === 'market'} className={kind === 'market' ? 'on' : ''} onClick={() => setKind('market')}>Market</button>
-          <button role="tab" aria-selected={kind === 'limit'} className={kind === 'limit' ? 'on' : ''} onClick={() => setKind('limit')}>Limit</button>
+        <div className="tabs" role="group" aria-label="Order type">
+          <button aria-pressed={kind === 'market'} className={kind === 'market' ? 'on' : ''} onClick={() => setKind('market')}>Market</button>
+          <button aria-pressed={kind === 'limit'} className={kind === 'limit' ? 'on' : ''} onClick={() => setKind('limit')}>Limit</button>
         </div>
-        <span className="bal">Available <b>{fmtAmount(sellBalance)} {sellTok.symbol}</b></span>
+        <span className="bal">Available <b>{fmtAmount(balanceStr)} {sellTok.symbol}</b></span>
       </div>
 
       {kind === 'limit' && (
-        <label className="field"><span>Price</span><input inputMode="decimal" value={price} onChange={num(setPrice)} placeholder={fmtPrice(depth?.mid)} /><em>{quoteTok.symbol}</em></label>
+        <label className="field"><span>Price</span><input inputMode="decimal" autoComplete="off" value={price} onChange={num(setPrice)} placeholder={fmtPrice(depth?.mid)} /><em>{quoteTok.symbol}</em></label>
       )}
       {(kind === 'limit' || side === 'sell') && (
-        <label className="field"><span>Amount</span><input inputMode="decimal" value={amount} onChange={num(setAmount)} placeholder="0.0" /><em>{base.symbol}</em></label>
+        <label className="field"><span>Amount</span><input inputMode="decimal" autoComplete="off" value={amount} onChange={num(setAmount)} placeholder="0.0" /><em>{base.symbol}</em></label>
       )}
       {kind === 'market' && side === 'buy' && (
-        <label className="field"><span>Spend</span><input inputMode="decimal" value={total} onChange={num(setTotal)} placeholder="0.0" /><em>{quoteTok.symbol}</em></label>
+        <label className="field"><span>Spend</span><input inputMode="decimal" autoComplete="off" value={total} onChange={num(setTotal)} placeholder="0.0" /><em>{quoteTok.symbol}</em></label>
       )}
+      {hint && <p className="hint" role="status">{hint}</p>}
       <div className="pcts" role="group" aria-label="Share of available balance">{[0.25, 0.5, 0.75, 1].map((p) => <button key={p} onClick={() => setPct(p)} disabled={!(sellBalance > 0)}>{p * 100}%</button>)}</div>
 
       {kind === 'market' ? (
         <dl className="summary">
           <div><dt>You receive {quote ? '' : '(estimate)'}</dt><dd>{expectedOut ? `${fmtAmount(expectedOut)} ${buyTok.symbol}` : '—'}</dd></div>
+          {partial && (
+            <div><dt>Book depth</dt><dd className="warn">The book shown can take only {fmtAmount(bookEstimate.spent)} of {fmtAmount(sellAmount)} {sellTok.symbol}</dd></div>
+          )}
+          {quoteError && <div><dt>Quote</dt><dd className="warn">{quoteError}</dd></div>}
+          {routeProblem && <div><dt>Route</dt><dd className="warn">{routeProblem}</dd></div>}
           <div><dt>Average price</dt><dd>{fmtPrice(execPrice)} {execPrice ? quoteTok.symbol : ''}</dd></div>
           <div><dt>Price impact</dt><dd className={impact !== undefined && impact > 3 ? 'warn' : ''}>{impact === undefined ? '—' : `${Math.max(0, impact).toFixed(2)}%`}</dd></div>
           {marketFees
-            ? <div><dt>Fees, already taken off</dt><dd>{fmtAmount(marketFees.network + marketFees.service)} {buyTok.symbol} (network fee + {pct(config.feeBps)})</dd></div>
+            ? <div><dt>Fees, already taken off</dt><dd>{fmtAmount(feeTotal(marketFees))} {buyTok.symbol} (network fee + {pct(config.feeBps)})</dd></div>
             : <div><dt>Route</dt><dd>{quote ? quote.route.map((p) => p.venue).join(' → ') : '—'}</dd></div>}
-          <div><dt>Max slippage</dt><dd className="seg mini">{SLIPPAGES.map((s) => <button key={s} className={s === slippage ? 'on' : ''} aria-pressed={s === slippage} onClick={() => setSlippage(s)}>{s}%</button>)}</dd></div>
+          <div><dt>Max slippage</dt><dd className="seg mini" role="group" aria-label="Maximum slippage">{SLIPPAGES.map((s) => <button key={s} className={s === slippage ? 'on' : ''} aria-pressed={s === slippage} onClick={() => setSlippage(s)}>{s}%</button>)}</dd></div>
         </dl>
       ) : useBook && book ? (
         <dl className="summary">
-          <div><dt>Fills</dt><dd className="seg mini"><button className="on" aria-pressed="true">In parts</button>{config.limitOrders.enabled && <button aria-pressed="false" onClick={() => setInBook(false)}>Whole only</button>}</dd></div>
+          <div><dt>Fills</dt><dd className="seg mini" role="group" aria-label="How the order fills"><button className="on" aria-pressed="true">In parts</button>{config.limitOrders.enabled && <button aria-pressed="false" onClick={() => setInBook(false)}>Whole only</button>}</dd></div>
           <div><dt>Moves into the order book</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>You receive, as it fills</dt><dd>{limitGross ? `${fmtAmount(Number(limitGross) * (1 - book.makerFeeBps / 10_000))} ${buyTok.symbol}` : '—'}</dd></div>
+          {bookPrice && !bookPrice.ok && <div><dt>Price</dt><dd className="warn">{bookPrice.reason}</dd></div>}
           <div><dt>Fee</dt><dd>{book.makerFeeBps > 0 ? pct(book.makerFeeBps) : 'None'}, plus the network fee to place it (about 0.8 XRD)</dd></div>
           <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away, at your price' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
           {fillsNow && quote && limitGross && (
             <div><dt>Note</dt><dd className="warn">The market pays {fmtAmount(quote.buyAmount)} {buyTok.symbol} for this size now, more than the {fmtAmount(limitGross)} {buyTok.symbol} your price gives. An order filled in parts gets its own price and no better: the difference is kept by the exchange. For the market price, use a Market order{config.limitOrders.enabled ? ' or “Whole only”' : ''}.</dd></div>
           )}
-          <div><dt>Expires in</dt><dd><select className="select" value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
+          <div><dt>Expires in</dt><dd><select className="select" aria-label="Expires in" value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
         </dl>
       ) : (
         <dl className="summary">
-          {book && <div><dt>Fills</dt><dd className="seg mini"><button aria-pressed="false" onClick={() => setInBook(true)}>In parts</button><button className="on" aria-pressed="true">Whole only</button></dd></div>}
+          {book && <div><dt>Fills</dt><dd className="seg mini" role="group" aria-label="How the order fills"><button aria-pressed="false" onClick={() => setInBook(true)}>In parts</button><button className="on" aria-pressed="true">Whole only</button></dd></div>}
           <div><dt>You pay</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>At your price you get</dt><dd>{limitGross ? `${fmtAmount(limitGross)} ${buyTok.symbol}` : '—'}</dd></div>
-          <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(limitFees.network + limitFees.service)} ${buyTok.symbol} (network fee + ${pct(config.feeBps)})` : '—'}</dd></div>
+          <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(feeTotal(limitFees))} ${buyTok.symbol} (network fee + ${pct(config.feeBps)})` : '—'}</dd></div>
           <div><dt>If another trader takes it</dt><dd>{(config.makerFeeBps ?? 0) > 0 ? `Fee ${pct(config.makerFeeBps ?? 0)}, no network fee` : 'No fee: you get your full price'}</dd></div>
-          <div><dt>You receive at least</dt><dd>{limitMinBuy && Number(limitMinBuy) > 0 ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
+          <div><dt>You receive at least</dt><dd>{limitMinBuy ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
           <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
-          <div><dt>Expires in</dt><dd><select className="select" value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
+          <div><dt>Expires in</dt><dd><select className="select" aria-label="Expires in" value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
         </dl>
       )}
 
       <button className={`submit ${side}${busy ? ' busy' : ''}`} disabled={Boolean(blocker) || busy} onClick={submit}>
         {busy ? 'Working…' : blocker ?? `${side === 'buy' ? 'Buy' : 'Sell'} ${base.symbol}`}
       </button>
-      {error && <p className="error">{error}</p>}
+      {error && <p className="error" role="alert">{error}</p>}
       {kind === 'market' && viaSolver && (
         <p className="note"><Icon name="info" size={13} />Your wallet will ask you to approve a pre-authorization. The order is then filled for you within a few seconds at the best price from the order book and the pools, and you pay no separate network fee.</p>
       )}
@@ -252,7 +298,7 @@ export function OrderForm(props: {
         <p className="note"><Icon name="info" size={13} />Your tokens move into the order book contract, where the ledger enforces your price. Other traders can buy any part of the order, and each part is paid straight to your account at your price. You can cancel at any time and take back what has not sold. This contract has not been audited.</p>
       )}
       {kind === 'limit' && !useBook && (
-        <p className="note"><Icon name="info" size={13} />A limit order is a signed permission, not a transaction: placing it is free and your funds stay in your account until it fills. It fills in full or not at all, as soon as the market reaches your price. The fees come out of what you receive, and you never get less than the “at least” amount, which is what your wallet shows.</p>
+        <p className="note"><Icon name="info" size={13} />A limit order is a signed permission, not a transaction: placing it is free and your funds stay in your account until it fills. It fills in full or not at all, as soon as the market reaches your price. The fees come out of what you receive, and you never get less than the “at least” amount, which is what your wallet shows. Its cancel key is kept in this browser only: clearing site data loses the ability to cancel it before it expires.</p>
       )}
     </section>
   );

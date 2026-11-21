@@ -3,7 +3,7 @@ import type { Depth } from '@radix-dex/core/browser';
 import type { MarketTrade } from './api';
 import { ladder } from './book';
 import { fmtAmount, fmtPrice } from './format';
-import { Empty, SkeletonRows } from './ui';
+import { Empty, SkeletonRows, TabPanel, Tabs } from './ui';
 
 const ROWS = 11;
 const clock = (sec: number) => {
@@ -32,12 +32,10 @@ export function Book({ depth, trades, explorer, baseSymbol, quoteSymbol, onPick 
   return (
     <section className="panel book">
       <header className="panel-head">
-        <div className="tabs" role="tablist" aria-label="Market activity">
-          <button role="tab" aria-selected={tab === 'book'} className={tab === 'book' ? 'on' : ''} onClick={() => setTab('book')}>Order book</button>
-          <button role="tab" aria-selected={tab === 'trades'} className={tab === 'trades' ? 'on' : ''} onClick={() => setTab('trades')}>Trades</button>
-        </div>
+        <Tabs label="Market activity" value={tab} onChange={setTab} panelId="activity-panel" items={[['book', 'Order book'], ['trades', 'Trades']]} />
         <span className="head-note">{tab === 'book' ? 'pools + limit orders' : <><i className="here">●</i> made here</>}</span>
       </header>
+      <TabPanel id="activity-panel" value={tab}>
       {tab === 'book' ? <>
         <div className="book-cols"><span>Price ({quoteSymbol})</span><span>Size ({baseSymbol})</span><span>Total</span></div>
         <div className="book-side asks">{depth ? [...asks].reverse().map(row('ask')) : <SkeletonRows rows={ROWS} label="Loading the order book" />}</div>
@@ -62,6 +60,7 @@ export function Book({ depth, trades, explorer, baseSymbol, quoteSymbol, onPick 
           {trades?.length === 0 && <Empty>No recent trades in this market.</Empty>}
         </div>
       </>}
+      </TabPanel>
     </section>
   );
 }

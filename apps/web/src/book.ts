@@ -1,6 +1,7 @@
 import type { Depth, DepthLevel } from '@radix-dex/core/browser';
 
-export interface BookEstimate { received: number; avgPrice: number; filledAll: boolean }
+/** `spent` is how much of the amount the levels shown can take; less than asked when `filledAll` is false. */
+export interface BookEstimate { received: number; spent: number; avgPrice: number; filledAll: boolean }
 
 /**
  * Walk the book to estimate a market order. `side` "buy" spends `amount` of quote on the asks;
@@ -20,7 +21,7 @@ export function estimate(depth: Depth | undefined, side: 'buy' | 'sell', amount:
   }
   const spent = amount - left;
   if (!(spent > 0) || !(received > 0)) return undefined;
-  return { received, avgPrice: side === 'buy' ? spent / received : received / spent, filledAll: left <= amount * 1e-9 };
+  return { received, spent, avgPrice: side === 'buy' ? spent / received : received / spent, filledAll: left <= amount * 1e-9 };
 }
 
 /** Group levels into at most `rows` rows with cumulative totals, best price first. */

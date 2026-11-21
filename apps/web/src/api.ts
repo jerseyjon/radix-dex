@@ -24,6 +24,8 @@ export interface OrderView {
   /** Orders in the on-ledger book: their number there, how much has sold and how much is still for sale. */
   bookId?: number; sold?: string; remaining?: string;
   expiresAt: number; createdAt: number; status: 'open' | 'filled' | 'cancelled' | 'expired'; fillTx: string | null; received: string | null;
+  /** When the order filled (seconds), if the server reports it; older servers do not. */
+  filledAt?: number | null;
   /** Open orders: what the market would pay for the whole order now, before fees, against what it needs to fill. */
   outlook?: { available: string; needed: string; at: number } | null;
 }
