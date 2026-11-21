@@ -1,0 +1,27 @@
+# The unit the mainnet site and solver run under: a systemd USER service of the account that owns
+# the checkout (docs/MAINNET.md, "How it runs"). Install as ~/.config/systemd/user/radix-dex-mainnet.service,
+# adjust WorkingDirectory and ExecStart to the checkout, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now radix-dex-mainnet
+#   loginctl enable-linger <user>      # so it runs without anyone logged in
+# Data stays in data/ inside the checkout. The server listens on 127.0.0.1 only; the
+# radix-dex-tunnel user service (cloudflared) is the only way in.
+#
+# The lines marked "added" are not in the unit running on 21 Nov 2026. They are safe to add:
+# UMask keeps new files private; TimeoutStopSec gives the solver time to finish a pass on stop
+# (the server handles SIGTERM and closes its database).
+[Unit]
+Description=Radix DEX site and solver (mainnet, 127.0.0.1:8787)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/jon/Radix/dex
+ExecStart=/home/jon/Radix/dex/scripts/run-mainnet.sh
+Restart=always
+RestartSec=5
+# added
+UMask=0077
+# added
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

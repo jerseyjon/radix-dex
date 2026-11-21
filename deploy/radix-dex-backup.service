@@ -1,0 +1,11 @@
+# One consistent copy of the mainnet order database (scripts/backup-db.ts). User unit, run by
+# radix-dex-backup.timer. Install both in ~/.config/systemd/user/, adjust the paths, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now radix-dex-backup.timer
+[Unit]
+Description=Back up the Radix DEX order database
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/Radix/dex
+UMask=0077
+ExecStart=/usr/bin/env npx tsx scripts/backup-db.ts data/orders-mainnet.sqlite data/backups

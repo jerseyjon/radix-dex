@@ -1,5 +1,10 @@
-# systemd unit for the mainnet site and solver. Copy to /etc/systemd/system/, adjust User and paths,
-# put the settings printed by "tsx scripts/mainnet-setup.ts status" in /etc/radix-dex.env, then:
+# NOT IN USE. Mainnet runs as the user service in radix-dex-mainnet.service (docs/MAINNET.md).
+# This is a template for moving the server to its own system user with a sandbox (audit M4).
+# Moving to it: a separate checkout in /opt/radix-dex, the settings printed by
+# "tsx scripts/mainnet-setup.ts status" in /etc/radix-dex.env, and, with the old service stopped,
+# orders-mainnet.sqlite with its -wal and -shm files and mainnet-solver.key moved to
+# /var/lib/radix-dex (owned by radixdex, mode 600). Starting it without moving the database starts
+# with no open signed orders. Note tsx is a devDependency: install with "npm ci", not --omit=dev.
 #   systemctl daemon-reload && systemctl enable --now radix-dex
 # The server listens on 127.0.0.1 only; Cloudflare Tunnel (cloudflared) is the only way in.
 [Unit]
@@ -15,6 +20,8 @@ Environment=DEX_HOST=127.0.0.1 DEX_PORT=8787 DEX_WEB_DIR=apps/web/dist DEX_DATA_
 ExecStart=/usr/bin/npx tsx apps/server/src/main.ts
 Restart=always
 RestartSec=5
+UMask=0077
+TimeoutStopSec=90
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true

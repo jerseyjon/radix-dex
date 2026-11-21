@@ -2,15 +2,21 @@
 
 A CEX-style spot trading terminal for Radix that holds no user funds.
 
-**Status: working prototype. Not audited. Nothing here has been run on mainnet with real money.**
+**Status: live on mainnet (https://dex.difd.net) since 21 November 2026. Not audited.** The
+`OrderBook` and `OrderRegistry` contracts are deployed on mainnet and hold real funds; they have
+not had an independent audit, and the owner has accepted that risk. An internal security audit,
+code review and bug test were done on 21 November 2026 (`docs/review-2026-11-21/`).
 
 - Market orders are short-lived pre-authorizations filled within seconds at the best price from
   resting limit orders and existing pools (Ociswap, DefiPlaza) in one transaction. Where no
   solver runs they fall back to an ordinary wallet transaction through the pools.
-- Limit orders are **subintents** (wallet "pre-authorizations"): free to place, funds stay in
-  the user's account until the fill, and the network fee is paid by the solver. An order fills when the
-  market reaches its price; fees come out of the proceeds, down to a minimum enforced by the Radix Engine. A small backend holds the signed orders and
-  fills them against pools or against each other.
+- Limit orders come in two kinds. **"In parts"** (the form's default) places the tokens in the
+  on-ledger `OrderBook` contract, which anyone can fill a part at a time at the order's price.
+  **"Whole only"** orders are **subintents** (wallet "pre-authorizations"): free to place, funds
+  stay in the user's account until the fill, and the network fee is paid by the solver. Either
+  fills when the market reaches its price; for subintents the fees come out of the proceeds, down
+  to a minimum enforced by the Radix Engine. A small backend holds the signed orders and fills them
+  against pools, against each other and against the order book.
 - The order book shows pool depth and resting limit orders together.
 
 Why it is built this way: [docs/REVIEW.md](docs/REVIEW.md). How it works:
@@ -28,7 +34,7 @@ Why it is built this way: [docs/REVIEW.md](docs/REVIEW.md). How it works:
 
 ## Run it
 
-Needs Node 22+ and, for the contracts, Docker.
+Needs Node 22.18 or later (`node:sqlite`) and, for the contracts, Docker.
 
 ```bash
 npm install
@@ -56,14 +62,28 @@ depth and quotes but cannot trade.
 | `DEX_CLIENT_IP_HEADER` | Header with the visitor's address when behind a proxy, for the rate limit (`cf-connecting-ip` behind Cloudflare) | unset |
 | `DEX_RATE_PER_MINUTE` | API requests allowed per visitor per minute | `240` |
 | `DEX_TLS_KEY_FILE`, `DEX_TLS_CERT_FILE`, `DEX_TLS_PORT` | Also listen over https with this key and certificate | unset, unset, `8443` |
+| `DEX_DATA_DIR` | Where the order database (`orders-<network>.sqlite`) lives | `data` |
+| `DEX_MIN_POOL_TVL_USD` | Pools below this TVL (venue figure) are not listed | `300` |
+| `DEX_MAX_ORDER_LIFETIME_SEC` | Longest lifetime accepted for a signed limit order | `2592000` (30 days) |
+| `DEX_MAX_OPEN_ORDERS` | Open signed orders allowed per account | `50` |
+| `DEX_FAILED_FEE_LIMIT_XRD` | Loss limit: the solver stops sending when network fees paid on failed transactions in the last hour reach this | `3` |
+| `DEX_ACCOUNT_FAILURE_LIMIT` | Failed fills in 24 hours after which an account may not post orders and its orders are skipped | `6` |
+| `DEX_MAX_RESTING_PER_TICK`, `DEX_MAX_BOOK_PER_TICK` | Resting signed orders, and book orders, looked at per solver pass (market orders are not limited) | `20`, `20` |
+| `DEX_MIN_BOOK_ORDER_XRD` | Book orders worth less than this are not bought by the solver with its own funds | `5` |
+| `DEX_LOW_XRD` | `/api/health` reports the solver as low on funds below this XRD balance | `30` |
+
+Numbers are checked at start-up: a value that is not a number in range stops the server rather
+than being ignored. `GET /api/health` answers 200 when all is well and 503 with a list of problems
+(markets not loaded, solver pass overdue, loss limit reached, solver XRD low) for an uptime monitor.
 
 ## Tests
 
 ```bash
-npm test                               # unit tests: order validation, matching, API
+npm test                               # unit tests: order validation, matching, solver, store, API
+npm run typecheck                      # the server, core and scripts
 npx tsx scripts/live-check.ts          # read-only check against mainnet pools
-npx tsx scripts/stokenet-e2e.ts        # signs and fills real orders on Stokenet with throwaway keys
-npx tsx scripts/stokenet-server-e2e.ts # same, through the HTTP API and solver
+npx tsx scripts/stokenet-e2e.ts        # first-version test; still the script that creates data/stokenet-keys.json
+npx tsx scripts/stokenet-server-e2e.ts # two signed orders crossed through the HTTP API and solver
 npx tsx scripts/stokenet-setup.ts      # publish contracts, pool, registry and dApp definition on Stokenet
 npx tsx scripts/stokenet-pool-e2e.ts   # pool fill and on-ledger cancel against that deployment
 npx tsx scripts/stokenet-book-e2e.ts   # on-ledger order book: partial fills, cancel, fill when a pool reaches the price
@@ -83,8 +103,12 @@ certificate in `data/tls/` is enough for testing), or forward the port and open 
   prices rather than better ones.
 - Pools are routed only if their on-ledger package is on the allow-list in
   `packages/core/src/venues.ts`.
-- `Pool` and `OrderBook` in `scrypto/` are new code that would hold other people's money. They have tests that try
-  to drain them, but they have not been audited. Do not deploy them to mainnet without a review.
+- The solver previews every transaction in full before sending it and sends nothing whose preview
+  fails, and it stops sending when fees lost on failed transactions pass a limit (see
+  `DEX_FAILED_FEE_LIMIT_XRD`). It only fills orders between the tokens of a listed market.
+- `OrderBook` and `OrderRegistry` are live on mainnet and hold other people's money. They have
+  tests that try to drain them and an internal review, but no independent audit; the owner chose
+  to deploy them on that basis. `Pool` is not deployed on mainnet.
 
 ## Licence
 
