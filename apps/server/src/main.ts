@@ -10,7 +10,7 @@ setInterval(() => data.refresh().catch((e) => console.error('[markets] refresh f
 
 if (solver) {
   console.log(`solver account: ${await solver.account()}`);
-  setInterval(() => solver.tick().catch((e) => console.error('[solver] tick failed:', e)), 10_000);
+  setInterval(() => solver.tick().catch((e) => console.error('[solver] tick failed:', e)), 5_000);
 } else {
   setInterval(() => store.expire(Math.floor(Date.now() / 1000)), 30_000).unref();
 }

@@ -22,8 +22,9 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged }
   const describe = (o: OrderView) => {
     const m = markets.find((x) => (x.base.address === o.sell && x.quote.address === o.buy) || (x.base.address === o.buy && x.quote.address === o.sell));
     const selling = m ? m.base.address === o.sell : true;
-    const size = selling ? Number(o.sellAmount) : Number(o.minBuyAmount);
-    const price = selling ? Number(o.minBuyAmount) / Number(o.sellAmount) : Number(o.sellAmount) / Number(o.minBuyAmount);
+    const gross = Number(o.limitBuyAmount ?? o.minBuyAmount); // the order's price times its size
+    const size = selling ? Number(o.sellAmount) : gross;
+    const price = selling ? gross / Number(o.sellAmount) : Number(o.sellAmount) / gross;
     return { pair: m ? `${m.base.symbol}/${m.quote.symbol}` : `${sym(o.sell)}→${sym(o.buy)}`, side: selling ? 'Sell' : 'Buy', size, price, baseSym: m?.base.symbol ?? sym(o.sell) };
   };
 
@@ -32,10 +33,11 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged }
     if (!o.outlook) return 'checking…';
     const d = describe(o), sell = Number(o.sellAmount), avail = Number(o.outlook.available), need = Number(o.outlook.needed);
     if (avail >= need) return 'filling now';
+    if (o.kind === 'market') return 'price moved beyond your slippage limit';
     const [have, want] = d.side === 'Sell' ? [avail / sell, need / sell] : [avail > 0 ? sell / avail : Infinity, sell / need];
     return d.side === 'Sell'
-      ? `pools pay ${fmtPrice(have)} after network fee; needs ${fmtPrice(want)}`
-      : `pools charge ${fmtPrice(have)} after network fee; needs ${fmtPrice(want)}`;
+      ? `market pays ${fmtPrice(have)} for this size; fills at ${fmtPrice(want)}`
+      : `market charges ${fmtPrice(have)} for this size; fills at ${fmtPrice(want)}`;
   };
 
   async function cancel(o: OrderView) {
@@ -51,7 +53,7 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged }
         <div className="tabs">
           <button className={tab === 'open' ? 'on' : ''} onClick={() => setTab('open')}>Open orders ({orders.filter((o) => o.status === 'open').length})</button>
           <button className={tab === 'trades' ? 'on' : ''} onClick={() => setTab('trades')}>Trades ({trades.length})</button>
-          <button className={tab === 'history' ? 'on' : ''} onClick={() => setTab('history')}>Limit order history</button>
+          <button className={tab === 'history' ? 'on' : ''} onClick={() => setTab('history')}>Order history</button>
         </div>
       </header>
       {error && <p className="error">{error}</p>}
@@ -78,7 +80,7 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged }
             </tbody>
           </table>
         </div>
-      )) : rows.length === 0 ? <p className="empty">{tab === 'open' ? 'No open orders.' : 'No filled, cancelled or expired limit orders.'}</p> : (
+      )) : rows.length === 0 ? <p className="empty">{tab === 'open' ? 'No open orders.' : 'No filled, cancelled or expired orders.'}</p> : (
         <div className="table-scroll">
           <table>
             <thead><tr><th>Placed</th><th>Market</th><th>Side</th><th className="r">Price</th><th className="r">Size</th>{tab === 'open' && <th>Fills when</th>}<th>{tab === 'open' ? 'Expires' : 'Status'}</th><th /></tr></thead>
@@ -89,8 +91,8 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged }
                   <tr key={o.id}>
                     <td>{fmtTime(o.createdAt)}</td>
                     <td>{d.pair}</td>
-                    <td className={d.side === 'Buy' ? 'up' : 'down'}>{d.side}</td>
-                    <td className="r">{fmtPrice(d.price)}</td>
+                    <td className={d.side === 'Buy' ? 'up' : 'down'}>{o.kind === 'market' ? 'Market ' : ''}{d.side}</td>
+                    <td className="r">{o.kind === 'market' ? 'Market' : fmtPrice(d.price)}</td>
                     <td className="r">{fmtAmount(d.size)} {d.baseSym}</td>
                     {tab === 'open' && <td className="muted">{waiting(o)}</td>}
                     <td>{tab === 'open' ? fmtTime(o.expiresAt) : o.status === 'filled' ? `Filled, received ${fmtAmount(o.received)} ${sym(o.buy)}` : o.status[0]!.toUpperCase() + o.status.slice(1)}</td>

@@ -35,7 +35,22 @@ test('config endpoint answers and describes limit orders', async () => {
   const r = await call('GET', '/api/config');
   assert.equal(r.status, 200);
   assert.equal(r.json.limitOrders.enabled, true);
-  assert.equal(typeof r.json.limitOrders.bufferBps, 'number');
+  assert.equal(typeof r.json.limitOrders.marketOrderLifetimeSec, 'number');
+});
+
+test('an order keeps its trigger and kind; a trigger below the signed minimum is refused', async () => {
+  const o = await order();
+  const placed = await call('POST', '/api/orders', { ...o.body, limitBuyAmount: String(Number(o.body.minBuyAmount) * 1.02) });
+  assert.equal(placed.status, 200);
+  const stored = app.store.get(placed.json.id)!;
+  assert.equal(stored.kind, 'limit');
+  assert.equal(Number(stored.limitBuyAmount), Number(o.body.minBuyAmount) * 1.02);
+  app.store.markCancelled(placed.json.id);
+  const low = await order();
+  assert.equal((await call('POST', '/api/orders', { ...low.body, limitBuyAmount: String(Number(low.body.minBuyAmount) * 0.5) })).status, 400);
+  // A market order may not rest: an hour's lifetime is refused.
+  const m = await order();
+  assert.equal((await call('POST', '/api/orders', { ...m.body, kind: 'market' })).status, 400);
 });
 
 test('place, list, and cancel an order', async () => {
@@ -88,8 +103,9 @@ test('a filled order cannot be cancelled or re-filled', async () => {
 
 test('resting orders appear in the book on the right side at the right price', () => {
   const market = { id: 'm', base: { address: net.xrd, symbol: 'XRD', name: '' }, quote: { address: TUSD, symbol: 'TUSD', name: '' }, pools: [], tvlUsd: 0, volume24hUsd: 0 };
-  const o = (sell: string, sellAmount: string, buy: string, minBuyAmount: string) => ({ sell, sellAmount, buy, minBuyAmount }) as any;
-  const { bids, asks } = orderLevels(market, [o(net.xrd, '100', TUSD, '10'), o(TUSD, '9', net.xrd, '100')]);
+  // The book shows the price an order fills at (its limit), not the lower signed minimum. Market orders are not depth.
+  const o = (sell: string, sellAmount: string, buy: string, limitBuyAmount: string, kind = 'limit') => ({ sell, sellAmount, buy, minBuyAmount: String(Number(limitBuyAmount) * 0.98), limitBuyAmount, kind }) as any;
+  const { bids, asks } = orderLevels(market, [o(net.xrd, '100', TUSD, '10'), o(TUSD, '9', net.xrd, '100'), o(net.xrd, '50', TUSD, '4', 'market')]);
   assert.deepEqual(asks, [{ price: 0.1, size: 100, source: 'orders' }]);
   assert.deepEqual(bids, [{ price: 0.09, size: 100, source: 'orders' }]);
 });

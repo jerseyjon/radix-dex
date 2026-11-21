@@ -11,6 +11,9 @@ export interface StoredOrder {
   sellAmount: string;
   buy: string;
   minBuyAmount: string;
+  /** Gross amount at which the order fills; equals the minimum on older orders. */
+  limitBuyAmount: string;
+  kind: 'limit' | 'market';
   orderKeyHex: string;
   expiresAt: number;
   createdAt: number;
@@ -23,7 +26,8 @@ export interface StoredOrder {
   failures: number;
 }
 
-const COLUMNS = `id, account, sell, sell_amount AS sellAmount, buy, min_buy_amount AS minBuyAmount, order_key AS orderKeyHex,
+const COLUMNS = `id, account, sell, sell_amount AS sellAmount, buy, min_buy_amount AS minBuyAmount,
+  COALESCE(limit_buy_amount, min_buy_amount) AS limitBuyAmount, kind, order_key AS orderKeyHex,
   expires_at AS expiresAt, created_at AS createdAt, status, spt_hex AS signedPartialTransactionHex,
   fill_tx AS fillTx, received, last_error AS lastError, retry_at AS retryAt, failures`;
 
@@ -41,7 +45,8 @@ export class OrderStore {
         buy TEXT NOT NULL, min_buy_amount TEXT NOT NULL, order_key TEXT NOT NULL,
         expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, status TEXT NOT NULL,
         spt_hex TEXT NOT NULL, fill_tx TEXT, received TEXT, last_error TEXT, retry_at INTEGER NOT NULL DEFAULT 0,
-        failures INTEGER NOT NULL DEFAULT 0
+        failures INTEGER NOT NULL DEFAULT 0,
+        limit_buy_amount TEXT, kind TEXT NOT NULL DEFAULT 'limit'
       );
       CREATE INDEX IF NOT EXISTS orders_status ON orders(status, created_at);
       CREATE INDEX IF NOT EXISTS orders_account ON orders(account, created_at);
@@ -49,13 +54,15 @@ export class OrderStore {
     // Databases made before a column existed: add it.
     const cols = new Set((this.db.prepare('PRAGMA table_info(orders)').all() as { name: string }[]).map((c) => c.name));
     if (!cols.has('failures')) this.db.exec('ALTER TABLE orders ADD COLUMN failures INTEGER NOT NULL DEFAULT 0');
+    if (!cols.has('limit_buy_amount')) this.db.exec('ALTER TABLE orders ADD COLUMN limit_buy_amount TEXT');
+    if (!cols.has('kind')) this.db.exec(`ALTER TABLE orders ADD COLUMN kind TEXT NOT NULL DEFAULT 'limit'`);
   }
 
   insert(o: Omit<StoredOrder, 'status' | 'fillTx' | 'received' | 'lastError' | 'retryAt' | 'failures'>): boolean {
     const r = this.db.prepare(`INSERT OR IGNORE INTO orders
-      (id, account, sell, sell_amount, buy, min_buy_amount, order_key, expires_at, created_at, status, spt_hex)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`)
-      .run(o.id, o.account, o.sell, o.sellAmount, o.buy, o.minBuyAmount, o.orderKeyHex, o.expiresAt, o.createdAt, o.signedPartialTransactionHex);
+      (id, account, sell, sell_amount, buy, min_buy_amount, order_key, expires_at, created_at, status, spt_hex, limit_buy_amount, kind)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`)
+      .run(o.id, o.account, o.sell, o.sellAmount, o.buy, o.minBuyAmount, o.orderKeyHex, o.expiresAt, o.createdAt, o.signedPartialTransactionHex, o.limitBuyAmount, o.kind);
     return Number(r.changes) === 1;
   }
 
@@ -64,7 +71,7 @@ export class OrderStore {
   }
 
   open(): StoredOrder[] {
-    return this.db.prepare(`SELECT ${COLUMNS} FROM orders WHERE status = 'open' ORDER BY created_at`).all() as unknown as StoredOrder[];
+    return this.db.prepare(`SELECT ${COLUMNS} FROM orders WHERE status = 'open' ORDER BY created_at, rowid`).all() as unknown as StoredOrder[];
   }
 
   openCount(account: string): number {

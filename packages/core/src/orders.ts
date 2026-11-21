@@ -136,3 +136,35 @@ export function crossFillManifest(o: { solver: SolverIdentity; feeLockXrd: strin
     `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
   ].join('\n');
 }
+
+/**
+ * Root manifest that fills a taker order against resting orders and, for what is left, pools.
+ * Each maker is paid `pay` of the token the taker sells. `poolIn` of that token goes through
+ * `route`. The taker gets everything the makers sold plus what the pools returned, less
+ * `solverTake`. Whatever remains (the makers' fees) goes to the solver.
+ */
+export function takeFillManifest(o: { solver: SolverIdentity; feeLockXrd: string; sell: string; buy: string; makerPays: string[]; poolIn: string; route: Pool[]; solverTake: string }): string {
+  const lines = [...head(o.solver, o.feeLockXrd), `YIELD_TO_CHILD NamedIntent("taker");`];
+  o.makerPays.forEach((_, i) => lines.push(`YIELD_TO_CHILD NamedIntent("maker_${i}");`));
+  o.makerPays.forEach((pay, i) => lines.push(
+    `TAKE_FROM_WORKTOP ${addr(o.sell)} ${dec(pay)} ${bucket(`pay_${i}`)};`,
+    `YIELD_TO_CHILD NamedIntent("maker_${i}") ${bucket(`pay_${i}`)};`,
+  ));
+  if (o.route.length && new Decimal(o.poolIn).isPositive()) {
+    const path = routePath(o.route, o.sell);
+    if (path[path.length - 1] !== o.buy) throw new Error('route does not end in the bought token');
+    lines.push(`TAKE_FROM_WORKTOP ${addr(o.sell)} ${dec(o.poolIn)} ${bucket('in0')};`, ...routeInstructions(o.route, o.sell));
+  }
+  if (new Decimal(o.solverTake).isPositive()) {
+    lines.push(
+      `TAKE_FROM_WORKTOP ${addr(o.buy)} ${dec(o.solverTake)} ${bucket('fee')};`,
+      `CALL_METHOD ${addr(o.solver.account)} "deposit" ${bucket('fee')};`,
+    );
+  }
+  lines.push(
+    `TAKE_ALL_FROM_WORKTOP ${addr(o.buy)} ${bucket('out')};`,
+    `YIELD_TO_CHILD NamedIntent("taker") ${bucket('out')};`,
+    `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
+  );
+  return lines.join('\n');
+}

@@ -6,6 +6,9 @@ import { type DecodedOrder, decodeSignedPartialTransaction, fromHex, normaliseSu
 
 export class OrderRejected extends Error {}
 
+/** A market order is filled at once or not at all, so it lives only a few minutes. */
+export const MARKET_MIN_LIFETIME_SEC = 20, MARKET_MAX_LIFETIME_SEC = 600;
+
 export interface OrderRules {
   networkId: number;
   solverBadge: string;
@@ -22,6 +25,10 @@ export interface OrderSubmission {
   sellAmount: string;
   buy: string;
   minBuyAmount: string;
+  /** Gross amount at which the order should fill (price times size). Not signed: defaults to the minimum. */
+  limitBuyAmount?: string;
+  /** "market" orders are short-lived and take the best price available now. */
+  kind?: 'limit' | 'market';
   /** Blake2b-256 of the user's cancel secret, hex. */
   orderKeyHex: string;
   signedPartialTransactionHex: string;
@@ -29,6 +36,8 @@ export interface OrderSubmission {
 
 export interface ValidatedOrder extends DecodedOrder {
   params: LimitOrderParams;
+  limitBuyAmount: string;
+  kind: 'limit' | 'market';
   expiresAt: number;
 }
 
@@ -57,6 +66,12 @@ export async function validateLimitOrder(s: OrderSubmission, rules: OrderRules):
     registry: rules.registry ? { component: rules.registry, orderKeyHex: s.orderKeyHex } : undefined,
   };
 
+  const kind = s.kind ?? 'limit';
+  if (kind !== 'limit' && kind !== 'market') throw new OrderRejected('Bad order kind');
+  // The trigger is the user's own instruction to us, never looser than what they signed.
+  const limitBuyAmount = s.limitBuyAmount === undefined || s.limitBuyAmount === null ? params.minBuyAmount : amount(s.limitBuyAmount, 'limitBuyAmount');
+  if (new Decimal(limitBuyAmount).lt(params.minBuyAmount)) throw new OrderRejected('limitBuyAmount is below the signed minimum');
+
   let decoded: DecodedOrder;
   try {
     decoded = await decodeSignedPartialTransaction(s.signedPartialTransactionHex, rules.networkId);
@@ -70,8 +85,8 @@ export async function validateLimitOrder(s: OrderSubmission, rules: OrderRules):
   const h = decoded.subintent.intentCore.header;
   const expiresAt = h.maxProposerTimestampExclusive;
   if (typeof expiresAt !== 'number') throw new OrderRejected('Order has no expiry time');
-  if (expiresAt < rules.nowSec + rules.minLifetimeSec) throw new OrderRejected('Order expires too soon');
-  if (expiresAt > rules.nowSec + rules.maxLifetimeSec) throw new OrderRejected('Order expires too far in the future');
+  if (expiresAt < rules.nowSec + (kind === 'market' ? MARKET_MIN_LIFETIME_SEC : rules.minLifetimeSec)) throw new OrderRejected('Order expires too soon');
+  if (expiresAt > rules.nowSec + (kind === 'market' ? MARKET_MAX_LIFETIME_SEC : rules.maxLifetimeSec)) throw new OrderRejected('Order expires too far in the future');
   if (typeof h.minProposerTimestampInclusive === 'number' && h.minProposerTimestampInclusive > rules.nowSec) throw new OrderRejected('Order is not valid yet');
 
   // Exactly one Ed25519 signature, valid over the subintent hash, from the key the account address is derived from.
@@ -84,5 +99,5 @@ export async function validateLimitOrder(s: OrderSubmission, rules: OrderRules):
   const derived = await RadixEngineToolkit.Derive.virtualAccountAddressFromPublicKey(new PublicKey.Ed25519(sig.publicKey), rules.networkId);
   if (derived !== s.account) throw new OrderRejected('Order is not signed by the key that controls this account');
 
-  return { ...decoded, params, expiresAt };
+  return { ...decoded, params, limitBuyAmount, kind, expiresAt };
 }

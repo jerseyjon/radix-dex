@@ -147,3 +147,30 @@ balances; no flash loans that can touch pricing state; independent audit before 
 ## Out of scope for v1
 
 Own pools, escrow order book, partial fills, stop/trigger orders, margin, fiat.
+
+## How orders are matched (since 21 Nov 2026)
+
+Every order, market or limit, is a signed subintent filled by the solver. Each one carries two amounts:
+
+- **the trigger** (`limitBuyAmount`): its price times its size. The solver fills the order once the
+  market pays that much for the whole order. It is the price shown in the book. It is not signed:
+  it is the user's instruction to the solver, and the server refuses a trigger below the signed minimum.
+- **the signed minimum** (`minBuyAmount`): the trigger less the fee allowance (the network fee, about
+  1 XRD, plus the service fee). The Radix Engine enforces it, and it is the figure the wallet shows.
+
+So an order fills when the market reaches its price and the fees come out of the proceeds, as on an
+exchange. "Fill only at my price" is the solver's promise; "never less than the minimum" is the ledger's.
+
+On each pass the solver treats every open order as a taker, market orders first, then the newest.
+For a taker it compares filling through pools alone with taking the best one, two or three resting
+orders on the other side (whole orders only, each paid its own price less the service fee) and
+sending the rest through pools, and uses whichever gives the taker most. It settles in one
+transaction (`takeFillManifest`). The taker pays the network fee: 1 XRD, plus 0.35 XRD per resting
+order taken (measured on Stokenet: 0.96 and 1.34 XRD).
+
+A market order is the same subintent with a slippage floor as its minimum, a lifetime of three
+minutes and `kind: "market"`. It never shows in the book and is never taken by another order.
+Where no solver runs, the site falls back to an ordinary wallet transaction straight into the pools.
+
+Known limits: orders still fill whole or not at all, so a taker smaller than a resting order cannot
+take part of it; and a resting order is only taken when doing so beats the pools for the taker.

@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  type Depth, type DepthLevel, type Market, Decimal, Gateway, OrderRejected, POOL_FILL_BUFFER_BPS, isAccount, isResource,
+  type Depth, type DepthLevel, type Market, Decimal, Gateway, OrderRejected, isAccount, isResource,
   orderKeyFromSecret, validateLimitOrder,
 } from '@radix-dex/core';
 import type { Config } from './config.ts';
@@ -9,6 +9,9 @@ import { Api, HttpError } from './http.ts';
 import { MarketData } from './marketdata.ts';
 import { GAS_XRD, Solver, loadSolverKey } from './solver.ts';
 import { OrderStore, type StoredOrder } from './store.ts';
+
+/** How long the site asks the wallet to keep a market order valid. */
+const MARKET_ORDER_LIFETIME_SEC = 180;
 
 const need = (v: string | null, name: string): string => {
   if (!v) throw new HttpError(400, `Missing "${name}"`);
@@ -18,15 +21,16 @@ const need = (v: string | null, name: string): string => {
 /** What the public may see of an order: never the signed bytes or the cancel key. */
 const publicOrder = (o: StoredOrder) => ({
   id: o.id, account: o.account, sell: o.sell, sellAmount: o.sellAmount, buy: o.buy, minBuyAmount: o.minBuyAmount,
-  expiresAt: o.expiresAt, createdAt: o.createdAt, status: o.status, fillTx: o.fillTx, received: o.received,
+  limitBuyAmount: o.limitBuyAmount, kind: o.kind, expiresAt: o.expiresAt, createdAt: o.createdAt, status: o.status, fillTx: o.fillTx, received: o.received,
 });
 
 /** Resting orders as book levels for one market. */
 export function orderLevels(market: Market, open: StoredOrder[]): { bids: DepthLevel[]; asks: DepthLevel[] } {
   const bids: DepthLevel[] = [], asks: DepthLevel[] = [];
   for (const o of open) {
-    const sell = Number(o.sellAmount), min = Number(o.minBuyAmount);
-    if (!(sell > 0) || !(min > 0)) continue;
+    // Shown at the price the order fills at. Market orders are gone in seconds and are not book depth.
+    const sell = Number(o.sellAmount), min = Number(o.limitBuyAmount);
+    if (o.kind === 'market' || !(sell > 0) || !(min > 0)) continue;
     if (o.sell === market.base.address && o.buy === market.quote.address) asks.push({ price: min / sell, size: sell, source: 'orders' });
     else if (o.sell === market.quote.address && o.buy === market.base.address) bids.push({ price: sell / min, size: min, source: 'orders' });
   }
@@ -53,7 +57,7 @@ export async function createApp(config: Config) {
     feeBps: config.feeBps, refreshedAt: data.refreshedAt, warning: data.lastError ?? null,
     dAppDefinition: config.dAppDefinition ?? null,
     limitOrders: config.solverBadge
-      ? { enabled: true, solverBadge: config.solverBadge, registry: config.registry ?? null, maxLifetimeSec: config.maxOrderLifetimeSec, filling: Boolean(solver), gasXrd: GAS_XRD, bufferBps: POOL_FILL_BUFFER_BPS }
+      ? { enabled: true, solverBadge: config.solverBadge, registry: config.registry ?? null, maxLifetimeSec: config.maxOrderLifetimeSec, filling: Boolean(solver), gasXrd: GAS_XRD, marketOrderLifetimeSec: MARKET_ORDER_LIFETIME_SEC }
       : { enabled: false },
   }));
 
@@ -151,10 +155,12 @@ export async function createApp(config: Config) {
     if (store.openCount(order.params.account) >= config.maxOpenOrdersPerAccount) throw new HttpError(429, 'Too many open orders for this account');
     const inserted = store.insert({
       id: order.hashId, account: order.params.account, sell: order.params.sell, sellAmount: order.params.sellAmount,
-      buy: order.params.buy, minBuyAmount: order.params.minBuyAmount, orderKeyHex: submission.orderKeyHex,
+      buy: order.params.buy, minBuyAmount: order.params.minBuyAmount, limitBuyAmount: order.limitBuyAmount, kind: order.kind, orderKeyHex: submission.orderKeyHex,
       expiresAt: order.expiresAt, createdAt: Math.floor(Date.now() / 1000), signedPartialTransactionHex: order.signedPartialTransactionHex,
     });
     if (!inserted) throw new HttpError(409, 'This order has already been submitted');
+    // A market order should not wait for the next timer pass.
+    if (order.kind === 'market') void solver?.tick().catch((e) => console.error('[solver] tick failed:', e));
     return { id: order.hashId, expiresAt: order.expiresAt };
   });
 

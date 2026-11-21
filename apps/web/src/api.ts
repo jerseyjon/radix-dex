@@ -6,15 +6,17 @@ export interface ServerConfig {
   network: 'mainnet' | 'stokenet'; networkId: number; xrd: string; feeBps: number; warning: string | null;
   /** dApp definition account; null means the wallet cannot connect and the site is read-only. */
   dAppDefinition?: string | null;
-  limitOrders: { enabled: false } | { enabled: true; solverBadge: string; registry: string | null; maxLifetimeSec: number; filling: boolean; gasXrd: string; bufferBps: number };
+  limitOrders: { enabled: false } | { enabled: true; solverBadge: string; registry: string | null; maxLifetimeSec: number; filling: boolean; gasXrd: string; marketOrderLifetimeSec: number };
   /** Set by the static preview build: data is a snapshot taken at this time and nothing can be traded. */
   snapshotAt?: number;
 }
 export interface QuoteResult { sell: string; buy: string; sellAmount: string; buyAmount: string; price: string; route: Pool[]; networkFeeXrd: string }
 export interface OrderView {
   id: string; account: string; sell: string; sellAmount: string; buy: string; minBuyAmount: string;
+  /** Gross amount at which the order fills (price times size); the signed minimum is this less the fee allowance. */
+  limitBuyAmount?: string; kind?: 'limit' | 'market';
   expiresAt: number; createdAt: number; status: 'open' | 'filled' | 'cancelled' | 'expired'; fillTx: string | null; received: string | null;
-  /** Open orders: what the pools would pay now after the network fee, against what the order needs to fill. */
+  /** Open orders: what the market would pay for the whole order now, before fees, against what it needs to fill. */
   outlook?: { available: string; needed: string; at: number } | null;
 }
 

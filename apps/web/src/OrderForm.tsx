@@ -49,7 +49,8 @@ export function OrderForm(props: {
     return side === 'buy' ? cleanAmount(toPlain(p * a)) : cleanAmount(amount);
   }, [kind, side, price, amount, total]);
 
-  const limitMinBuy = useMemo(() => {
+  // A limit order's price times its size: what the market must pay, before fees, for it to fill.
+  const limitGross = useMemo(() => {
     const p = Number(price), a = Number(amount);
     if (kind !== 'limit' || !(p > 0) || !(a > 0)) return undefined;
     return side === 'buy' ? cleanAmount(amount) : cleanAmount(toPlain(p * a));
@@ -68,18 +69,26 @@ export function OrderForm(props: {
     return () => { live = false; clearTimeout(t); };
   }, [kind, sellAmount, sellTok.address, buyTok.address]);
 
-  const expectedOut = quote ? Number(quote.buyAmount) : bookEstimate?.received;
   const execPrice = quote && sellAmount
     ? (side === 'buy' ? Number(sellAmount) / Number(quote.buyAmount) : Number(quote.buyAmount) / Number(sellAmount))
     : bookEstimate?.avgPrice;
   const impact = execPrice && depth?.mid ? ((side === 'buy' ? execPrice / depth.mid : depth.mid / execPrice) - 1) * 100 : undefined;
 
-  // Would this limit order fill at once? Same sum the solver does: pool proceeds less the network fee against the limit plus a small margin.
+  // Orders are filled for the user by the solver, which pays the network fee and takes it,
+  // with the service fee, out of what the order buys.
   const lo = config.limitOrders.enabled ? config.limitOrders : undefined;
-  const netNow = kind === 'limit' && quote && lo && sellAmount
-    ? Math.max(0, Number(quote.buyAmount) - (buyTok.address === config.xrd ? Number(lo.gasXrd) : sellTok.address === config.xrd ? Number(quote.buyAmount) / Number(sellAmount) * Number(lo.gasXrd) : 0))
-    : undefined;
-  const fillsNow = netNow === undefined || !limitMinBuy ? undefined : netNow >= Number(limitMinBuy) * (1 + (lo?.bufferBps ?? 0) / 10_000);
+  const viaSolver = Boolean(lo?.filling);
+  const feesOn = (gross: number | undefined) => {
+    if (gross === undefined || !lo || !sellAmount) return undefined;
+    const network = buyTok.address === config.xrd ? Number(lo.gasXrd) : sellTok.address === config.xrd ? gross / Number(sellAmount) * Number(lo.gasXrd) : 0;
+    return { network, service: gross * config.feeBps / 10_000 };
+  };
+  const limitFees = feesOn(limitGross ? Number(limitGross) : undefined);
+  const limitMinBuy = limitGross && limitFees ? cleanAmount(toPlain(Number(limitGross) - limitFees.network - limitFees.service)) : undefined;
+  const fillsNow = kind === 'limit' && quote && limitGross ? Number(quote.buyAmount) >= Number(limitGross) : undefined;
+  const marketFees = kind === 'market' && viaSolver && quote ? feesOn(Number(quote.buyAmount)) : undefined;
+  const marketNet = marketFees ? Number(quote!.buyAmount) - marketFees.network - marketFees.service : undefined;
+  const expectedOut = marketNet ?? (quote ? Number(quote.buyAmount) : bookEstimate?.received);
 
   const setPct = (pct: number) => {
     if (!(sellBalance > 0)) return;
@@ -97,29 +106,51 @@ export function OrderForm(props: {
   else if (!sellAmount) blocker = 'Enter an amount';
   else if (Number(sellAmount) > sellBalance) blocker = `Not enough ${sellTok.symbol}`;
   else if (kind === 'market' && !quote) blocker = quoteError ?? 'Getting a quote…';
+  else if (kind === 'market' && marketNet !== undefined && !(marketNet > 0)) blocker = 'Too small to cover the network fee';
+  else if (kind === 'limit' && limitGross && !(Number(limitMinBuy) > 0)) blocker = 'Too small to cover the network fee';
 
   async function submit() {
     if (blocker || !wallet || !account || !sellAmount) return;
     setBusy(true); setError(undefined);
     try {
-      if (kind === 'market') {
+      const sign = async (minBuyAmount: string, limitBuyAmount: string, orderKind: Kind, lifetime: number, label: string) => {
+        if (!config.limitOrders.enabled) throw new Error('Orders are not enabled');
+        const secret = newCancelSecret();
+        const orderKeyHex = orderKeyFromSecret(secret);
+        const p = { account, sell: sellTok.address, sellAmount, buy: buyTok.address, minBuyAmount };
+        const manifest = limitOrderManifest({
+          ...p, solverBadge: config.limitOrders.solverBadge,
+          registry: config.limitOrders.registry ? { component: config.limitOrders.registry, orderKeyHex } : undefined,
+        });
+        const signed = await wallet.signOrder(manifest, lifetime, label);
+        const placed = await api.placeOrder({ ...p, limitBuyAmount, kind: orderKind, orderKeyHex, signedPartialTransactionHex: signed.signedPartialTransactionHex });
+        secrets.set(placed.id, secret);
+        return placed;
+      };
+      if (kind === 'market' && viaSolver && lo && marketNet) {
+        // Filled by the solver so it can take limit orders in the book as well as the pools.
+        const minBuy = cleanAmount(toPlain(marketNet * (1 - slippage / 100)));
+        if (!minBuy) return;
+        const placed = await sign(minBuy, minBuy, 'market', lo.marketOrderLifetimeSec, `Market ${side} ${base.symbol}`);
+        props.onDone('Market order sent, filling…');
+        const deadline = placed.expiresAt * 1000;
+        let outcome = 'Market order not filled: the price moved beyond your slippage limit';
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const mine = (await api.orders(account).catch(() => [])).find((o) => o.id === placed.id);
+          if (mine?.status === 'filled') { outcome = `Market order filled: received ${fmtAmount(mine.received)} ${buyTok.symbol}`; break; }
+          if (mine && mine.status !== 'open') break;
+        }
+        props.onDone(outcome);
+      } else if (kind === 'market') {
         const minBuy = toPlain(Number(quote!.buyAmount) * (1 - slippage / 100));
         const txid = await wallet.sendTransaction(
           marketOrderManifest({ account, sell: sellTok.address, sellAmount, minBuyAmount: minBuy, route: quote!.route }),
           `${side === 'buy' ? 'Buy' : 'Sell'} ${base.symbol}`);
         props.onDone(`Market order submitted: ${txid}`);
       } else {
-        if (!config.limitOrders.enabled || !limitMinBuy) return;
-        const secret = newCancelSecret();
-        const orderKeyHex = orderKeyFromSecret(secret);
-        const p = { account, sell: sellTok.address, sellAmount, buy: buyTok.address, minBuyAmount: limitMinBuy };
-        const manifest = limitOrderManifest({
-          ...p, solverBadge: config.limitOrders.solverBadge,
-          registry: config.limitOrders.registry ? { component: config.limitOrders.registry, orderKeyHex } : undefined,
-        });
-        const signed = await wallet.signOrder(manifest, expiry, `Limit ${side} ${base.symbol} @ ${price}`);
-        const placed = await api.placeOrder({ ...p, orderKeyHex, signedPartialTransactionHex: signed.signedPartialTransactionHex });
-        secrets.set(placed.id, secret);
+        if (!limitMinBuy || !limitGross) return;
+        await sign(limitMinBuy, limitGross, 'limit', expiry, `Limit ${side} ${base.symbol} @ ${price}`);
         props.onDone('Limit order placed');
       }
       setAmount(''); setTotal('');
@@ -161,25 +192,31 @@ export function OrderForm(props: {
           <div><dt>You receive {quote ? '' : '(estimate)'}</dt><dd>{expectedOut ? `${fmtAmount(expectedOut)} ${buyTok.symbol}` : '—'}</dd></div>
           <div><dt>Average price</dt><dd>{fmtPrice(execPrice)} {execPrice ? quoteTok.symbol : ''}</dd></div>
           <div><dt>Price impact</dt><dd className={impact !== undefined && impact > 3 ? 'warn' : ''}>{impact === undefined ? '—' : `${Math.max(0, impact).toFixed(2)}%`}</dd></div>
-          <div><dt>Route</dt><dd>{quote ? quote.route.map((p) => p.venue).join(' → ') : '—'}</dd></div>
+          {marketFees
+            ? <div><dt>Fees, already taken off</dt><dd>{fmtAmount(marketFees.network + marketFees.service)} {buyTok.symbol} (network fee + {(config.feeBps / 100).toFixed(2)}%)</dd></div>
+            : <div><dt>Route</dt><dd>{quote ? quote.route.map((p) => p.venue).join(' → ') : '—'}</dd></div>}
           <div><dt>Max slippage</dt><dd className="seg mini">{SLIPPAGES.map((s) => <button key={s} className={s === slippage ? 'on' : ''} onClick={() => setSlippage(s)}>{s}%</button>)}</dd></div>
         </dl>
       ) : (
         <dl className="summary">
           <div><dt>You pay</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
-          <div><dt>You receive at least</dt><dd>{limitMinBuy ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
-          <div><dt>Fee</dt><dd>Up to {(config.feeBps / 100).toFixed(2)}% plus the network fee, taken only from what the fill pays above your limit.</dd></div>
-          <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away' : `Would wait: pools pay ${fmtAmount(netNow)} ${buyTok.symbol} for this size after the network fee`}</dd></div>
+          <div><dt>At your price you get</dt><dd>{limitGross ? `${fmtAmount(limitGross)} ${buyTok.symbol}` : '—'}</dd></div>
+          <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(limitFees.network + limitFees.service)} ${buyTok.symbol} (network fee + ${(config.feeBps / 100).toFixed(2)}%)` : '—'}</dd></div>
+          <div><dt>You receive at least</dt><dd>{limitMinBuy && Number(limitMinBuy) > 0 ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
+          <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
           <div><dt>Expires in</dt><dd><select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
         </dl>
       )}
 
       <button className={`submit ${side}`} disabled={Boolean(blocker) || busy} onClick={submit}>
-        {busy ? 'Waiting for wallet…' : blocker ?? `${side === 'buy' ? 'Buy' : 'Sell'} ${base.symbol}`}
+        {busy ? 'Working…' : blocker ?? `${side === 'buy' ? 'Buy' : 'Sell'} ${base.symbol}`}
       </button>
       {error && <p className="error">{error}</p>}
+      {kind === 'market' && viaSolver && (
+        <p className="note">Your wallet will ask you to approve a pre-authorization. The order is then filled for you within a few seconds at the best price from the order book and the pools, and you pay no separate network fee.</p>
+      )}
       {kind === 'limit' && (
-        <p className="note">A limit order is a signed permission, not a transaction: placing it is free and your funds stay in your account until it fills. It fills in full or not at all, never at a worse price than your limit.</p>
+        <p className="note">A limit order is a signed permission, not a transaction: placing it is free and your funds stay in your account until it fills. It fills in full or not at all, as soon as the market reaches your price. The fees come out of what you receive, and you never get less than the “at least” amount, which is what your wallet shows.</p>
       )}
     </section>
   );

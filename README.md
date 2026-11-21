@@ -4,11 +4,12 @@ A CEX-style spot trading terminal for Radix that holds no user funds.
 
 **Status: working prototype. Not audited. Nothing here has been run on mainnet with real money.**
 
-- Market orders are ordinary wallet transactions routed through existing pools (Ociswap,
-  DefiPlaza), quoted by previewing the real swap on the ledger.
+- Market orders are short-lived pre-authorizations filled within seconds at the best price from
+  resting limit orders and existing pools (Ociswap, DefiPlaza) in one transaction. Where no
+  solver runs they fall back to an ordinary wallet transaction through the pools.
 - Limit orders are **subintents** (wallet "pre-authorizations"): free to place, funds stay in
-  the user's account until the fill, the network fee is paid by the solver, and the user's
-  minimum price is enforced by the Radix Engine. A small backend holds the signed orders and
+  the user's account until the fill, and the network fee is paid by the solver. An order fills when the
+  market reaches its price; fees come out of the proceeds, down to a minimum enforced by the Radix Engine. A small backend holds the signed orders and
   fills them against pools or against each other.
 - The order book shows pool depth and resting limit orders together.
 

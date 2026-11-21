@@ -1,8 +1,9 @@
 import { readFileSync, statSync } from 'node:fs';
 import {
   type DecodedOrder, type Ed25519Key, type Gateway, type SolverIdentity, Decimal,
-  accountOf, buildTransaction, crossFillManifest, decodeSignedPartialTransaction, findCrosses, keyFromHex,
-  POOL_FILL_BUFFER_BPS, planPoolFill, poolFillManifest, submitAndWait,
+  type MakerFill, type Pool,
+  accountOf, buildTransaction, decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, payout,
+  pickMakers, planPoolFill, submitAndWait, takeFillManifest,
 } from '@radix-dex/core';
 import type { Config } from './config.ts';
 import type { MarketData } from './marketdata.ts';
@@ -20,7 +21,23 @@ const FEE_LOCK_XRD = '10';
 export const GAS_XRD = '1';
 const MAX_FILL_FAILURES = 3;
 
-/** Fills open orders: against each other when they cross, otherwise through pools when the price is there. */
+/** Extra network cost of each resting order settled in the same transaction, as a share of GAS_XRD. */
+const GAS_PER_MAKER = 0.35;
+
+/** The best way found to fill one order now. */
+interface Execution {
+  makers: MakerFill[];
+  /** Amount of the taker's sell token sent through pools, and the route it takes. */
+  poolIn: string;
+  route: Pool[];
+  /** Everything the taker's sale produces, before the network fee and our fee. */
+  total: Decimal;
+}
+
+/**
+ * Fills open orders. Each order is tried as a taker: it takes the resting orders that give it a
+ * better price than the pools, and the pools for the rest, all in one transaction.
+ */
 export class Solver {
   private readonly config: Config;
   private readonly gateway: Gateway;
@@ -95,6 +112,35 @@ export class Solver {
     console.warn(`[solver] ${orders.map((o) => o.id.slice(-8)).join('+')}: ${error.slice(0, 200)}`);
   }
 
+  /**
+   * Best execution for `taker`: with no resting orders (pools only), then with the best one, two…
+   * of them, keeping whichever produces the most.
+   */
+  private async bestExecution(taker: StoredOrder, resting: StoredOrder[]): Promise<Execution | undefined> {
+    const xrd = this.config.network.xrd;
+    const candidates = pickMakers(taker, resting, this.config.feeBps, this.divisibility);
+    let best: Execution | undefined;
+    for (let k = 0; k <= candidates.length; k++) {
+      let makers = candidates.slice(0, k);
+      const fromMakers = makers.reduce((sum, m) => sum.plus(m.order.sellAmount), new Decimal(0));
+      const left = makers.reduce((rest, m) => rest.minus(m.cost), new Decimal(taker.sellAmount));
+      let total = fromMakers, route: Pool[] = [], poolIn = '0';
+      if (left.isPositive()) {
+        const quote = await this.data.quoter.best(this.data.pools, taker.sell, taker.buy, left.toFixed(), xrd).catch(() => undefined);
+        if (quote) { total = total.plus(quote.buyAmount); route = quote.route; poolIn = left.toFixed(); }
+        else if (k === 0) continue;
+        else {
+          // No pool for the remainder: the first maker gets it as a better price.
+          const first = makers[0]!, cost = new Decimal(first.cost).plus(left);
+          const pay = payout(cost, new Decimal(first.order.minBuyAmount), this.config.feeBps, this.divisibility(taker.sell))!;
+          makers = [{ order: first.order, cost: cost.toFixed(), pay: pay.toFixed() }, ...makers.slice(1)];
+        }
+      }
+      if (!best || total.gt(best.total)) best = { makers, poolIn, route, total };
+    }
+    return best;
+  }
+
   /** One pass over the open orders. Safe to call on a timer; overlapping calls are skipped. */
   async tick(): Promise<{ crossed: number; poolFilled: number }> {
     const result = { crossed: 0, poolFilled: 0 };
@@ -103,54 +149,49 @@ export class Solver {
     try {
       const now = Math.floor(Date.now() / 1000);
       this.store.expire(now + 15); // leave time for the fill to commit
-      let open = this.store.open().filter((o) => o.retryAt <= now);
-      const openIds = new Set(this.store.open().map((o) => o.id));
+      const all = this.store.open();
+      const openIds = new Set(all.map((o) => o.id));
       for (const id of this.outlook.keys()) if (!openIds.has(id)) this.outlook.delete(id);
+      // Market orders first, then the newest: the order that arrives is the one that takes.
+      const open = all.filter((o) => o.retryAt <= now).reverse()
+        .sort((a, b) => Number(b.kind === 'market') - Number(a.kind === 'market'));
       if (!open.length) return result;
       await this.account();
       const solver = this.identity!;
       await this.loadDivisibility(open.flatMap((o) => [o.sell, o.buy]));
+      const xrd = this.config.network.xrd;
+      const done = new Set<string>();
 
-      // 1. Orders that cross each other.
-      for (const plan of findCrosses(open, this.config.feeBps, this.divisibility)) {
-        const a = plan.a as StoredOrder, b = plan.b as StoredOrder;
-        try {
-          if (!(await this.funded(a)) || !(await this.funded(b))) { this.fail([a, b], 'account no longer holds the sell amount'); continue; }
-          const res = await this.submit(
-            crossFillManifest({ solver, feeLockXrd: FEE_LOCK_XRD, x: a.sell, y: a.buy, payA: plan.payA, payB: plan.payB }),
-            { order_a: await this.decode(a), order_b: await this.decode(b) });
-          if (!res.ok) { this.fail([a, b], res.error); continue; }
-          this.store.markFilled(a.id, res.txid, plan.payA);
-          this.store.markFilled(b.id, res.txid, plan.payB);
-          result.crossed += 2;
-          console.log(`[solver] crossed ${a.id.slice(-8)} with ${b.id.slice(-8)} in ${res.txid}`);
-        } catch (e) { this.fail([a, b], String((e as Error).message ?? e)); }
-      }
-
-      // 2. Everything still open: try the pools.
-      open = this.store.open().filter((o) => o.retryAt <= now);
       for (const o of open) {
+        if (done.has(o.id)) continue;
+        let involved: StoredOrder[] = [o];
         try {
-          const quote = await this.data.quoter.best(this.data.pools, o.sell, o.buy, o.sellAmount, this.config.network.xrd);
-          if (!quote) { this.outlook.delete(o.id); continue; }
-          const out = new Decimal(quote.buyAmount);
-          const xrd = this.config.network.xrd;
-          const gasInBuyToken = o.buy === xrd ? GAS_XRD : o.sell === xrd ? out.div(o.sellAmount).mul(GAS_XRD).toFixed(18) : '0';
-          this.outlook.set(o.id, {
-            available: Decimal.max(out.minus(gasInBuyToken), 0).toFixed(), at: now,
-            needed: new Decimal(o.minBuyAmount).mul(10_000 + POOL_FILL_BUFFER_BPS).div(10_000).toFixed(),
-          });
-          const plan = planPoolFill({ quotedOut: quote.buyAmount, minBuyAmount: o.minBuyAmount, feeBps: this.config.feeBps, gasInBuyToken, divisibility: this.divisibility(o.buy) });
+          const exec = await this.bestExecution(o, open.filter((m) => m.kind !== 'market' && !done.has(m.id)));
+          if (!exec) { this.outlook.delete(o.id); continue; }
+          const gasXrd = new Decimal(GAS_XRD).mul(1 + GAS_PER_MAKER * exec.makers.length);
+          const gasInBuyToken = o.buy === xrd ? gasXrd.toFixed() : o.sell === xrd ? exec.total.div(o.sellAmount).mul(gasXrd).toFixed(18) : '0';
+          // With no pool leg the outcome is exact, so no margin is needed.
+          const terms = { minBuyAmount: o.minBuyAmount, limitBuyAmount: limitOf(o).toFixed(), gasInBuyToken, bufferBps: exec.route.length ? undefined : 0 };
+          this.outlook.set(o.id, { available: exec.total.toFixed(), needed: grossNeeded(terms).toFixed(), at: now });
+          const plan = planPoolFill({ ...terms, quotedOut: exec.total.toFixed(), feeBps: this.config.feeBps, divisibility: this.divisibility(o.buy) });
           if (!plan) continue;
-          if (!(await this.funded(o))) { this.fail([o], 'account no longer holds the sell amount'); continue; }
+          const makers = exec.makers.map((m) => m.order as StoredOrder);
+          involved = [o, ...makers];
+          let unfunded = false;
+          for (const x of involved) if (!(await this.funded(x))) { this.fail([x], 'account no longer holds the sell amount'); unfunded = true; }
+          if (unfunded) continue;
+          const children: Record<string, DecodedOrder> = { taker: await this.decode(o) };
+          for (const [i, m] of makers.entries()) children[`maker_${i}`] = await this.decode(m);
           const res = await this.submit(
-            poolFillManifest({ solver, feeLockXrd: FEE_LOCK_XRD, sell: o.sell, route: quote.route, solverTake: plan.solverTake }),
-            { order: await this.decode(o) });
-          if (!res.ok) { this.fail([o], res.error); continue; }
+            takeFillManifest({ solver, feeLockXrd: FEE_LOCK_XRD, sell: o.sell, buy: o.buy, makerPays: exec.makers.map((m) => m.pay), poolIn: exec.poolIn, route: exec.route, solverTake: plan.solverTake }),
+            children);
+          if (!res.ok) { this.fail(involved, res.error); continue; }
           this.store.markFilled(o.id, res.txid, plan.userReceives);
-          result.poolFilled += 1;
-          console.log(`[solver] filled ${o.id.slice(-8)} through ${quote.route.map((p) => p.venue).join('>')} in ${res.txid}`);
-        } catch (e) { this.fail([o], String((e as Error).message ?? e)); }
+          exec.makers.forEach((m) => this.store.markFilled(m.order.id, res.txid, m.pay));
+          involved.forEach((x) => done.add(x.id));
+          if (makers.length) result.crossed += involved.length; else result.poolFilled += 1;
+          console.log(`[solver] filled ${o.kind} ${o.id.slice(-8)}${makers.length ? ' against ' + makers.map((m) => m.id.slice(-8)).join('+') : ''}${exec.route.length ? ' through ' + exec.route.map((p) => p.venue).join('>') : ''} in ${res.txid}`);
+        } catch (e) { this.fail(involved, String((e as Error).message ?? e)); }
       }
       return result;
     } finally {

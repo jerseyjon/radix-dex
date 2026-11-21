@@ -46,9 +46,10 @@ const oa = orders.find((o) => o.id === a.id), of = orders.find((o) => o.id === f
 expect(oa?.status === 'filled' && /^txid_/.test(oa.fillTx), `Alice's order is filled (${oa?.status}, ${oa?.fillTx})`);
 expect(of?.status === 'open', 'the far-from-market order is still open');
 const after = { at: await balance(alice, keys.tusd), bx: await balance(bob, net.xrd) };
-// 10 bps fee: Alice gets 4 * 0.999 = 3.996 TUSD, Bob gets 40 * 0.999 = 39.96 XRD.
+// Bob's order arrived second, so it is the taker and carries the network fee (1.35 XRD with one maker).
+// Alice gets 4 * 0.999 = 3.996 TUSD; Bob gets 40 XRD less 0.10% and the network fee = 38.61.
 expect(Math.abs(after.at - before.at - 3.996) < 1e-9, `Alice received 3.996 TUSD (got ${after.at - before.at})`);
-expect(Math.abs(after.bx - before.bx - 39.96) < 1e-9, `Bob received 39.96 XRD (got ${after.bx - before.bx})`);
+expect(Math.abs(after.bx - before.bx - 38.61) < 1e-9, `Bob received 38.61 XRD (got ${after.bx - before.bx})`);
 const cancel = await fetch(`${base}/api/orders/${far.id}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ secret: far.secret }) });
 expect(cancel.ok, 'far order soft-cancelled');
 void b;

@@ -7,7 +7,16 @@ export interface OpenOrder {
   sellAmount: string;
   buy: string;
   minBuyAmount: string;
+  /**
+   * What the order must be worth, before fees, for it to fill: its price times its size.
+   * The signed minimum sits below this by the fee allowance. Absent on older orders, where the
+   * minimum is also the trigger.
+   */
+  limitBuyAmount?: string;
 }
+
+/** The gross amount at which an order triggers. */
+export const limitOf = (o: OpenOrder): Decimal => Decimal.max(o.limitBuyAmount ?? o.minBuyAmount, o.minBuyAmount);
 
 const floorTo = (d: Decimal, divisibility: number) => d.toDecimalPlaces(divisibility, Decimal.ROUND_DOWN);
 const ceilTo = (d: Decimal, divisibility: number) => d.toDecimalPlaces(divisibility, Decimal.ROUND_UP);
@@ -64,18 +73,57 @@ export function findCrosses(orders: OpenOrder[], feeBps: number, divisibility: (
 export const POOL_FILL_BUFFER_BPS = 5;
 
 /**
- * Decide the solver's cut of a pool fill. `quotedOut` is what the route is expected to produce,
- * `gasInBuyToken` the network fee expressed in the bought token.
- * The network fee always comes out of the proceeds. The service fee is taken only from what is
- * left above the user's minimum (plus `bufferBps`), so it never stops an order filling and
- * never takes the user below their limit.
+ * Decide the solver's cut of a fill. `quotedOut` is everything the fill is expected to produce
+ * for the order, `gasInBuyToken` the network fee expressed in the bought token.
+ * The order fills only when the proceeds reach its trigger (`limitBuyAmount`, default the minimum).
+ * The network fee always comes out of the proceeds. The service fee is cut back if needed so the
+ * user stays above their signed minimum (plus `bufferBps`), and never takes them below it.
  */
-export function planPoolFill(o: { quotedOut: string; minBuyAmount: string; feeBps: number; gasInBuyToken: string; divisibility: number; bufferBps?: number }): { solverTake: string; userReceives: string } | undefined {
+export function planPoolFill(o: { quotedOut: string; minBuyAmount: string; limitBuyAmount?: string; feeBps: number; gasInBuyToken: string; divisibility: number; bufferBps?: number }): { solverTake: string; userReceives: string } | undefined {
   const out = new Decimal(o.quotedOut);
+  if (o.limitBuyAmount !== undefined && out.lt(o.limitBuyAmount)) return undefined;
   const needed = new Decimal(o.minBuyAmount).mul(10_000 + (o.bufferBps ?? POOL_FILL_BUFFER_BPS)).div(10_000);
   const surplus = out.minus(o.gasInBuyToken).minus(needed);
   if (surplus.isNegative()) return undefined;
   const fee = Decimal.min(out.mul(o.feeBps).div(10_000), surplus);
   const take = floorTo(fee.plus(o.gasInBuyToken), o.divisibility);
   return { solverTake: take.toFixed(), userReceives: out.minus(take).toFixed() };
+}
+
+/** The least a fill must produce, before fees, for `planPoolFill` to accept it. */
+export function grossNeeded(o: { minBuyAmount: string; limitBuyAmount?: string; gasInBuyToken: string; bufferBps?: number }): Decimal {
+  const floor = new Decimal(o.minBuyAmount).mul(10_000 + (o.bufferBps ?? POOL_FILL_BUFFER_BPS)).div(10_000).plus(o.gasInBuyToken);
+  return Decimal.max(floor, o.limitBuyAmount ?? 0);
+}
+
+export interface MakerFill {
+  order: OpenOrder;
+  /** What the maker is owed before fees, in the token the taker sells. */
+  cost: string;
+  /** What the maker is paid: its limit less the fee, never below its signed minimum. */
+  pay: string;
+}
+
+/**
+ * Resting orders a taker can absorb, best price for the taker first. Orders fill whole or not at
+ * all, so a maker qualifies only while the makers chosen so far, at their own prices, fit inside
+ * what the taker sells. The caller decides how many of them to use.
+ */
+export function pickMakers(taker: OpenOrder, resting: OpenOrder[], feeBps: number, divisibility: (resource: string) => number, max = 3): MakerFill[] {
+  const div = divisibility(taker.sell);
+  const candidates = resting
+    .filter((m) => m.id !== taker.id && m.sell === taker.buy && m.buy === taker.sell)
+    .map((m) => ({ m, limit: limitOf(m) }))
+    .sort((x, y) => x.limit.div(x.m.sellAmount).cmp(y.limit.div(y.m.sellAmount)));
+  const out: MakerFill[] = [];
+  let left = new Decimal(taker.sellAmount);
+  for (const { m, limit } of candidates) {
+    if (out.length >= max) break;
+    const cost = ceilTo(limit, div);
+    const pay = payout(cost, new Decimal(m.minBuyAmount), feeBps, div);
+    if (!pay || cost.gt(left)) continue;
+    left = left.minus(cost);
+    out.push({ order: m, cost: cost.toFixed(), pay: pay.toFixed() });
+  }
+  return out;
 }
