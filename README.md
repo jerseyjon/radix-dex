@@ -64,6 +64,11 @@ scripts/run-stokenet.sh                # run the Stokenet test site with wallet 
 scrypto/run.sh test                    # contract tests, including attempts to drain the pool
 ```
 
+The Radix Connector browser extension only runs on `https://` pages and on `http://localhost` or
+`http://127.0.0.1`. Opened by LAN address over plain http, the site reports the extension as
+missing. From another machine, forward the port (`ssh -L 8788:localhost:8788 user@host`) and
+open `http://localhost:8788`.
+
 ## Safety notes
 
 - The solver key can never move a user's funds beyond what a signed order allows. If it leaks,
