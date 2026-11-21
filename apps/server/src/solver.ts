@@ -2,7 +2,7 @@ import { readFileSync, statSync } from 'node:fs';
 import {
   type DecodedOrder, type Ed25519Key, type Gateway, type SolverIdentity, Decimal,
   accountOf, buildTransaction, crossFillManifest, decodeSignedPartialTransaction, findCrosses, keyFromHex,
-  planPoolFill, poolFillManifest, submitAndWait,
+  POOL_FILL_BUFFER_BPS, planPoolFill, poolFillManifest, submitAndWait,
 } from '@radix-dex/core';
 import type { Config } from './config.ts';
 import type { MarketData } from './marketdata.ts';
@@ -17,7 +17,7 @@ export function loadSolverKey(path: string): Ed25519Key {
 
 const FEE_LOCK_XRD = '10';
 /** Rough network cost of a fill, charged to the order in the bought token. */
-const GAS_XRD = '1';
+export const GAS_XRD = '1';
 const MAX_FILL_FAILURES = 3;
 
 /** Fills open orders: against each other when they cross, otherwise through pools when the price is there. */
@@ -31,6 +31,8 @@ export class Solver {
   private identity: SolverIdentity | undefined;
   private readonly divisibilities = new Map<string, number>();
   private running = false;
+  /** Per open order: what the pools would pay it right now after the network fee, and what it needs. */
+  readonly outlook = new Map<string, { available: string; needed: string; at: number }>();
 
   constructor(o: { config: Config; gateway: Gateway; store: OrderStore; data: MarketData; key: Ed25519Key; badge: string }) {
     this.config = o.config; this.gateway = o.gateway; this.store = o.store; this.data = o.data; this.key = o.key; this.badge = o.badge;
@@ -102,6 +104,8 @@ export class Solver {
       const now = Math.floor(Date.now() / 1000);
       this.store.expire(now + 15); // leave time for the fill to commit
       let open = this.store.open().filter((o) => o.retryAt <= now);
+      const openIds = new Set(this.store.open().map((o) => o.id));
+      for (const id of this.outlook.keys()) if (!openIds.has(id)) this.outlook.delete(id);
       if (!open.length) return result;
       await this.account();
       const solver = this.identity!;
@@ -128,11 +132,14 @@ export class Solver {
       for (const o of open) {
         try {
           const quote = await this.data.quoter.best(this.data.pools, o.sell, o.buy, o.sellAmount, this.config.network.xrd);
-          if (!quote) continue;
+          if (!quote) { this.outlook.delete(o.id); continue; }
           const out = new Decimal(quote.buyAmount);
-          if (out.lt(o.minBuyAmount)) continue; // price not there yet: not an error
           const xrd = this.config.network.xrd;
           const gasInBuyToken = o.buy === xrd ? GAS_XRD : o.sell === xrd ? out.div(o.sellAmount).mul(GAS_XRD).toFixed(18) : '0';
+          this.outlook.set(o.id, {
+            available: Decimal.max(out.minus(gasInBuyToken), 0).toFixed(), at: now,
+            needed: new Decimal(o.minBuyAmount).mul(10_000 + POOL_FILL_BUFFER_BPS).div(10_000).toFixed(),
+          });
           const plan = planPoolFill({ quotedOut: quote.buyAmount, minBuyAmount: o.minBuyAmount, feeBps: this.config.feeBps, gasInBuyToken, divisibility: this.divisibility(o.buy) });
           if (!plan) continue;
           if (!(await this.funded(o))) { this.fail([o], 'account no longer holds the sell amount'); continue; }

@@ -7,7 +7,7 @@ import {
 import type { Config } from './config.ts';
 import { Api, HttpError } from './http.ts';
 import { MarketData } from './marketdata.ts';
-import { Solver, loadSolverKey } from './solver.ts';
+import { GAS_XRD, Solver, loadSolverKey } from './solver.ts';
 import { OrderStore, type StoredOrder } from './store.ts';
 
 const need = (v: string | null, name: string): string => {
@@ -53,7 +53,7 @@ export async function createApp(config: Config) {
     feeBps: config.feeBps, refreshedAt: data.refreshedAt, warning: data.lastError ?? null,
     dAppDefinition: config.dAppDefinition ?? null,
     limitOrders: config.solverBadge
-      ? { enabled: true, solverBadge: config.solverBadge, registry: config.registry ?? null, maxLifetimeSec: config.maxOrderLifetimeSec, filling: Boolean(solver) }
+      ? { enabled: true, solverBadge: config.solverBadge, registry: config.registry ?? null, maxLifetimeSec: config.maxOrderLifetimeSec, filling: Boolean(solver), gasXrd: GAS_XRD, bufferBps: POOL_FILL_BUFFER_BPS }
       : { enabled: false },
   }));
 
@@ -125,7 +125,7 @@ export async function createApp(config: Config) {
   api.on('GET', '/api/orders', ({ url }) => {
     const account = need(url.searchParams.get('account'), 'account');
     if (!isAccount(account)) throw new HttpError(400, 'Bad account address');
-    return store.byAccount(account).map(publicOrder);
+    return store.byAccount(account).map((o) => ({ ...publicOrder(o), outlook: o.status === 'open' ? solver?.outlook.get(o.id) ?? null : null }));
   });
 
   api.on('POST', '/api/orders', async ({ body }) => {

@@ -60,17 +60,22 @@ export function findCrosses(orders: OpenOrder[], feeBps: number, divisibility: (
   return plans;
 }
 
+/** Margin by which a pool fill must clear the user's minimum, so a small price move between quote and commit does not waste a failed transaction. */
+export const POOL_FILL_BUFFER_BPS = 5;
+
 /**
  * Decide the solver's cut of a pool fill. `quotedOut` is what the route is expected to produce,
  * `gasInBuyToken` the network fee expressed in the bought token.
- * The fill only goes ahead if the user would still clear their minimum by `bufferBps`,
- * so that small price moves between quote and commit do not waste a failed transaction.
+ * The network fee always comes out of the proceeds. The service fee is taken only from what is
+ * left above the user's minimum (plus `bufferBps`), so it never stops an order filling and
+ * never takes the user below their limit.
  */
 export function planPoolFill(o: { quotedOut: string; minBuyAmount: string; feeBps: number; gasInBuyToken: string; divisibility: number; bufferBps?: number }): { solverTake: string; userReceives: string } | undefined {
   const out = new Decimal(o.quotedOut);
-  const take = floorTo(out.mul(o.feeBps).div(10_000).plus(o.gasInBuyToken), o.divisibility);
-  const user = out.minus(take);
-  const needed = new Decimal(o.minBuyAmount).mul(10_000 + (o.bufferBps ?? 20)).div(10_000);
-  if (user.lt(needed)) return undefined;
-  return { solverTake: take.toFixed(), userReceives: user.toFixed() };
+  const needed = new Decimal(o.minBuyAmount).mul(10_000 + (o.bufferBps ?? POOL_FILL_BUFFER_BPS)).div(10_000);
+  const surplus = out.minus(o.gasInBuyToken).minus(needed);
+  if (surplus.isNegative()) return undefined;
+  const fee = Decimal.min(out.mul(o.feeBps).div(10_000), surplus);
+  const take = floorTo(fee.plus(o.gasInBuyToken), o.divisibility);
+  return { solverTake: take.toFixed(), userReceives: out.minus(take).toFixed() };
 }

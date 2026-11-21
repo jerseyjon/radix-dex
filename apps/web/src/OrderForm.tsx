@@ -60,7 +60,7 @@ export function OrderForm(props: {
   // Exact quote from the server (a ledger preview), debounced.
   useEffect(() => {
     setQuote(undefined); setQuoteError(undefined);
-    if (kind !== 'market' || !sellAmount || STATIC) return;
+    if (!sellAmount || STATIC) return;
     let live = true;
     const t = setTimeout(() => {
       api.quote(sellTok.address, buyTok.address, sellAmount).then((q) => live && setQuote(q)).catch((e) => live && setQuoteError(e.message));
@@ -73,6 +73,13 @@ export function OrderForm(props: {
     ? (side === 'buy' ? Number(sellAmount) / Number(quote.buyAmount) : Number(quote.buyAmount) / Number(sellAmount))
     : bookEstimate?.avgPrice;
   const impact = execPrice && depth?.mid ? ((side === 'buy' ? execPrice / depth.mid : depth.mid / execPrice) - 1) * 100 : undefined;
+
+  // Would this limit order fill at once? Same sum the solver does: pool proceeds less the network fee against the limit plus a small margin.
+  const lo = config.limitOrders.enabled ? config.limitOrders : undefined;
+  const netNow = kind === 'limit' && quote && lo && sellAmount
+    ? Math.max(0, Number(quote.buyAmount) - (buyTok.address === config.xrd ? Number(lo.gasXrd) : sellTok.address === config.xrd ? Number(quote.buyAmount) / Number(sellAmount) * Number(lo.gasXrd) : 0))
+    : undefined;
+  const fillsNow = netNow === undefined || !limitMinBuy ? undefined : netNow >= Number(limitMinBuy) * (1 + (lo?.bufferBps ?? 0) / 10_000);
 
   const setPct = (pct: number) => {
     if (!(sellBalance > 0)) return;
@@ -161,7 +168,8 @@ export function OrderForm(props: {
         <dl className="summary">
           <div><dt>You pay</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>You receive at least</dt><dd>{limitMinBuy ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
-          <div><dt>Fee</dt><dd>{(config.feeBps / 100).toFixed(2)}% of the proceeds, never taking you below your limit. Network fee paid for you.</dd></div>
+          <div><dt>Fee</dt><dd>Up to {(config.feeBps / 100).toFixed(2)}% plus the network fee, taken only from what the fill pays above your limit.</dd></div>
+          <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away' : `Would wait: pools pay ${fmtAmount(netNow)} ${buyTok.symbol} for this size after the network fee`}</dd></div>
           <div><dt>Expires in</dt><dd><select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
         </dl>
       )}

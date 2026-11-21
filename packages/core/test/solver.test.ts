@@ -42,10 +42,16 @@ test('each order is used in at most one cross', () => {
   assert.deepEqual([plans[0]!.a.id, plans[0]!.b.id], ['a', 'b']);
 });
 
-test('pool fill takes fee plus gas and refuses when the user would miss their minimum', () => {
-  assert.deepEqual(planPoolFill({ quotedOut: '100', minBuyAmount: '90', feeBps: 10, gasInBuyToken: '0.5', divisibility: 18 }), { solverTake: '0.6', userReceives: '99.4' });
-  assert.equal(planPoolFill({ quotedOut: '100', minBuyAmount: '99.5', feeBps: 10, gasInBuyToken: '0.5', divisibility: 18 }), undefined);
-  // Buffer: exactly at the minimum is not enough.
-  assert.equal(planPoolFill({ quotedOut: '100', minBuyAmount: '99.4', feeBps: 10, gasInBuyToken: '0.5', divisibility: 18 }), undefined);
-  assert.ok(planPoolFill({ quotedOut: '100', minBuyAmount: '99.4', feeBps: 10, gasInBuyToken: '0.5', divisibility: 18, bufferBps: 0 }));
+test('pool fill: gas always comes out, the fee only from the surplus, never below the minimum', () => {
+  const f = (minBuyAmount: string, bufferBps?: number) => planPoolFill({ quotedOut: '100', minBuyAmount, feeBps: 10, gasInBuyToken: '0.5', divisibility: 18, bufferBps });
+  // Plenty of room: full fee (0.1) plus gas (0.5).
+  assert.deepEqual(f('90'), { solverTake: '0.6', userReceives: '99.4' });
+  // Tight: the order still fills, the fee shrinks to what is left above the minimum.
+  assert.deepEqual(f('99.45', 0), { solverTake: '0.55', userReceives: '99.45' });
+  assert.deepEqual(f('99.5', 0), { solverTake: '0.5', userReceives: '99.5' });
+  // Not even the network fee is covered: no fill.
+  assert.equal(f('99.51', 0), undefined);
+  // The default buffer keeps a small margin above the minimum.
+  assert.equal(f('99.5'), undefined);
+  assert.ok(Number(f('99.4')!.userReceives) >= 99.4 * 1.0005);
 });
