@@ -1,3 +1,4 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   type Depth, type DepthLevel, type Market, Decimal, Gateway, OrderRejected, isAccount, isResource,
@@ -116,7 +117,14 @@ export async function createApp(config: Config) {
         nowSec: Math.floor(Date.now() / 1000), maxLifetimeSec: config.maxOrderLifetimeSec, minLifetimeSec: 60,
       });
     } catch (e) {
-      if (e instanceof OrderRejected) throw new HttpError(400, e.message);
+      if (e instanceof OrderRejected) {
+        console.error('[orders] rejected: ' + e.message);
+        // Off mainnet, keep the refused submission so the cause can be worked out.
+        if (config.network.name !== 'mainnet' && config.dataDir !== ':memory:') {
+          try { mkdirSync(join(config.dataDir, 'rejected'), { recursive: true }); writeFileSync(join(config.dataDir, 'rejected', Date.now() + '.json'), JSON.stringify({ reason: e.message, submission }, null, 2).slice(0, 60_000), { mode: 0o600 }); } catch { /* diagnostics only */ }
+        }
+        throw new HttpError(400, e.message);
+      }
       throw e;
     }
     if (store.openCount(order.params.account) >= config.maxOpenOrdersPerAccount) throw new HttpError(429, 'Too many open orders for this account');

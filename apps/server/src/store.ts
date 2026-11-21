@@ -46,6 +46,9 @@ export class OrderStore {
       CREATE INDEX IF NOT EXISTS orders_status ON orders(status, created_at);
       CREATE INDEX IF NOT EXISTS orders_account ON orders(account, created_at);
     `);
+    // Databases made before a column existed: add it.
+    const cols = new Set((this.db.prepare('PRAGMA table_info(orders)').all() as { name: string }[]).map((c) => c.name));
+    if (!cols.has('failures')) this.db.exec('ALTER TABLE orders ADD COLUMN failures INTEGER NOT NULL DEFAULT 0');
   }
 
   insert(o: Omit<StoredOrder, 'status' | 'fillTx' | 'received' | 'lastError' | 'retryAt' | 'failures'>): boolean {

@@ -118,6 +118,7 @@ export function OrderForm(props: {
       setAmount(''); setTotal('');
     } catch (e) {
       setError((e as Error).message);
+      props.onDone(`${kind === 'limit' ? 'Limit order' : 'Order'} not placed: ${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
