@@ -1,7 +1,7 @@
 import { mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  type BookOrder, type Depth, type DepthLevel, type Market, Decimal, Gateway, GatewayError, OrderRejected, isAccount, isResource,
+  type BookOrder, type Depth, type DepthLevel, type Market, Decimal, Gateway, GatewayError, OrderRejected, decodeSignedPartialTransaction, isAccount, isResource,
   orderKeyCancelled, orderKeyFromSecret, validateLimitOrder,
 } from '@radix-dex/core';
 import { BookWatcher } from './book.ts';
@@ -176,9 +176,15 @@ export async function createApp(config: Config) {
     return problems.length ? new JsonReply(503, body) : body;
   });
 
+  // Added 22 Nov 2026: each token's divisibility once read from the ledger (absent until then), and
+  // the market's pool components, so the site can round amounts and check a quoted route.
+  const withDivisibility = (t: Market['base']) => {
+    const divisibility = data.divisibility(t.address);
+    return divisibility === undefined ? t : { ...t, divisibility };
+  };
   api.on('GET', '/api/markets', () => data.markets.map((m) => ({
-    id: m.id, base: m.base, quote: m.quote, tvlUsd: m.tvlUsd, volume24hUsd: m.volume24hUsd,
-    venues: [...new Set(m.pools.map((p) => p.venue))],
+    id: m.id, base: withDivisibility(m.base), quote: withDivisibility(m.quote), tvlUsd: m.tvlUsd, volume24hUsd: m.volume24hUsd,
+    venues: [...new Set(m.pools.map((p) => p.venue))], pools: m.pools.map((p) => p.address),
   })));
 
   api.on('GET', '/api/depth', async ({ url }): Promise<Depth> => {
@@ -264,11 +270,30 @@ export async function createApp(config: Config) {
     if (!isAccount(account)) throw new HttpError(400, 'Bad account address');
     readBookSoon();
     const now = Math.floor(Date.now() / 1000);
+    const signed = store.byAccount(account);
+    const registry = await Promise.all(signed.map((o) => (o.status === 'open' ? checksRegistry(o) : undefined)));
     return [
       ...(book?.byMaker(account) ?? []).map((o) => bookOrderView(o, now, book?.placedAt.get(o.id))),
-      ...store.byAccount(account).map((o) => ({ ...publicOrder(o), outlook: o.status === 'open' ? solver?.outlook.get(o.id) ?? null : null })),
+      ...signed.map((o, i) => ({ ...publicOrder(o), outlook: o.status === 'open' ? solver?.outlook.get(o.id) ?? null : null, ...(registry[i] === undefined ? {} : { registry: registry[i] }) })),
     ];
   });
+
+  // Does this signed order check the registry the server names now (`assert_live`)? Only then can a
+  // cancel recorded there stop it. Read from the signed bytes once per order; open orders only.
+  const registryOf = new Map<string, boolean>();
+  async function checksRegistry(o: StoredOrder): Promise<boolean> {
+    if (!config.registry) return false;
+    let v = registryOf.get(o.id);
+    if (v === undefined) {
+      try {
+        const m = (await decodeSignedPartialTransaction(o.signedPartialTransactionHex, config.network.networkId)).manifest;
+        v = m.includes('"assert_live"') && m.includes(config.registry);
+      } catch { v = false; }
+      if (registryOf.size > 5_000) registryOf.clear();
+      registryOf.set(o.id, v);
+    }
+    return v;
+  }
 
   api.on('POST', '/api/orders', async ({ body }) => {
     if (!config.solverBadge) throw new HttpError(503, 'Limit orders are not enabled on this server');

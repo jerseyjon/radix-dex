@@ -249,9 +249,38 @@ test('an order whose key is already cancelled in the registry is refused at subm
       const p = { account, sell: net.xrd, sellAmount: '100', buy: TUSD, minBuyAmount: '9' };
       const signed = await signSubintent(limitOrderManifest({ ...p, solverBadge: BADGE, registry: { component: registry, orderKeyHex } }), { networkId: net.networkId, startEpoch: 1, endEpoch: 100, expiresAt: Math.floor(Date.now() / 1000) + 3600 }, key);
       const res = await fetch(`http://127.0.0.1:${(s2.address() as any).port}/api/orders`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...p, orderKeyHex, signedPartialTransactionHex: signed.signedPartialTransactionHex }) });
-      return res.status;
+      return { status: res.status, account };
     };
-    assert.equal(await post(true), 400);
-    assert.equal(await post(false), 200);
+    assert.equal((await post(true)).status, 400);
+    const ok = await post(false);
+    assert.equal(ok.status, 200);
+    // The order view says the order checks this registry, so the site can offer the on-ledger cancel.
+    const listed = await (await fetch(`http://127.0.0.1:${(s2.address() as any).port}/api/orders?account=${ok.account}`)).json() as any[];
+    assert.equal(listed[0].registry, true);
   } finally { s2.close(); app2.store.close(); }
+});
+
+test('open orders say whether they check a registry; a server without one says no', async () => {
+  const o = await order();
+  const placed = await call('POST', '/api/orders', o.body);
+  assert.equal(placed.status, 200);
+  const listed = await call('GET', `/api/orders?account=${o.account}`);
+  assert.equal(listed.json[0].registry, false);
+  app.store.markCancelled(placed.json.id);
+  const after = await call('GET', `/api/orders?account=${o.account}`);
+  assert.equal(after.json[0].registry, undefined, 'only open orders carry the flag');
+});
+
+test('markets list each token\'s divisibility once read, and the market\'s pools', async () => {
+  const saved = app.data.markets;
+  const pool = { venue: 'ociswap' as const, address: 'component_tdx_2_1cpool', kind: 'basic', tokens: [net.xrd, TUSD] as [string, string], feeRate: 0.003, tvlUsd: 1, volume24hUsd: 0, reserves: [1, 1] as [number, number] };
+  app.data.markets = [{ ...saved[0]!, pools: [pool] }];
+  try {
+    await app.data.loadDivisibilities();
+    const r = await call('GET', '/api/markets');
+    assert.equal(r.status, 200);
+    assert.equal(r.json[0].base.divisibility, 18);
+    assert.equal(r.json[0].quote.divisibility, 6);
+    assert.deepEqual(r.json[0].pools, ['component_tdx_2_1cpool']);
+  } finally { app.data.markets = saved; }
 });

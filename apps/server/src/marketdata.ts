@@ -76,6 +76,7 @@ export class MarketData {
         }
       }
       this.refreshedAt = Date.now();
+      void this.loadDivisibilities();
       return;
     }
     const min = { minTvlUsd: this.config.minPoolTvlUsd };
@@ -97,10 +98,30 @@ export class MarketData {
     this.tokens = tokens;
     this.markets = buildMarkets(pools, tokens, this.config.quotePriority);
     this.refreshedAt = Date.now();
+    void this.loadDivisibilities();
   }
 
   market(id: string): Market | undefined {
     return this.markets.find((m) => m.id === id);
+  }
+
+  private readonly divisibilities = new Map<string, number>();
+
+  /**
+   * Read the divisibility of every listed token not yet known (the quoter caches it for good), a few
+   * at a time. A failure is left for the next refresh. `/api/markets` publishes what is known, so the
+   * order form can round amounts the way order intake checks them.
+   */
+  async loadDivisibilities(): Promise<void> {
+    const todo = [...new Set(this.markets.flatMap((m) => [m.base.address, m.quote.address]))].filter((r) => !this.divisibilities.has(r));
+    for (let i = 0; i < todo.length; i += 5) {
+      await Promise.all(todo.slice(i, i + 5).map((r) => this.quoter.divisibility(r).then((d) => { this.divisibilities.set(r, d); }, () => undefined)));
+    }
+  }
+
+  /** A listed token's divisibility, if it has been read. */
+  divisibility(resource: string): number | undefined {
+    return this.divisibilities.get(resource);
   }
 
   /** A token's symbol for log lines, or the start of its address. */
