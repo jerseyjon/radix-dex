@@ -3,10 +3,14 @@ import { type Depth, type Pool, type Token, marketKey } from '@radix-dex/core/br
 export interface MarketSummary { id: string; base: Token; quote: Token; tvlUsd: number; volume24hUsd: number; venues: string[] }
 export interface Candle { time: number; open: number; high: number; low: number; close: number; volume: number }
 export interface ServerConfig {
-  network: 'mainnet' | 'stokenet'; networkId: number; xrd: string; feeBps: number; warning: string | null;
+  network: 'mainnet' | 'stokenet'; networkId: number; xrd: string;
+  /** Taker fee, and the fee a resting order pays when another order takes it (often zero). */
+  feeBps: number; makerFeeBps?: number; warning: string | null;
   /** dApp definition account; null means the wallet cannot connect and the site is read-only. */
   dAppDefinition?: string | null;
   limitOrders: { enabled: false } | { enabled: true; solverBadge: string; registry: string | null; maxLifetimeSec: number; filling: boolean; gasXrd: string; marketOrderLifetimeSec: number };
+  /** The on-ledger order book, for resting orders that fill in part. The fee is read from the ledger. */
+  orderBook?: { component: string; receipts: string; makerFeeBps: number } | null;
   /** Set by the static preview build: data is a snapshot taken at this time and nothing can be traded. */
   snapshotAt?: number;
 }
@@ -14,7 +18,9 @@ export interface QuoteResult { sell: string; buy: string; sellAmount: string; bu
 export interface OrderView {
   id: string; account: string; sell: string; sellAmount: string; buy: string; minBuyAmount: string;
   /** Gross amount at which the order fills (price times size); the signed minimum is this less the fee allowance. */
-  limitBuyAmount?: string; kind?: 'limit' | 'market';
+  limitBuyAmount?: string; kind?: 'limit' | 'market' | 'book';
+  /** Orders in the on-ledger book: their number there, how much has sold and how much is still for sale. */
+  bookId?: number; sold?: string; remaining?: string;
   expiresAt: number; createdAt: number; status: 'open' | 'filled' | 'cancelled' | 'expired'; fillTx: string | null; received: string | null;
   /** Open orders: what the market would pay for the whole order now, before fees, against what it needs to fill. */
   outlook?: { available: string; needed: string; at: number } | null;

@@ -22,7 +22,7 @@ if (!data.markets.length) throw new Error('No markets: refusing to write an empt
 const xrdFirst = [...data.markets].sort((a, b) => Number(b.base.address === config.network.xrd) - Number(a.base.address === config.network.xrd));
 const markets = xrdFirst.slice(0, count);
 write('config.json', {
-  network: config.network.name, networkId: config.network.networkId, xrd: config.network.xrd, feeBps: config.feeBps,
+  network: config.network.name, networkId: config.network.networkId, xrd: config.network.xrd, feeBps: config.feeBps, makerFeeBps: config.makerFeeBps,
   warning: null, limitOrders: { enabled: false }, snapshotAt: Math.floor(Date.now() / 1000),
 });
 write('markets.json', markets.map((m) => ({

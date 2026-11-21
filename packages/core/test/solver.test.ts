@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Decimal, findCrosses, grossNeeded, payout, pickMakers, planCross, planPoolFill, takeFillManifest, type OpenOrder } from '../src/index.ts';
+import { Decimal, findCrosses, grossNeeded, payout, pickLiquidity, pickMakers, planCross, planPoolFill, takeFillManifest, type BookOrder, type OpenOrder } from '../src/index.ts';
 
 const X = 'resource_x', Y = 'resource_y';
 const div18 = () => 18;
@@ -88,4 +88,40 @@ test('the combined fill pays makers first, swaps the rest, and gives the taker e
   assert.ok(at('Decimal("4.77")') < at('NamedIntent("maker_0") Bucket("pay_0")'));
   assert.ok(at('Decimal("1.05")') < at('NamedIntent("taker") Bucket("out")'));
   assert.ok(lines.at(-1)!.includes('deposit_batch'));
+});
+
+test('a taker takes book orders in part and signed orders whole, cheapest first', () => {
+  const now = 1_000_000;
+  const bk = (id: number, remaining: string, price: string, over: Partial<BookOrder> = {}): BookOrder => ({
+    id, maker: 'account_m', sell: X, buy: Y, price, sellAmount: remaining, remaining, returned: '0', unclaimed: '0', makerFeeBps: 0, expiresAt: 0, open: true, ...over,
+  });
+  const signed: OpenOrder = { id: 's', sell: X, sellAmount: '50', buy: Y, minBuyAmount: '4.6', limitBuyAmount: '4.7' }; // 0.094 each
+  // The taker spends 10 Y. Cheapest is book order 1 (20 X at 0.09 = 1.8 Y), then the signed order
+  // whole (4.7 Y), then as much of book order 2 (0.1 each) as the last 3.5 Y buys: 35 X.
+  const items = pickLiquidity(o('t', Y, '10', X, '1'), [signed], [bk(2, '1000', '0.1'), bk(1, '20', '0.09')], 0, div18, now);
+  assert.deepEqual(items.map((i) => [i.kind, i.cost, i.gives]), [['book', '1.8', '20'], ['order', '4.7', '50'], ['book', '3.5', '35']]);
+  assert.equal(items[1]!.kind === 'order' && items[1]!.pay, '4.7'); // maker fee 0: the full price
+
+  // Closed, expired, emptied or wrong-way orders are never taken; one about to expire is left alone too.
+  const none = pickLiquidity(o('t', Y, '10', X, '1'), [], [
+    bk(3, '100', '0.05', { open: false }), bk(4, '100', '0.05', { expiresAt: now - 1 }), bk(5, '100', '0.05', { expiresAt: now + 10 }),
+    bk(6, '0', '0.05'), bk(7, '100', '0.05', { sell: Y, buy: X }),
+  ], 0, div18, now);
+  assert.deepEqual(none, []);
+
+  // Rounding follows the contract: tokens bought round down, the cost up, so the fill is never underpaid.
+  const dust = pickLiquidity(o('t', Y, '1', X, '1'), [], [bk(8, '1000', '0.3')], 0, (r) => (r === X ? 0 : 2), now);
+  assert.deepEqual(dust.map((i) => [i.cost, i.gives]), [['0.9', '3']]);
+});
+
+test('the combined fill buys from the book before the pool leg and checks what was delivered', () => {
+  const R = (n: string) => 'resource_tdx_2_1t' + n.repeat(53), C = 'component_tdx_2_1c' + 'q'.repeat(53);
+  const text = takeFillManifest({
+    solver: { account: 'account_tdx_2_1' + 'a'.repeat(54), badge: R('b') }, feeLockXrd: '10', sell: R('y'), buy: R('x'), makerPays: [], poolIn: '0', route: [], solverTake: '1',
+    bookFills: [{ book: C, id: 7, pay: '1.8' }], assertBought: '20',
+  });
+  const lines = text.split('\n');
+  const at = (needle: string) => lines.findIndex((l) => l.includes(needle));
+  assert.ok(at('"fill" 7u64 Bucket("book_0")') > at('Decimal("1.8")'));
+  assert.ok(at('ASSERT_WORKTOP_CONTAINS') > at('"fill" 7u64') && at('ASSERT_WORKTOP_CONTAINS') < at('NamedIntent("taker") Bucket("out")'));
 });

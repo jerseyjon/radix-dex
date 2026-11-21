@@ -43,7 +43,7 @@ export interface ValidatedOrder extends DecodedOrder {
 
 const amount = (v: unknown, name: string): string => {
   if (typeof v !== 'string' || !/^\d{1,30}(\.\d{1,18})?$/.test(v)) throw new OrderRejected(`${name} is not a plain decimal amount`);
-  if (!new Decimal(v).isPositive()) throw new OrderRejected(`${name} must be positive`);
+  if (!new Decimal(v).gt(0)) throw new OrderRejected(`${name} must be positive`);
   return v;
 };
 

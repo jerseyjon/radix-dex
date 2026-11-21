@@ -133,7 +133,7 @@ export function App() {
           </header>
           <Chart candles={candles} loading={candlesLoading} />
         </section>
-        <Orders orders={orders} trades={trades} explorer={config?.networkId === 1 ? 'https://dashboard.radixdlt.com' : 'https://stokenet-dashboard.radixdlt.com'} markets={markets} account={account} onChanged={refreshAccount} />
+        <Orders orders={orders} trades={trades} explorer={config?.networkId === 1 ? 'https://dashboard.radixdlt.com' : 'https://stokenet-dashboard.radixdlt.com'} markets={markets} account={account} onChanged={refreshAccount} wallet={wallet} orderBook={config.orderBook} />
       </main>
 
       <div className="side">

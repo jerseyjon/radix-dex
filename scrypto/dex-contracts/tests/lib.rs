@@ -355,3 +355,271 @@ fn first_depositor_cannot_dilute_the_second() {
     assert!(xrd_before - world.balance(XRD) < dec!("0.000001"), "lost {} XRD", xrd_before - world.balance(XRD));
     assert!(usd_before - world.balance(usd) < dec!("0.000001"), "lost {} USD", usd_before - world.balance(usd));
 }
+
+// ---------------------------------------------------------------- Order book
+
+/// A world with an order book, a seller-side token A, a payment token B, and a second account
+/// (`maker`) that orders pay out to, so what the maker earns is easy to read.
+struct Book {
+    world: World,
+    book: ComponentAddress,
+    receipts: ResourceAddress,
+    badge: ResourceAddress,
+    a: ResourceAddress,
+    b: ResourceAddress,
+    maker: ComponentAddress,
+    maker_key: Secp256k1PublicKey,
+}
+
+impl Book {
+    fn new(maker_fee_bps: u16, divisibility_a: u8, divisibility_b: u8) -> Self {
+        let mut world = World::new();
+        let badge = world.token(dec!(1), 0);
+        let a = world.token(dec!(1000000), divisibility_a);
+        let b = world.token(dec!(1000000), divisibility_b);
+        let (maker_key, _, maker) = world.ledger.new_allocated_account();
+        let manifest = ManifestBuilder::new()
+            .lock_fee_from_faucet()
+            .call_function(world.package, "OrderBook", "instantiate", manifest_args!(maker_fee_bps, badge))
+            .build();
+        let receipt = world.run(manifest);
+        let commit = receipt.expect_commit_success();
+        let (book, receipts) = (commit.new_component_addresses()[0], commit.new_resource_addresses()[0]);
+        Self { world, book, receipts, badge, a, b, maker, maker_key }
+    }
+
+    fn place(&mut self, sell: ResourceAddress, amount: Decimal, buy: ResourceAddress, price: Decimal, expires_at: i64) -> TransactionReceipt {
+        let (account, maker, book) = (self.world.account, self.maker, self.book);
+        let manifest = ManifestBuilder::new()
+            .lock_fee_from_faucet()
+            .withdraw_from_account(account, sell, amount)
+            .take_all_from_worktop(sell, "sell")
+            .call_method_with_name_lookup(book, "place", |lookup| (lookup.bucket("sell"), buy, price, maker, expires_at))
+            .deposit_entire_worktop(account)
+            .build();
+        self.world.run(manifest)
+    }
+
+    fn fill(&mut self, id: u64, pay: ResourceAddress, amount: Decimal) -> TransactionReceipt {
+        let (account, book) = (self.world.account, self.book);
+        let manifest = ManifestBuilder::new()
+            .lock_fee_from_faucet()
+            .withdraw_from_account(account, pay, amount)
+            .take_all_from_worktop(pay, "pay")
+            .call_method_with_name_lookup(book, "fill", |lookup| (id, lookup.bucket("pay")))
+            .deposit_entire_worktop(account)
+            .build();
+        self.world.run(manifest)
+    }
+
+    fn cancel(&mut self, id: u64) -> TransactionReceipt {
+        let (account, book, receipts) = (self.world.account, self.book, self.receipts);
+        let manifest = ManifestBuilder::new()
+            .lock_fee_from_faucet()
+            .withdraw_non_fungibles_from_account(account, receipts, [NonFungibleLocalId::integer(id)])
+            .take_all_from_worktop(receipts, "receipt")
+            .call_method_with_name_lookup(book, "cancel", |lookup| (lookup.bucket("receipt"),))
+            .deposit_entire_worktop(account)
+            .build();
+        self.world.run(manifest)
+    }
+
+    fn maker_balance(&mut self, resource: ResourceAddress) -> Decimal {
+        self.world.ledger.get_component_balance(self.maker, resource)
+    }
+}
+
+#[test]
+fn order_book_fills_in_parts_at_the_makers_price_and_returns_change() {
+    let mut t = Book::new(0, 18, 18);
+    let (a, b) = (t.a, t.b);
+    t.place(a, dec!(100), b, dec!(2), 0).expect_commit_success();
+    assert_eq!(t.world.balance(a), dec!(999900));
+    assert_eq!(t.world.balance(t.receipts), dec!(1));
+
+    // 50 B buys 25 A; the maker is paid at once.
+    t.fill(1, b, dec!(50)).expect_commit_success();
+    assert_eq!(t.world.balance(a), dec!(999925));
+    assert_eq!(t.maker_balance(b), dec!(50));
+
+    // Offering far too much buys only what is left (75 A for 150 B); the rest comes back.
+    t.fill(1, b, dec!(1000)).expect_commit_success();
+    assert_eq!(t.world.balance(a), dec!(1000000));
+    assert_eq!(t.maker_balance(b), dec!(200));
+    assert_eq!(t.world.balance(b), dec!(999800));
+
+    t.fill(1, b, dec!(1)).expect_commit_failure_containing_error("Order is closed");
+    t.fill(1, a, dec!(1)).expect_commit_failure();
+    t.fill(99, b, dec!(1)).expect_commit_failure_containing_error("Unknown order");
+}
+
+#[test]
+fn order_book_rounds_against_the_buyer_on_low_divisibility_tokens() {
+    // A is a whole-unit token, B has two decimals, price 0.33 B per A.
+    let mut t = Book::new(0, 0, 2);
+    let (a, b) = (t.a, t.b);
+    t.place(a, dec!(1000), b, dec!("0.33"), 0).expect_commit_success();
+
+    // 0.32 B does not cover one A.
+    t.fill(1, b, dec!("0.32")).expect_commit_failure_containing_error("Payment too small");
+    // 1 B covers 3 A (0.99 B); the buyer cannot get a fourth.
+    t.fill(1, b, dec!(1)).expect_commit_success();
+    assert_eq!(t.world.balance(a), dec!(999003));
+    assert_eq!(t.maker_balance(b), dec!("0.99"));
+
+    // Many small fills never give the buyer more than they paid for.
+    for _ in 0..20 {
+        t.fill(1, b, dec!("0.65")).expect_commit_success(); // 1 A for 0.33 B each time
+    }
+    let sold = t.world.balance(a) - dec!(999000);
+    assert_eq!(sold, dec!(23));
+    assert!(t.maker_balance(b) >= sold * dec!("0.33"));
+}
+
+#[test]
+fn order_book_awkward_prices_never_underpay_the_maker() {
+    let mut t = Book::new(0, 18, 18);
+    let (a, b) = (t.a, t.b);
+    let price = dec!("0.091991000000000007");
+    t.place(a, dec!(1000), b, price, 0).expect_commit_success();
+    let mut sold = Decimal::ZERO;
+    for pay in [dec!("0.000000000000000001"), dec!("1.234567890123456789"), dec!("7"), dec!("0.3333333333333333")] {
+        let before = t.world.balance(a);
+        let receipt = t.fill(1, b, pay);
+        if receipt.is_commit_success() {
+            sold += t.world.balance(a) - before;
+        }
+        // What the maker holds always covers everything sold so far at the full price.
+        assert!(t.maker_balance(b) >= sold * price);
+    }
+    assert!(sold > Decimal::ZERO);
+}
+
+#[test]
+fn order_book_cancel_returns_only_that_orders_unsold_tokens() {
+    let mut t = Book::new(0, 18, 18);
+    let (a, b) = (t.a, t.b);
+    t.place(a, dec!(100), b, dec!(2), 0).expect_commit_success();
+    t.place(a, dec!(300), b, dec!(3), 0).expect_commit_success();
+    t.fill(1, b, dec!(80)).expect_commit_success(); // 40 A sold from order 1
+    let before = t.world.balance(a);
+
+    t.cancel(1).expect_commit_success();
+    assert_eq!(t.world.balance(a) - before, dec!(60));
+    assert_eq!(t.world.balance(t.receipts), dec!(1));
+    // The receipt is gone, so it cannot be cancelled twice, and the order cannot be filled.
+    t.cancel(1).expect_commit_failure();
+    t.fill(1, b, dec!(2)).expect_commit_failure_containing_error("Order is closed");
+
+    // Order 2 still has every one of its 300 A.
+    t.fill(2, b, dec!(900)).expect_commit_success();
+    assert_eq!(t.world.balance(a), dec!(1000000));
+    t.cancel(2).expect_commit_success(); // nothing left to return, but closing is allowed
+}
+
+#[test]
+fn order_book_refuses_bad_orders() {
+    let mut t = Book::new(0, 18, 18);
+    let (a, b) = (t.a, t.b);
+    t.place(a, dec!(100), a, dec!(2), 0).expect_commit_failure_containing_error("The two tokens must differ");
+    t.place(a, dec!(100), b, dec!(0), 0).expect_commit_failure_containing_error("Price must be positive");
+    t.place(a, dec!(100), b, dec!(-1), 0).expect_commit_failure_containing_error("Price must be positive");
+    t.place(a, dec!(100), t.receipts, dec!(1), 0).expect_commit_failure();
+    t.place(a, dec!(100), b, dec!(1), -5).expect_commit_failure_containing_error("Bad expiry");
+
+    // A token that is not a receipt cannot cancel anything.
+    let account = t.world.account;
+    let fake = t.world.ledger.create_non_fungible_resource(account);
+    let manifest = ManifestBuilder::new()
+        .lock_fee_from_faucet()
+        .withdraw_from_account(account, fake, dec!(1))
+        .take_all_from_worktop(fake, "receipt")
+        .call_method_with_name_lookup(t.book, "cancel", |lookup| (lookup.bucket("receipt"),))
+        .deposit_entire_worktop(account)
+        .build();
+    t.world.run(manifest).expect_commit_failure_containing_error("Not an order receipt");
+}
+
+#[test]
+fn order_book_takes_the_maker_fee_and_only_the_owner_collects_it() {
+    let mut t = Book::new(10, 18, 18);
+    let (a, b, badge, book, account) = (t.a, t.b, t.badge, t.book, t.world.account);
+    t.place(a, dec!(1000), b, dec!(1), 0).expect_commit_success();
+    t.fill(1, b, dec!(1000)).expect_commit_success();
+    assert_eq!(t.maker_balance(b), dec!(999)); // 0.10% of 1,000
+
+    let collect = |with_badge: bool| {
+        let mut m = ManifestBuilder::new().lock_fee_from_faucet();
+        if with_badge {
+            m = m.create_proof_from_account_of_amount(account, badge, dec!(1));
+        }
+        m.call_method(book, "collect_fees", manifest_args!(b)).deposit_entire_worktop(account).build()
+    };
+    t.world.run(collect(false)).expect_commit_failure();
+    let before = t.world.balance(b);
+    t.world.run(collect(true)).expect_commit_success();
+    assert_eq!(t.world.balance(b) - before, dec!(1));
+
+    // The fee can be changed for future orders, within the cap, by the owner only.
+    let set = |bps: u16, with_badge: bool| {
+        let mut m = ManifestBuilder::new().lock_fee_from_faucet();
+        if with_badge {
+            m = m.create_proof_from_account_of_amount(account, badge, dec!(1));
+        }
+        m.call_method(book, "set_maker_fee_bps", manifest_args!(bps)).build()
+    };
+    t.world.run(set(0, false)).expect_commit_failure();
+    t.world.run(set(101, true)).expect_commit_failure_containing_error("Fee too high");
+    t.world.run(set(0, true)).expect_commit_success();
+    t.place(a, dec!(1000), b, dec!(1), 0).expect_commit_success();
+    t.fill(2, b, dec!(1000)).expect_commit_success();
+    assert_eq!(t.maker_balance(b), dec!(1999)); // the new order pays no fee
+}
+
+#[test]
+fn order_book_expired_orders_cannot_be_filled_but_can_be_cancelled() {
+    let mut t = Book::new(0, 18, 18);
+    let (a, b) = (t.a, t.b);
+    t.place(a, dec!(100), b, dec!(2), 1000).expect_commit_success();
+    t.world.ledger.advance_to_round_at_timestamp(Round::of(2), 999_000);
+    t.fill(1, b, dec!(20)).expect_commit_success();
+    t.world.ledger.advance_to_round_at_timestamp(Round::of(3), 1_000_000);
+    t.fill(1, b, dec!(20)).expect_commit_failure_containing_error("Order has expired");
+    let before = t.world.balance(a);
+    t.cancel(1).expect_commit_success();
+    assert_eq!(t.world.balance(a) - before, dec!(90));
+}
+
+#[test]
+fn order_book_keeps_payment_for_a_maker_whose_account_refuses_deposits() {
+    let mut t = Book::new(0, 18, 18);
+    let (a, b, maker, book, receipts, account) = (t.a, t.b, t.maker, t.book, t.receipts, t.world.account);
+    t.place(a, dec!(100), b, dec!(2), 0).expect_commit_success();
+    let refuse = ManifestBuilder::new()
+        .lock_fee_from_faucet()
+        .call_method(maker, "set_default_deposit_rule", manifest_args!(DefaultDepositRule::Reject))
+        .build();
+    t.world.ledger.execute_manifest(refuse, vec![NonFungibleGlobalId::from_public_key(t.maker_key)]).expect_commit_success();
+
+    // The fill still works; the payment waits in the book.
+    t.fill(1, b, dec!(50)).expect_commit_success();
+    assert_eq!(t.maker_balance(b), dec!(0));
+    assert_eq!(t.world.balance(a), dec!(999925));
+
+    // Whoever holds the receipt can collect it, and cancelling returns the rest.
+    let before = t.world.balance(b);
+    let claim = ManifestBuilder::new()
+        .lock_fee_from_faucet()
+        .create_proof_from_account_of_non_fungibles(account, receipts, [NonFungibleLocalId::integer(1)])
+        .pop_from_auth_zone("proof")
+        .call_method_with_name_lookup(book, "claim", |lookup| (lookup.proof("proof"),))
+        .deposit_entire_worktop(account)
+        .build();
+    t.world.run(claim).expect_commit_success();
+    assert_eq!(t.world.balance(b) - before, dec!(50));
+    t.fill(1, b, dec!(10)).expect_commit_success();
+    let (a_before, b_before) = (t.world.balance(a), t.world.balance(b));
+    t.cancel(1).expect_commit_success();
+    assert_eq!(t.world.balance(a) - a_before, dec!(70));
+    assert_eq!(t.world.balance(b) - b_before, dec!(10));
+}

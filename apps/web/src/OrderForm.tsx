@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { type Depth, limitOrderManifest, marketOrderManifest, newCancelSecret, orderKeyFromSecret } from '@radix-dex/core/browser';
+import { type Depth, bookPlaceManifest, limitOrderManifest, marketOrderManifest, newCancelSecret, orderKeyFromSecret } from '@radix-dex/core/browser';
 import { type MarketSummary, type QuoteResult, type ServerConfig, STATIC, api } from './api';
 import { estimate } from './book';
 import { cleanAmount, fmtAmount, fmtPrice, toPlain } from './format';
@@ -9,6 +9,7 @@ type Side = 'buy' | 'sell';
 type Kind = 'limit' | 'market';
 const EXPIRIES: [string, number][] = [['1 hour', 3600], ['24 hours', 86400], ['7 days', 7 * 86400], ['30 days', 30 * 86400 - 3600]];
 const SLIPPAGES = [0.5, 1, 2, 5];
+const pct = (bps: number) => `${(bps / 100).toFixed(2)}%`;
 
 /** Cancel secrets stay in this browser only; the server has just their hashes. */
 export const secrets = {
@@ -28,6 +29,8 @@ export function OrderForm(props: {
   const [total, setTotal] = useState('');   // quote units
   const [expiry, setExpiry] = useState(86400);
   const [slippage, setSlippage] = useState(1);
+  // Limit orders: in the on-ledger order book (fills in part) or signed and kept in the wallet (fills whole).
+  const [inBook, setInBook] = useState(true);
   const [quote, setQuote] = useState<QuoteResult | undefined>();
   const [quoteError, setQuoteError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
@@ -36,7 +39,9 @@ export function OrderForm(props: {
   const base = market.base, quoteTok = market.quote;
   const sellTok = side === 'buy' ? quoteTok : base, buyTok = side === 'buy' ? base : quoteTok;
   const sellBalance = Number(balances[sellTok.address] ?? 0);
-  const limitsOn = config.limitOrders.enabled;
+  const book = config.orderBook ?? undefined;
+  const useBook = kind === 'limit' && inBook && Boolean(book);
+  const limitsOn = config.limitOrders.enabled || Boolean(book);
 
   useEffect(() => { setAmount(''); setTotal(''); setPrice(''); setQuote(undefined); setError(undefined); }, [market.id]);
   useEffect(() => { if (props.pickedPrice) { setKind('limit'); setPrice(fmtPrice(props.pickedPrice).replace(/,/g, '')); } }, [props.pickedPrice]);
@@ -107,7 +112,8 @@ export function OrderForm(props: {
   else if (Number(sellAmount) > sellBalance) blocker = `Not enough ${sellTok.symbol}`;
   else if (kind === 'market' && !quote) blocker = quoteError ?? 'Getting a quote…';
   else if (kind === 'market' && marketNet !== undefined && !(marketNet > 0)) blocker = 'Too small to cover the network fee';
-  else if (kind === 'limit' && limitGross && !(Number(limitMinBuy) > 0)) blocker = 'Too small to cover the network fee';
+  else if (kind === 'limit' && !useBook && !config.limitOrders.enabled) blocker = 'Only order-book orders are enabled';
+  else if (kind === 'limit' && !useBook && limitGross && !(Number(limitMinBuy) > 0)) blocker = 'Too small to cover the network fee';
 
   async function submit() {
     if (blocker || !wallet || !account || !sellAmount) return;
@@ -148,6 +154,15 @@ export function OrderForm(props: {
           marketOrderManifest({ account, sell: sellTok.address, sellAmount, minBuyAmount: minBuy, route: quote!.route }),
           `${side === 'buy' ? 'Buy' : 'Sell'} ${base.symbol}`);
         props.onDone(`Market order submitted: ${txid}`);
+      } else if (useBook && book) {
+        // The contract's price is what the order is owed for each token it sells.
+        const p = Number(price);
+        const perSell = cleanAmount(side === 'sell' ? price : toPlain(1 / p));
+        if (!perSell) return;
+        await wallet.sendTransaction(
+          bookPlaceManifest({ account, book: book.component, sell: sellTok.address, sellAmount, buy: buyTok.address, price: perSell, expiresAt: Math.floor(Date.now() / 1000) + expiry }),
+          `Limit ${side} ${base.symbol} @ ${price}`);
+        props.onDone('Limit order placed in the order book');
       } else {
         if (!limitMinBuy || !limitGross) return;
         await sign(limitMinBuy, limitGross, 'limit', expiry, `Limit ${side} ${base.symbol} @ ${price}`);
@@ -193,15 +208,26 @@ export function OrderForm(props: {
           <div><dt>Average price</dt><dd>{fmtPrice(execPrice)} {execPrice ? quoteTok.symbol : ''}</dd></div>
           <div><dt>Price impact</dt><dd className={impact !== undefined && impact > 3 ? 'warn' : ''}>{impact === undefined ? '—' : `${Math.max(0, impact).toFixed(2)}%`}</dd></div>
           {marketFees
-            ? <div><dt>Fees, already taken off</dt><dd>{fmtAmount(marketFees.network + marketFees.service)} {buyTok.symbol} (network fee + {(config.feeBps / 100).toFixed(2)}%)</dd></div>
+            ? <div><dt>Fees, already taken off</dt><dd>{fmtAmount(marketFees.network + marketFees.service)} {buyTok.symbol} (network fee + {pct(config.feeBps)})</dd></div>
             : <div><dt>Route</dt><dd>{quote ? quote.route.map((p) => p.venue).join(' → ') : '—'}</dd></div>}
           <div><dt>Max slippage</dt><dd className="seg mini">{SLIPPAGES.map((s) => <button key={s} className={s === slippage ? 'on' : ''} onClick={() => setSlippage(s)}>{s}%</button>)}</dd></div>
         </dl>
+      ) : useBook && book ? (
+        <dl className="summary">
+          <div><dt>Fills</dt><dd className="seg mini"><button className="on">In parts</button>{config.limitOrders.enabled && <button onClick={() => setInBook(false)}>Whole only</button>}</dd></div>
+          <div><dt>Moves into the order book</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
+          <div><dt>You receive, as it fills</dt><dd>{limitGross ? `${fmtAmount(Number(limitGross) * (1 - book.makerFeeBps / 10_000))} ${buyTok.symbol}` : '—'}</dd></div>
+          <div><dt>Fee</dt><dd>{book.makerFeeBps > 0 ? pct(book.makerFeeBps) : 'None'}, plus the network fee to place it (about 0.8 XRD)</dd></div>
+          <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'The market already pays your price: it should fill soon' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
+          <div><dt>Expires in</dt><dd><select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
+        </dl>
       ) : (
         <dl className="summary">
+          {book && <div><dt>Fills</dt><dd className="seg mini"><button onClick={() => setInBook(true)}>In parts</button><button className="on">Whole only</button></dd></div>}
           <div><dt>You pay</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>At your price you get</dt><dd>{limitGross ? `${fmtAmount(limitGross)} ${buyTok.symbol}` : '—'}</dd></div>
-          <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(limitFees.network + limitFees.service)} ${buyTok.symbol} (network fee + ${(config.feeBps / 100).toFixed(2)}%)` : '—'}</dd></div>
+          <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(limitFees.network + limitFees.service)} ${buyTok.symbol} (network fee + ${pct(config.feeBps)})` : '—'}</dd></div>
+          <div><dt>If another trader takes it</dt><dd>{(config.makerFeeBps ?? 0) > 0 ? `Fee ${pct(config.makerFeeBps ?? 0)}, no network fee` : 'No fee: you get your full price'}</dd></div>
           <div><dt>You receive at least</dt><dd>{limitMinBuy && Number(limitMinBuy) > 0 ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
           <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
           <div><dt>Expires in</dt><dd><select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
@@ -215,7 +241,10 @@ export function OrderForm(props: {
       {kind === 'market' && viaSolver && (
         <p className="note">Your wallet will ask you to approve a pre-authorization. The order is then filled for you within a few seconds at the best price from the order book and the pools, and you pay no separate network fee.</p>
       )}
-      {kind === 'limit' && (
+      {useBook && (
+        <p className="note">Your tokens move into the order book contract, where the ledger enforces your price. Other traders can buy any part of the order, and each part is paid straight to your account at your price. You can cancel at any time and take back what has not sold. This contract has not been audited.</p>
+      )}
+      {kind === 'limit' && !useBook && (
         <p className="note">A limit order is a signed permission, not a transaction: placing it is free and your funds stay in your account until it fills. It fills in full or not at all, as soon as the market reaches your price. The fees come out of what you receive, and you never get less than the “at least” amount, which is what your wallet shows.</p>
       )}
     </section>

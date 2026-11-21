@@ -86,6 +86,30 @@ if (!state.poolFunded) {
   save();
 }
 
+// 3b. Order book (resting orders with partial fills). The first package cannot be changed, so
+// the current build is published as a second package and the order book made from that.
+if (!state.orderBookPackage) {
+  const wasm = new Uint8Array(readFileSync('data/contracts/dex_contracts.wasm'));
+  const rpd = new Uint8Array(readFileSync('data/contracts/dex_contracts.rpd'));
+  const definition = await RadixEngineToolkit.ManifestSbor.decodeToString(rpd, net.networkId, ManifestSborStringRepresentation.ManifestString);
+  const r = await run('publish order book package', [
+    lockFee(solver, 300),
+    'PUBLISH_PACKAGE_ADVANCED Enum<OwnerRole::None>() ' + definition + ' Blob("' + toHex(blake2b(wasm, { dkLen: 32 })) + '") Map<String, Tuple>() None;',
+  ].join('\n'), solverKey, [wasm]);
+  state.orderBookPackage = need(r.find('package_'), 'order book package address');
+  save();
+}
+if (!state.orderBook) {
+  // Maker fee 0: the solver badge is the owner and may change it for future orders, up to 1%.
+  const r = await run('instantiate order book', [
+    lockFee(solver),
+    'CALL_FUNCTION ' + addr(state.orderBookPackage!) + ' "OrderBook" "instantiate" 0u16 ' + addr(state.badge!) + ';',
+  ].join('\n'), solverKey);
+  state.orderBook = need(r.find('component_'), 'order book address');
+  state.orderReceipts = need(r.find('resource_'), 'order receipt address');
+  save();
+}
+
 // 4. Give the test token a name and symbol so the wallet shows something readable.
 if (!state.tusdNamed) {
   // TUSD was created with no owner, so its metadata cannot be set. Record that and move on.
@@ -130,7 +154,7 @@ writeFileSync('data/stokenet-markets.json', JSON.stringify(markets, null, 2));
 writeFileSync('data/stokenet-solver.key', state.solver!, { mode: 0o600 });
 
 console.log(JSON.stringify({
-  package: state.package, registry: state.registry, pool: state.pool, poolUnits: state.poolUnits,
+  package: state.package, registry: state.registry, orderBook: state.orderBook, orderReceipts: state.orderReceipts, pool: state.pool, poolUnits: state.poolUnits,
   solverAccount: solver, solverBadge: state.badge, tusd: state.tusd, dAppDefinition: dapp, origins,
   poolReserves: { xrd: reserve(net.xrd), tusd: reserve(state.tusd!) },
 }, null, 2));

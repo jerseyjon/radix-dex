@@ -15,7 +15,7 @@ const s = JSON.parse(readFileSync('data/stokenet-keys.json', 'utf8'));
 const gw = new Gateway(net);
 const app = await createApp(loadConfig({
   DEX_NETWORK: 'stokenet', DEX_DATA_DIR: ':memory:', DEX_SOLVER_BADGE: s.badge, DEX_SOLVER_KEY_FILE: 'data/stokenet-solver.key',
-  DEX_REGISTRY: s.registry, DEX_MARKETS_FILE: 'data/stokenet-markets.json', DEX_FEE_BPS: '10',
+  DEX_REGISTRY: s.registry, DEX_MARKETS_FILE: 'data/stokenet-markets.json', DEX_FEE_BPS: '10', DEX_MAKER_FEE_BPS: '10',
 }));
 await app.data.refresh();
 const server = app.api.listen(0, '127.0.0.1');
@@ -132,6 +132,18 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
   await softCancel(above);
 }
 
+// Keep the buyer's test account in funds: repeated runs spend its TUSD, and the seller's account collects it.
+if ((await balance(bob, s.tusd)) < 80) {
+  const give = Math.floor((await balance(alice, s.tusd)) / 2);
+  const { epoch } = await gw.status();
+  const tx = await buildTransaction({
+    manifest: ['CALL_METHOD ' + addr(alice) + ' "lock_fee" Decimal("10");', 'CALL_METHOD ' + addr(alice) + ' "withdraw" ' + addr(s.tusd) + ' Decimal("' + give + '");',
+      'CALL_METHOD ' + addr(bob) + ' "try_deposit_batch_or_abort" Expression("ENTIRE_WORKTOP") None;'].join('\n'),
+    window: { networkId: net.networkId, startEpoch: epoch, endEpoch: epoch + 20 }, notary: aliceKey,
+  });
+  console.log('topped up the buyer with ' + give + ' TUSD: ' + (await submitAndWait(gw, tx)).status);
+}
+
 // 4. A market order takes a resting limit order that beats the pool, and the pool for the rest, in one transaction.
 {
   // Fresh prices from the pool itself: what it pays for 50 XRD, and what it charges someone buying about that much.
@@ -157,7 +169,7 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
   const aliceGot = (await balance(alice, s.tusd)) - before.at, alicePaid = before.ax - (await balance(alice, net.xrd));
   expect(Math.abs(bobPaid - Number(spend)) < 1e-9 && Math.abs(alicePaid - 150) < 1e-9, 'Bob paid exactly ' + spend + ' TUSD and Alice exactly 150 XRD');
   expect(Math.abs(aliceGot - gross * 0.999) < 1e-6, 'Alice received her price less 0.10%: ' + aliceGot.toFixed(6) + ' TUSD');
-  const bobGross = bobGot + 1.35 + (bobGot + 1.35) / 0.999 * 0.001;
+  const bobGross = bobGot + 1.38 + (bobGot + 1.38) / 0.999 * 0.001;
   // Better even after the dearer network fee: 1.35 XRD against 1 XRD for the pool alone.
   expect(bobGot > (poolOnly - 1) * 0.999, 'Bob got ' + bobGot.toFixed(4) + ' XRD after fees (' + bobGross.toFixed(4) + ' before), better than the pool alone at ' + poolOnly.toFixed(4));
 }

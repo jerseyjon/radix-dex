@@ -9,7 +9,7 @@ import { loadConfig } from '../apps/server/src/config.ts';
 const net = NETWORKS.stokenet;
 const keys = JSON.parse(readFileSync('data/stokenet-keys.json', 'utf8'));
 writeFileSync('data/stokenet-solver.key', keys.solver, { mode: 0o600 });
-const app = await createApp(loadConfig({ DEX_NETWORK: 'stokenet', DEX_DATA_DIR: ':memory:', DEX_SOLVER_BADGE: keys.badge, DEX_SOLVER_KEY_FILE: 'data/stokenet-solver.key', DEX_FEE_BPS: '10' }));
+const app = await createApp(loadConfig({ DEX_NETWORK: 'stokenet', DEX_DATA_DIR: ':memory:', DEX_SOLVER_BADGE: keys.badge, DEX_SOLVER_KEY_FILE: 'data/stokenet-solver.key', DEX_FEE_BPS: '10', DEX_MAKER_FEE_BPS: '10' }));
 const server = app.api.listen(0, '127.0.0.1');
 await new Promise((r) => server.once('listening', r));
 const base = `http://127.0.0.1:${(server.address() as any).port}`;
@@ -46,10 +46,10 @@ const oa = orders.find((o) => o.id === a.id), of = orders.find((o) => o.id === f
 expect(oa?.status === 'filled' && /^txid_/.test(oa.fillTx), `Alice's order is filled (${oa?.status}, ${oa?.fillTx})`);
 expect(of?.status === 'open', 'the far-from-market order is still open');
 const after = { at: await balance(alice, keys.tusd), bx: await balance(bob, net.xrd) };
-// Bob's order arrived second, so it is the taker and carries the network fee (1.35 XRD with one maker).
-// Alice gets 4 * 0.999 = 3.996 TUSD; Bob gets 40 XRD less 0.10% and the network fee = 38.61.
+// Bob's order arrived second, so it is the taker and carries the network fee (1.08 XRD with one maker and no pool).
+// Alice gets 4 * 0.999 = 3.996 TUSD; Bob gets 40 XRD less 0.10% and the network fee = 38.88.
 expect(Math.abs(after.at - before.at - 3.996) < 1e-9, `Alice received 3.996 TUSD (got ${after.at - before.at})`);
-expect(Math.abs(after.bx - before.bx - 38.61) < 1e-9, `Bob received 38.61 XRD (got ${after.bx - before.bx})`);
+expect(Math.abs(after.bx - before.bx - 38.88) < 1e-9, `Bob received 38.88 XRD (got ${after.bx - before.bx})`);
 const cancel = await fetch(`${base}/api/orders/${far.id}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ secret: far.secret }) });
 expect(cancel.ok, 'far order soft-cancelled');
 void b;

@@ -1,10 +1,11 @@
 import { readFileSync, statSync } from 'node:fs';
 import {
   type DecodedOrder, type Ed25519Key, type Gateway, type SolverIdentity, Decimal,
-  type MakerFill, type Pool,
-  accountOf, buildTransaction, decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, payout,
-  pickMakers, planPoolFill, submitAndWait, takeFillManifest,
+  type BookOrder, type LiquidityItem, type Pool,
+  accountOf, bookArbManifest, buildTransaction, decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, payout,
+  pickLiquidity, planPoolFill, submitAndWait, takeFillManifest,
 } from '@radix-dex/core';
+import type { BookWatcher } from './book.ts';
 import type { Config } from './config.ts';
 import type { MarketData } from './marketdata.ts';
 import type { OrderStore, StoredOrder } from './store.ts';
@@ -17,16 +18,22 @@ export function loadSolverKey(path: string): Ed25519Key {
 }
 
 const FEE_LOCK_XRD = '10';
-/** Rough network cost of a fill, charged to the order in the bought token. */
+/** Network cost of a plain pool fill, which the site quotes before an order is signed. */
 export const GAS_XRD = '1';
 const MAX_FILL_FAILURES = 3;
 
-/** Extra network cost of each resting order settled in the same transaction, as a share of GAS_XRD. */
-const GAS_PER_MAKER = 0.35;
+/**
+ * Network cost of a fill in XRD, from Stokenet measurements: the taker's order alone, a pool leg,
+ * and each resting order taken (pool only 0.96; one order and a pool 1.34 to 1.40; one order alone 1.08).
+ */
+const fillGasXrd = (items: number, poolLeg: boolean): Decimal => new Decimal('0.7').plus(poolLeg ? '0.3' : 0).plus(new Decimal('0.38').mul(items));
+/** Shares of a book order the solver tries to buy with its own funds when a pool pays more than the order asks, largest first. */
+const ARB_SHARES = [1, 0.5, 0.25, 0.1];
 
 /** The best way found to fill one order now. */
 interface Execution {
-  makers: MakerFill[];
+  /** What is taken from other traders: signed orders whole, book orders in part. */
+  items: LiquidityItem[];
   /** Amount of the taker's sell token sent through pools, and the route it takes. */
   poolIn: string;
   route: Pool[];
@@ -49,11 +56,15 @@ export class Solver {
   private readonly badge: string;
   private identity: SolverIdentity | undefined;
   private readonly divisibilities = new Map<string, number>();
+  private readonly book: BookWatcher | undefined;
+  /** Book orders a purchase just failed on: left alone until this time (ms). */
+  private readonly bookRetryAt = new Map<number, number>();
   private running = false;
   /** Per open order: what the pools would pay it right now after the network fee, and what it needs. */
   readonly outlook = new Map<string, { available: string; needed: string; at: number }>();
 
-  constructor(o: { config: Config; gateway: Gateway; store: OrderStore; data: MarketData; key: Ed25519Key; badge: string }) {
+  constructor(o: { config: Config; gateway: Gateway; store: OrderStore; data: MarketData; key: Ed25519Key; badge: string; book?: BookWatcher }) {
+    this.book = o.book;
     this.config = o.config; this.gateway = o.gateway; this.store = o.store; this.data = o.data; this.key = o.key; this.badge = o.badge;
   }
 
@@ -114,41 +125,85 @@ export class Solver {
     console.warn(`[solver] ${orders.map((o) => o.id.slice(-8)).join('+')}: ${error.slice(0, 200)}`);
   }
 
-  /**
-   * Best execution for `taker`: with no resting orders (pools only), then with the best one, two…
-   * of them, keeping whichever produces the most.
-   */
-  private async bestExecution(taker: StoredOrder, resting: StoredOrder[]): Promise<Execution | undefined> {
+  private gasIn(resource: string, counter: string, perCounter: Decimal, gasXrd: Decimal): string {
     const xrd = this.config.network.xrd;
-    const candidates = pickMakers(taker, resting, this.config.feeBps, this.divisibility);
+    return resource === xrd ? gasXrd.toFixed() : counter === xrd ? perCounter.mul(gasXrd).toFixed(18) : '0';
+  }
+
+  /**
+   * Best execution for `taker`: with nothing taken from other traders (pools only), then with the
+   * cheapest one, two… of their orders, keeping whichever leaves the taker most after the network fee.
+   */
+  private async bestExecution(taker: StoredOrder, resting: StoredOrder[], book: BookOrder[], nowSec: number): Promise<Execution | undefined> {
+    const xrd = this.config.network.xrd;
+    const candidates = pickLiquidity(taker, resting, book, this.config.makerFeeBps, this.divisibility, nowSec);
     let best: Execution | undefined;
     for (let k = 0; k <= candidates.length; k++) {
-      let makers = candidates.slice(0, k);
-      const fromMakers = makers.reduce((sum, m) => sum.plus(m.order.sellAmount), new Decimal(0));
-      const left = makers.reduce((rest, m) => rest.minus(m.cost), new Decimal(taker.sellAmount));
-      let total = fromMakers, route: Pool[] = [], poolIn = '0';
-      if (left.isPositive()) {
+      let items = candidates.slice(0, k);
+      const fromOthers = items.reduce((sum, m) => sum.plus(m.gives), new Decimal(0));
+      const left = items.reduce((rest, m) => rest.minus(m.cost), new Decimal(taker.sellAmount));
+      let total = fromOthers, route: Pool[] = [], poolIn = '0';
+      if (left.gt(0)) {
         const quote = await this.data.quoter.best(this.data.pools, taker.sell, taker.buy, left.toFixed(), xrd).catch(() => undefined);
         if (quote) { total = total.plus(quote.buyAmount); route = quote.route; poolIn = left.toFixed(); }
-        else if (k === 0) continue;
         else {
-          // No pool for the remainder: the first maker gets it as a better price.
-          const first = makers[0]!, cost = new Decimal(first.cost).plus(left);
-          const pay = payout(cost, new Decimal(first.order.minBuyAmount), this.config.feeBps, this.divisibility(taker.sell))!;
-          makers = [{ order: first.order, cost: cost.toFixed(), pay: pay.toFixed() }, ...makers.slice(1)];
+          // No pool for the remainder. A signed order can be given it as a better price;
+          // a book order cannot, and the taker cannot be handed it back, so that plan is out.
+          const i = items.findIndex((m) => m.kind === 'order');
+          const first = items[i];
+          if (!first || first.kind !== 'order') { if (left.gt(new Decimal(taker.sellAmount).mul('1e-9'))) continue; }
+          else {
+            const cost = new Decimal(first.cost).plus(left);
+            const pay = payout(cost, new Decimal(first.order.minBuyAmount), this.config.makerFeeBps, this.divisibility(taker.sell))!;
+            items = items.map((m, j) => (j === i ? { ...first, cost: cost.toFixed(), pay: pay.toFixed() } : m));
+          }
         }
       }
-      // Each resting order adds to the network fee the taker pays, so compare what is left after it.
-      const gasXrd = new Decimal(GAS_XRD).mul(1 + GAS_PER_MAKER * makers.length);
-      const gasInBuyToken = taker.buy === xrd ? gasXrd.toFixed() : taker.sell === xrd ? total.div(taker.sellAmount).mul(gasXrd).toFixed(18) : '0';
-      if (!best || total.minus(gasInBuyToken).gt(best.total.minus(best.gasInBuyToken))) best = { makers, poolIn, route, total, gasInBuyToken };
+      // Each order taken adds to the network fee the taker pays, so compare what is left after it.
+      const gasXrd = fillGasXrd(items.length, route.length > 0);
+      const gasInBuyToken = this.gasIn(taker.buy, taker.sell, total.div(taker.sellAmount), gasXrd);
+      if (!best || total.minus(gasInBuyToken).gt(best.total.minus(best.gasInBuyToken))) best = { items, poolIn, route, total, gasInBuyToken };
     }
     return best;
   }
 
+  /**
+   * A book order is paid its price and nothing more, so when a pool pays more than it asks the
+   * solver buys from it with its own funds and sells through the pool, keeping the difference.
+   * That is what fills a resting order when the market reaches its price.
+   */
+  private async arbitrage(b: BookOrder, solver: { account: string; badge: string }): Promise<boolean> {
+    const xrd = this.config.network.xrd;
+    const sellDiv = this.divisibility(b.sell), buyDiv = this.divisibility(b.buy);
+    const attempt = async (share: number, mustCoverGas: boolean) => {
+      const q = new Decimal(b.remaining).mul(share).toDecimalPlaces(sellDiv, Decimal.ROUND_DOWN);
+      if (!q.gt(0)) return undefined;
+      const quote = await this.data.quoter.best(this.data.pools, b.sell, b.buy, q.toFixed(), xrd).catch(() => undefined);
+      if (!quote) return undefined;
+      const cost = q.mul(b.price).toDecimalPlaces(buyDiv, Decimal.ROUND_UP);
+      const gas = mustCoverGas ? new Decimal(this.gasIn(b.buy, b.sell, new Decimal(quote.buyAmount).div(q), new Decimal(GAS_XRD))) : new Decimal(0);
+      return new Decimal(quote.buyAmount).minus(cost).minus(gas).gt(0) ? { q, cost, route: quote.route } : undefined;
+    };
+    // One cheap look first: if even a small part does not sell for more than it costs, nothing will.
+    if (!(await attempt(ARB_SHARES[ARB_SHARES.length - 1]!, false))) return false;
+    const float = await this.balance(solver.account, b.buy);
+    for (const share of ARB_SHARES) {
+      const plan = await attempt(share, true);
+      if (!plan || plan.cost.gt(float)) continue;
+      const res = await this.submit(bookArbManifest({
+        solver, feeLockXrd: FEE_LOCK_XRD, book: this.book!.component, id: b.id, payResource: b.buy, pay: plan.cost.toFixed(),
+        boughtResource: b.sell, route: plan.route, minBack: plan.cost.toFixed(),
+      }), {});
+      if (!res.ok) { this.bookRetryAt.set(b.id, Date.now() + 60_000); console.warn(`[solver] book order ${b.id}: ${res.error.slice(0, 200)}`); return false; }
+      console.log(`[solver] bought ${plan.q.toFixed()} from book order ${b.id} and sold it through ${plan.route.map((p) => p.venue).join('>')} in ${res.txid}`);
+      return true;
+    }
+    return false;
+  }
+
   /** One pass over the open orders. Safe to call on a timer; overlapping calls are skipped. */
-  async tick(): Promise<{ crossed: number; poolFilled: number }> {
-    const result = { crossed: 0, poolFilled: 0 };
+  async tick(): Promise<{ crossed: number; poolFilled: number; bookBought: number }> {
+    const result = { crossed: 0, poolFilled: 0, bookBought: 0 };
     if (this.running) return result;
     this.running = true;
     try {
@@ -160,10 +215,12 @@ export class Solver {
       // Market orders first, then the newest: the order that arrives is the one that takes.
       const open = all.filter((o) => o.retryAt <= now).reverse()
         .sort((a, b) => Number(b.kind === 'market') - Number(a.kind === 'market'));
-      if (!open.length) return result;
+      await this.book?.refresh().catch((e) => console.warn('[solver] order book not read:', String((e as Error).message ?? e).slice(0, 200)));
+      const liveBook = () => (this.book?.live(now) ?? []).filter((b) => (this.bookRetryAt.get(b.id) ?? 0) <= Date.now());
+      if (!open.length && !liveBook().length) return result;
       await this.account();
       const solver = this.identity!;
-      await this.loadDivisibility(open.flatMap((o) => [o.sell, o.buy]));
+      await this.loadDivisibility([...open, ...liveBook()].flatMap((o) => [o.sell, o.buy]));
       const done = new Set<string>();
 
       for (const o of open) {
@@ -173,7 +230,7 @@ export class Solver {
         // at once without them: a resting order cancelled on the ledger must not strand a market order.
         let blame: StoredOrder[] = [o];
         try {
-          const exec = await this.bestExecution(o, open.filter((m) => m.kind !== 'market' && !done.has(m.id)));
+          const exec = await this.bestExecution(o, open.filter((m) => m.kind !== 'market' && !done.has(m.id)), liveBook(), now);
           if (!exec) { this.outlook.delete(o.id); continue; }
           const { gasInBuyToken } = exec;
           // With no pool leg the outcome is exact, so no margin is needed.
@@ -181,7 +238,9 @@ export class Solver {
           this.outlook.set(o.id, { available: exec.total.toFixed(), needed: grossNeeded(terms).toFixed(), at: now });
           const plan = planPoolFill({ ...terms, quotedOut: exec.total.toFixed(), feeBps: this.config.feeBps, divisibility: this.divisibility(o.buy) });
           if (!plan) continue;
-          const makers = exec.makers.map((m) => m.order as StoredOrder);
+          const makerItems = exec.items.filter((m) => m.kind === 'order');
+          const bookItems = exec.items.filter((m) => m.kind === 'book');
+          const makers = makerItems.map((m) => m.order as StoredOrder);
           involved = [o, ...makers];
           if (makers.length) blame = makers;
           let unfunded = false;
@@ -190,15 +249,29 @@ export class Solver {
           const children: Record<string, DecodedOrder> = { taker: await this.decode(o) };
           for (const [i, m] of makers.entries()) children[`maker_${i}`] = await this.decode(m);
           const res = await this.submit(
-            takeFillManifest({ solver, feeLockXrd: FEE_LOCK_XRD, sell: o.sell, buy: o.buy, makerPays: exec.makers.map((m) => m.pay), poolIn: exec.poolIn, route: exec.route, solverTake: plan.solverTake }),
+            takeFillManifest({
+              solver, feeLockXrd: FEE_LOCK_XRD, sell: o.sell, buy: o.buy, makerPays: makerItems.map((m) => m.pay), poolIn: exec.poolIn, route: exec.route, solverTake: plan.solverTake,
+              bookFills: bookItems.map((m) => ({ book: this.book!.component, id: m.order.id, pay: m.cost })),
+              assertBought: bookItems.length ? exec.items.reduce((sum, m) => sum.plus(m.gives), new Decimal(0)).toFixed() : undefined,
+            }),
             children);
+          // Whatever happened, the book is no longer as it was read.
+          if (bookItems.length) await this.book?.refresh().catch(() => undefined);
           if (!res.ok) { this.fail(blame, res.error); continue; }
           this.store.markFilled(o.id, res.txid, plan.userReceives);
-          exec.makers.forEach((m) => this.store.markFilled(m.order.id, res.txid, m.pay));
+          makerItems.forEach((m) => this.store.markFilled((m.order as StoredOrder).id, res.txid, m.pay));
           involved.forEach((x) => done.add(x.id));
-          if (makers.length) result.crossed += involved.length; else result.poolFilled += 1;
-          console.log(`[solver] filled ${o.kind} ${o.id.slice(-8)}${makers.length ? ' against ' + makers.map((m) => m.id.slice(-8)).join('+') : ''}${exec.route.length ? ' through ' + exec.route.map((p) => p.venue).join('>') : ''} in ${res.txid}`);
+          if (exec.items.length) result.crossed += involved.length; else result.poolFilled += 1;
+          const took = [...makers.map((m) => m.id.slice(-8)), ...bookItems.map((m) => `book order ${m.order.id}`)];
+          console.log(`[solver] filled ${o.kind} ${o.id.slice(-8)}${took.length ? ' against ' + took.join('+') : ''}${exec.route.length ? ' through ' + exec.route.map((p) => p.venue).join('>') : ''} in ${res.txid}`);
         } catch (e) { this.fail(blame, String((e as Error).message ?? e)); }
+      }
+
+      // Book orders the market has reached.
+      for (const b of liveBook()) {
+        try {
+          if (await this.arbitrage(b, solver)) { result.bookBought += 1; await this.book?.refresh().catch(() => undefined); }
+        } catch (e) { console.warn(`[solver] book order ${b.id}: ${String((e as Error).message ?? e).slice(0, 200)}`); }
       }
       return result;
     } finally {

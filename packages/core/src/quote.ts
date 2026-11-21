@@ -82,7 +82,7 @@ export class Quoter {
   /** Simulate selling `sellAmount` of `sell` along `route`. Returns undefined if no funder can cover it or the swap fails. */
   async simulate(route: Pool[], sell: string, sellAmount: string | Decimal): Promise<Quote | undefined> {
     const amount = new Decimal(sellAmount).toDecimalPlaces(await this.divisibility(sell), Decimal.ROUND_DOWN);
-    if (!amount.isPositive()) return undefined;
+    if (!amount.gt(0)) return undefined;
     const path = routePath(route, sell);
     const buy = path[path.length - 1]!;
     const epoch = await this.currentEpoch();
@@ -107,7 +107,7 @@ export class Quoter {
       const received = net(buy);
       // A pool short of liquidity can hand part of the input back, so measure what was really sold.
       const sold = net(sell).neg();
-      if (!received.isPositive() || !sold.isPositive()) return undefined;
+      if (!received.gt(0) || !sold.gt(0)) return undefined;
       return {
         sell, buy,
         sellAmount: sold.toFixed(),
@@ -150,7 +150,7 @@ export class Quoter {
     const base = market.base.address, quote = market.quote.address;
     const reserve = (token: string) => pool.reserves[pool.tokens[0] === token ? 0 : 1];
     const ladder = async (sell: string) => {
-      const sizes = fractions.map((f) => new Decimal(reserve(sell)).mul(f)).filter((s) => s.isPositive());
+      const sizes = fractions.map((f) => new Decimal(reserve(sell)).mul(f)).filter((s) => s.gt(0));
       const qs = await Promise.all(sizes.map((s) => this.simulate([pool], sell, s).catch(() => undefined)));
       const steps: { sold: Decimal; got: Decimal }[] = [];
       let prevSold = new Decimal(0), prevGot = new Decimal(0);

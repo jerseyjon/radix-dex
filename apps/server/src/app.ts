@@ -1,9 +1,10 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  type Depth, type DepthLevel, type Market, Decimal, Gateway, OrderRejected, isAccount, isResource,
+  type BookOrder, type Depth, type DepthLevel, type Market, Decimal, Gateway, OrderRejected, isAccount, isResource,
   orderKeyFromSecret, validateLimitOrder,
 } from '@radix-dex/core';
+import { BookWatcher } from './book.ts';
 import type { Config } from './config.ts';
 import { Api, HttpError } from './http.ts';
 import { MarketData } from './marketdata.ts';
@@ -37,12 +38,38 @@ export function orderLevels(market: Market, open: StoredOrder[]): { bids: DepthL
   return { bids, asks };
 }
 
+/** Orders in the on-ledger book as levels for one market: what is still for sale, at the order's own price. */
+export function bookLevels(market: Market, live: BookOrder[]): { bids: DepthLevel[]; asks: DepthLevel[] } {
+  const bids: DepthLevel[] = [], asks: DepthLevel[] = [];
+  for (const o of live) {
+    const price = Number(o.price), remaining = Number(o.remaining);
+    if (!(price > 0) || !(remaining > 0)) continue;
+    if (o.sell === market.base.address && o.buy === market.quote.address) asks.push({ price, size: remaining, source: 'orders' });
+    else if (o.sell === market.quote.address && o.buy === market.base.address) bids.push({ price: 1 / price, size: remaining * price, source: 'orders' });
+  }
+  return { bids, asks };
+}
+
+/** A book order in the same shape as a signed order, for the site's order tables. */
+function bookOrderView(o: BookOrder, nowSec: number) {
+  const sold = new Decimal(o.sellAmount).minus(o.remaining).minus(o.returned);
+  const gross = new Decimal(o.sellAmount).mul(o.price).toDecimalPlaces(18).toFixed();
+  const status = o.open ? (o.expiresAt !== 0 && o.expiresAt <= nowSec ? 'expired' : 'open') : sold.gte(o.sellAmount) ? 'filled' : 'cancelled';
+  return {
+    id: `book:${o.id}`, bookId: o.id, kind: 'book' as const, account: o.maker, sell: o.sell, sellAmount: o.sellAmount, buy: o.buy,
+    minBuyAmount: gross, limitBuyAmount: gross, expiresAt: o.expiresAt, createdAt: 0, status, fillTx: null,
+    sold: sold.toFixed(), remaining: o.remaining, unclaimed: o.unclaimed,
+    received: sold.mul(o.price).mul(10_000 - o.makerFeeBps).div(10_000).toDecimalPlaces(18).toFixed(), outlook: null,
+  };
+}
+
 export async function createApp(config: Config) {
   const gateway = new Gateway(config.network, { url: config.gatewayUrl });
   const data = new MarketData(config, gateway);
   const store = new OrderStore(config.dataDir === ':memory:' ? ':memory:' : join(config.dataDir, `orders-${config.network.name}.sqlite`));
+  const book = config.orderBook ? new BookWatcher(gateway, config.orderBook) : undefined;
   const solver = config.solverBadge && config.solverKeyFile
-    ? new Solver({ config, gateway, store, data, key: loadSolverKey(config.solverKeyFile), badge: config.solverBadge })
+    ? new Solver({ config, gateway, store, data, key: loadSolverKey(config.solverKeyFile), badge: config.solverBadge, book })
     : undefined;
   const api = new Api({ staticDir: config.webDir });
 
@@ -52,14 +79,18 @@ export async function createApp(config: Config) {
     return m;
   };
 
-  api.on('GET', '/api/config', () => ({
+  const readBookSoon = () => book?.refresh(3_000).catch((e) => console.warn('[book] not read:', String((e as Error).message ?? e).slice(0, 200)));
+
+  api.on('GET', '/api/config', async () => { await readBookSoon(); return {
     network: config.network.name, networkId: config.network.networkId, xrd: config.network.xrd,
-    feeBps: config.feeBps, refreshedAt: data.refreshedAt, warning: data.lastError ?? null,
+    feeBps: config.feeBps, makerFeeBps: config.makerFeeBps, refreshedAt: data.refreshedAt, warning: data.lastError ?? null,
     dAppDefinition: config.dAppDefinition ?? null,
     limitOrders: config.solverBadge
       ? { enabled: true, solverBadge: config.solverBadge, registry: config.registry ?? null, maxLifetimeSec: config.maxOrderLifetimeSec, filling: Boolean(solver), gasXrd: GAS_XRD, marketOrderLifetimeSec: MARKET_ORDER_LIFETIME_SEC }
       : { enabled: false },
-  }));
+    // Resting orders with partial fills, held in the on-ledger order book. The fee is read from the ledger.
+    orderBook: book?.info ? { component: book.info.component, receipts: book.info.receipts, makerFeeBps: book.info.makerFeeBps } : null,
+  }; });
 
   api.on('GET', '/api/markets', () => data.markets.map((m) => ({
     id: m.id, base: m.base, quote: m.quote, tvlUsd: m.tvlUsd, volume24hUsd: m.volume24hUsd,
@@ -69,9 +100,10 @@ export async function createApp(config: Config) {
   api.on('GET', '/api/depth', async ({ url }): Promise<Depth> => {
     const market = marketOr404(need(url.searchParams.get('market'), 'market'));
     const pools = market.pools.length ? await data.depth(market) : { marketId: market.id, mid: null, bids: [], asks: [] };
-    const resting = orderLevels(market, store.open());
-    const bids = [...pools.bids, ...resting.bids].sort((a, b) => b.price - a.price);
-    const asks = [...pools.asks, ...resting.asks].sort((a, b) => a.price - b.price);
+    await readBookSoon();
+    const resting = orderLevels(market, store.open()), onLedger = bookLevels(market, book?.live() ?? []);
+    const bids = [...pools.bids, ...resting.bids, ...onLedger.bids].sort((a, b) => b.price - a.price);
+    const asks = [...pools.asks, ...resting.asks, ...onLedger.asks].sort((a, b) => a.price - b.price);
     return { marketId: market.id, mid: pools.mid ?? (bids[0] && asks[0] ? (bids[0].price + asks[0].price) / 2 : null), bids, asks };
   });
 
@@ -85,7 +117,7 @@ export async function createApp(config: Config) {
     if (!isResource(sell) || !isResource(buy) || sell === buy) throw new HttpError(400, 'Bad token addresses');
     let d: Decimal;
     try { d = new Decimal(amount); } catch { throw new HttpError(400, 'Bad amount'); }
-    if (!d.isFinite() || !d.isPositive() || d.gt('1e30')) throw new HttpError(400, 'Bad amount');
+    if (!d.isFinite() || !d.gt(0) || d.gt('1e30')) throw new HttpError(400, 'Bad amount');
     const q = await data.quote(sell, buy, d.toDecimalPlaces(18).toFixed());
     if (!q) throw new HttpError(404, 'No route with enough liquidity');
     return q;
@@ -126,10 +158,15 @@ export async function createApp(config: Config) {
     return trades;
   });
 
-  api.on('GET', '/api/orders', ({ url }) => {
+  api.on('GET', '/api/orders', async ({ url }) => {
     const account = need(url.searchParams.get('account'), 'account');
     if (!isAccount(account)) throw new HttpError(400, 'Bad account address');
-    return store.byAccount(account).map((o) => ({ ...publicOrder(o), outlook: o.status === 'open' ? solver?.outlook.get(o.id) ?? null : null }));
+    await readBookSoon();
+    const now = Math.floor(Date.now() / 1000);
+    return [
+      ...(book?.byMaker(account) ?? []).map((o) => bookOrderView(o, now)),
+      ...store.byAccount(account).map((o) => ({ ...publicOrder(o), outlook: o.status === 'open' ? solver?.outlook.get(o.id) ?? null : null })),
+    ];
   });
 
   api.on('POST', '/api/orders', async ({ body }) => {
@@ -176,5 +213,5 @@ export async function createApp(config: Config) {
     return { id: order.id, status: 'cancelled' };
   });
 
-  return { api, data, store, solver, gateway, config };
+  return { api, data, store, solver, gateway, config, book };
 }

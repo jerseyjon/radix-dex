@@ -174,3 +174,39 @@ Where no solver runs, the site falls back to an ordinary wallet transaction stra
 
 Known limits: orders still fill whole or not at all, so a taker smaller than a resting order cannot
 take part of it; and a resting order is only taken when doing so beats the pools for the taker.
+
+## Partial fills: the on-ledger order book (since 21 Nov 2026)
+
+A signed order (subintent) can execute once only, so it can never be filled a part at a time.
+Resting orders that fill in parts therefore live in a contract, `OrderBook`
+(`scrypto/dex-contracts/src/order_book.rs`). This is a deliberate exception to "hold no user
+funds": the tokens a maker is selling sit in the contract until sold or cancelled.
+
+- **Placing** is a wallet transaction: the tokens go in, a receipt NFT comes back. The maker pays
+  the network fee (about 0.8 XRD).
+- **Filling** is open to anyone: `fill(id, payment)` hands over as many tokens as the payment
+  covers at the order's price, rounding against the buyer, and pays the maker's account in the
+  same transaction. The price is enforced by the ledger, not by our solver.
+- **Cancelling** needs the receipt: it is burnt and the unsold tokens come back (about 0.6 XRD).
+- The owner badge can set the maker fee for future orders (capped at 1%) and collect fees.
+  It has no path to anyone's tokens.
+
+The server reads the book from the ledger (component state and its key-value store) and trusts
+nothing else about it. Book orders appear in the depth and in the maker's order list.
+
+How they get filled:
+
+1. **By takers.** When the solver fills a market order or a signed limit order it may buy from
+   book orders as well as take signed orders whole and use pools, whichever leaves the taker
+   most after the network fee. The taker itself still fills whole.
+2. **By the solver, when a pool reaches the price.** A book order is paid its price and no
+   more. When a pool pays more than the order asks, the solver buys from the order with its own
+   funds, sells through the pool and keeps the difference, which is what pays the network fee.
+
+Fees: `DEX_TAKER_FEE_BPS` (default 10) is charged to the order that takes liquidity;
+`DEX_MAKER_FEE_BPS` (default 0) to a signed order when another order takes it. A book order's
+maker fee is set in the contract and fixed for each order when it is placed.
+
+Not done: two book orders that cross each other are not matched directly (each fills against
+takers or a pool); the Trades tab does not list a book order's fills (the order row shows what
+has sold); a signed limit order is not split across fills.

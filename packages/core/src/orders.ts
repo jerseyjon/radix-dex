@@ -28,7 +28,7 @@ const HEX32 = /^[0-9a-f]{64}$/;
  */
 export function limitOrderManifest(p: LimitOrderParams): string {
   if (p.sell === p.buy) throw new Error('sell and buy must differ');
-  if (!new Decimal(p.sellAmount).isPositive() || !new Decimal(p.minBuyAmount).isPositive()) throw new Error('amounts must be positive');
+  if (!new Decimal(p.sellAmount).gt(0) || !new Decimal(p.minBuyAmount).gt(0)) throw new Error('amounts must be positive');
   const lines = [
     `VERIFY_PARENT ${requireResourceRule(p.solverBadge)};`,
     `ASSERT_WORKTOP_IS_EMPTY;`,
@@ -92,7 +92,7 @@ export function poolFillManifest(o: { solver: SolverIdentity; feeLockXrd: string
     `TAKE_ALL_FROM_WORKTOP ${addr(o.sell)} ${bucket('in0')};`,
     ...routeInstructions(o.route, o.sell),
   ];
-  if (new Decimal(o.solverTake).isPositive()) {
+  if (new Decimal(o.solverTake).gt(0)) {
     lines.push(
       `TAKE_FROM_WORKTOP ${addr(buy)} ${dec(o.solverTake)} ${bucket('fee')};`,
       `CALL_METHOD ${addr(o.solver.account)} "deposit" ${bucket('fee')};`,
@@ -143,19 +143,34 @@ export function crossFillManifest(o: { solver: SolverIdentity; feeLockXrd: strin
  * `route`. The taker gets everything the makers sold plus what the pools returned, less
  * `solverTake`. Whatever remains (the makers' fees) goes to the solver.
  */
-export function takeFillManifest(o: { solver: SolverIdentity; feeLockXrd: string; sell: string; buy: string; makerPays: string[]; poolIn: string; route: Pool[]; solverTake: string }): string {
+export function takeFillManifest(o: {
+  solver: SolverIdentity; feeLockXrd: string; sell: string; buy: string; makerPays: string[]; poolIn: string; route: Pool[]; solverTake: string;
+  /** Purchases from the on-ledger order book, paid in the token the taker sells. */
+  bookFills?: { book: string; id: number; pay: string }[];
+  /** What the makers and the book must have delivered between them before the pool leg, or the transaction fails. */
+  assertBought?: string;
+}): string {
   const lines = [...head(o.solver, o.feeLockXrd), `YIELD_TO_CHILD NamedIntent("taker");`];
   o.makerPays.forEach((_, i) => lines.push(`YIELD_TO_CHILD NamedIntent("maker_${i}");`));
   o.makerPays.forEach((pay, i) => lines.push(
     `TAKE_FROM_WORKTOP ${addr(o.sell)} ${dec(pay)} ${bucket(`pay_${i}`)};`,
     `YIELD_TO_CHILD NamedIntent("maker_${i}") ${bucket(`pay_${i}`)};`,
   ));
-  if (o.route.length && new Decimal(o.poolIn).isPositive()) {
+  (o.bookFills ?? []).forEach((f, i) => {
+    if (!Number.isSafeInteger(f.id) || f.id < 0) throw new Error('bad order id');
+    lines.push(
+      `TAKE_FROM_WORKTOP ${addr(o.sell)} ${dec(f.pay)} ${bucket(`book_${i}`)};`,
+      `CALL_METHOD ${addr(f.book)} "fill" ${f.id}u64 ${bucket(`book_${i}`)};`,
+    );
+  });
+  // If a book order was bought by someone else first, stop here rather than short-change the taker.
+  if (o.assertBought && new Decimal(o.assertBought).gt(0)) lines.push(`ASSERT_WORKTOP_CONTAINS ${addr(o.buy)} ${dec(o.assertBought)};`);
+  if (o.route.length && new Decimal(o.poolIn).gt(0)) {
     const path = routePath(o.route, o.sell);
     if (path[path.length - 1] !== o.buy) throw new Error('route does not end in the bought token');
     lines.push(`TAKE_FROM_WORKTOP ${addr(o.sell)} ${dec(o.poolIn)} ${bucket('in0')};`, ...routeInstructions(o.route, o.sell));
   }
-  if (new Decimal(o.solverTake).isPositive()) {
+  if (new Decimal(o.solverTake).gt(0)) {
     lines.push(
       `TAKE_FROM_WORKTOP ${addr(o.buy)} ${dec(o.solverTake)} ${bucket('fee')};`,
       `CALL_METHOD ${addr(o.solver.account)} "deposit" ${bucket('fee')};`,

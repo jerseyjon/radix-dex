@@ -23,7 +23,7 @@ Why it is built this way: [docs/REVIEW.md](docs/REVIEW.md). How it works:
 | `packages/core` | Gateway client, venue adapters, quoting by preview, manifest builders, order validation, matching logic |
 | `apps/server` | HTTP API (markets, candles, depth, quotes, orders) and the solver loop |
 | `apps/web` | The trading terminal (React + Vite) |
-| `scrypto/dex-contracts` | `OrderRegistry` (hard cancel) and `Pool` (rounding-safe constant-product pool) |
+| `scrypto/dex-contracts` | `OrderRegistry` (hard cancel), `Pool` (rounding-safe constant-product pool) and `OrderBook` (resting orders with partial fills) |
 | `scripts` | Live checks and Stokenet end-to-end tests |
 
 ## Run it
@@ -45,9 +45,11 @@ depth and quotes but cannot trade.
 | `DEX_NETWORK` | `mainnet` or `stokenet` | `mainnet` |
 | `DEX_GATEWAY_URL` | Gateway to use (for example your own) | the public one |
 | `DEX_PORT`, `DEX_HOST` | Where to listen | `8787`, `127.0.0.1` |
-| `DEX_FEE_BPS` | Fee the solver takes from limit-order fills | `10` (0.10%) |
+| `DEX_TAKER_FEE_BPS` | Fee on an order that takes liquidity, from a pool or a resting order (`DEX_FEE_BPS` also works) | `10` (0.10%) |
+| `DEX_MAKER_FEE_BPS` | Fee on a resting order when another order takes it | `0` |
 | `DEX_SOLVER_BADGE` | Fungible badge limit orders are pinned to; enables limit orders | unset |
 | `DEX_SOLVER_KEY_FILE` | File (mode 600) with the solver's Ed25519 key in hex; enables filling | unset |
+| `DEX_ORDER_BOOK` | `OrderBook` component, to enable resting orders with partial fills | unset |
 | `DEX_REGISTRY` | `OrderRegistry` component, to enable hard cancels | unset |
 | `DEX_MARKETS_FILE` | JSON of tokens and pools, for networks with no venue API | unset |
 | `DEX_DAPP_DEFINITION` | dApp definition account, so the wallet will connect | unset |
@@ -62,6 +64,7 @@ npx tsx scripts/stokenet-e2e.ts        # signs and fills real orders on Stokenet
 npx tsx scripts/stokenet-server-e2e.ts # same, through the HTTP API and solver
 npx tsx scripts/stokenet-setup.ts      # publish contracts, pool, registry and dApp definition on Stokenet
 npx tsx scripts/stokenet-pool-e2e.ts   # pool fill and on-ledger cancel against that deployment
+npx tsx scripts/stokenet-book-e2e.ts   # on-ledger order book: partial fills, cancel, fill when a pool reaches the price
 scripts/run-stokenet.sh                # run the Stokenet test site with wallet connect on port 8788
 scrypto/run.sh test                    # contract tests, including attempts to drain the pool
 ```
@@ -78,8 +81,8 @@ certificate in `data/tls/` is enough for testing), or forward the port and open 
   prices rather than better ones.
 - Pools are routed only if their on-ledger package is on the allow-list in
   `packages/core/src/venues.ts`.
-- `Pool` in `scrypto/` is new code that would hold other people's money. It has tests that try
-  to drain it, but it has not been audited. Do not deploy it to mainnet without a review.
+- `Pool` and `OrderBook` in `scrypto/` are new code that would hold other people's money. They have tests that try
+  to drain them, but they have not been audited. Do not deploy them to mainnet without a review.
 
 ## Licence
 

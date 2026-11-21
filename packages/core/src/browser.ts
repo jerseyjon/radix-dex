@@ -3,5 +3,6 @@ export * from './types.ts';
 export * from './manifest.ts';
 export * from './orders.ts';
 export * from './orderkey.ts';
+export { type BookOrder, bookCancelManifest, bookPlaceManifest } from './orderbook.ts';
 export { routePath } from './quote.ts';
 export { marketKey } from './markets.ts';
