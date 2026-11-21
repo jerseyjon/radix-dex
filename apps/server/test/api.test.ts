@@ -31,6 +31,13 @@ async function order(secret = randomBytes(32).toString('hex'), key = keyFromHex(
   return { secret, key, account, body: { ...p, orderKeyHex: orderKeyFromSecret(secret), signedPartialTransactionHex: signed.signedPartialTransactionHex } };
 }
 
+test('config endpoint answers and describes limit orders', async () => {
+  const r = await call('GET', '/api/config');
+  assert.equal(r.status, 200);
+  assert.equal(r.json.limitOrders.enabled, true);
+  assert.equal(typeof r.json.limitOrders.bufferBps, 'number');
+});
+
 test('place, list, and cancel an order', async () => {
   const o = await order();
   const placed = await call('POST', '/api/orders', o.body);

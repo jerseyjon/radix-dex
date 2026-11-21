@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  type Depth, type DepthLevel, type Market, Decimal, Gateway, OrderRejected, isAccount, isResource,
+  type Depth, type DepthLevel, type Market, Decimal, Gateway, OrderRejected, POOL_FILL_BUFFER_BPS, isAccount, isResource,
   orderKeyFromSecret, validateLimitOrder,
 } from '@radix-dex/core';
 import type { Config } from './config.ts';
