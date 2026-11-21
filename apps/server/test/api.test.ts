@@ -5,6 +5,7 @@ import type { Server } from 'node:http';
 import { NETWORKS, accountOf, keyFromHex, limitOrderManifest, orderKeyFromSecret, signSubintent } from '@radix-dex/core';
 import { createApp, orderLevels } from '../src/app.ts';
 import { loadConfig } from '../src/config.ts';
+import { fillGasXrd } from '../src/solver.ts';
 
 const net = NETWORKS.stokenet;
 const TUSD = 'resource_tdx_2_1th7w39rfv8dux3egj68femh6e5kp20xruxv8u5ll4j0xnh6enw4kfx';
@@ -120,4 +121,13 @@ test('an order that keeps failing to fill is dropped, with growing delays in bet
   assert.equal(app.store.markCancelled(json.id, 'Dropped after 3 failed fills'), true);
   assert.equal(app.store.get(json.id)!.status, 'cancelled');
   assert.equal(app.store.noteFailure(json.id, 'late', 400), 3, 'a closed order no longer counts failures');
+});
+
+test('the network fee charged follows what the route costs to swap through', () => {
+  assert.equal(fillGasXrd(0).toFixed(), '0.7', 'no pool leg');
+  assert.equal(fillGasXrd(1).toFixed(), '1.08');
+  assert.equal(fillGasXrd(0, '0.51').toFixed(), '1.01', 'a cheap pool');
+  assert.equal(fillGasXrd(0, '0.92').toFixed(), '1.42', 'a costly pool is charged more');
+  assert.equal(fillGasXrd(1, '0.5').toFixed(), '1.38');
+  assert.equal(fillGasXrd(0, 'x').toFixed(), '1', 'an unreadable measurement falls back');
 });

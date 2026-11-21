@@ -8,7 +8,7 @@ import { BookWatcher } from './book.ts';
 import type { Config } from './config.ts';
 import { Api, HttpError } from './http.ts';
 import { MarketData } from './marketdata.ts';
-import { GAS_XRD, Solver, loadSolverKey } from './solver.ts';
+import { GAS_XRD, Solver, fillGasXrd, loadSolverKey } from './solver.ts';
 import { OrderStore, type StoredOrder } from './store.ts';
 
 /** How long the site asks the wallet to keep a market order valid. */
@@ -124,8 +124,8 @@ export async function createApp(config: Config) {
     if (!d.isFinite() || !d.gt(0) || d.gt('1e30')) throw new HttpError(400, 'Bad amount');
     const q = await data.quote(sell, buy, d.toDecimalPlaces(18).toFixed());
     if (!q) throw new HttpError(404, 'No route with enough liquidity');
-    // The network fee of a plain fill, in the token being bought, so the site can show it before an order is signed.
-    return { ...q, gasInBuyToken: (await data.xrdValueIn(buy, GAS_XRD).catch(() => undefined)) ?? null };
+    // The network fee of a fill through this route, in the token being bought, so the site can show it before an order is signed.
+    return { ...q, gasInBuyToken: (await data.xrdValueIn(buy, fillGasXrd(0, q.networkFeeXrd)).catch(() => undefined)) ?? null };
   });
 
   api.on('GET', '/api/balances', async ({ url }) => {

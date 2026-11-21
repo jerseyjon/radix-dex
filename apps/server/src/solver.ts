@@ -23,10 +23,17 @@ export const GAS_XRD = '1';
 const MAX_FILL_FAILURES = 3;
 
 /**
- * Network cost of a fill in XRD, from Stokenet measurements: the taker's order alone, a pool leg,
- * and each resting order taken (pool only 0.96; one order and a pool 1.34 to 1.40; one order alone 1.08).
+ * Network cost of a fill in XRD: the taker's order alone 0.7, each resting order taken 0.38, and
+ * for a pool leg what that swap costs on its own (measured when it was quoted) plus 0.5 for running
+ * it inside the fill. Pool kinds differ widely: on mainnet an Ociswap basic pool swap costs about
+ * 0.5 and a precision pool about 0.9, and their fills cost 1.0 and 1.4.
  */
-const fillGasXrd = (items: number, poolLeg: boolean): Decimal => new Decimal('0.7').plus(poolLeg ? '0.3' : 0).plus(new Decimal('0.38').mul(items));
+export const fillGasXrd = (items: number, poolSwapFeeXrd?: string): Decimal => {
+  const taken = new Decimal('0.38').mul(items);
+  if (poolSwapFeeXrd === undefined) return taken.plus('0.7');
+  const n = Number(poolSwapFeeXrd);
+  return taken.plus(Number.isFinite(n) && n > 0 ? poolSwapFeeXrd : '0.5').plus('0.5');
+};
 /** Shares of a book order the solver tries to buy with its own funds when a pool pays more than the order asks, largest first. */
 const ARB_SHARES = [1, 0.5, 0.25, 0.1];
 
@@ -142,10 +149,10 @@ export class Solver {
       let items = candidates.slice(0, k);
       const fromOthers = items.reduce((sum, m) => sum.plus(m.gives), new Decimal(0));
       const left = items.reduce((rest, m) => rest.minus(m.cost), new Decimal(taker.sellAmount));
-      let total = fromOthers, route: Pool[] = [], poolIn = '0';
+      let total = fromOthers, route: Pool[] = [], poolIn = '0', swapFee: string | undefined;
       if (left.gt(0)) {
         const quote = await this.data.quoter.best(this.data.pools, taker.sell, taker.buy, left.toFixed(), xrd).catch(() => undefined);
-        if (quote) { total = total.plus(quote.buyAmount); route = quote.route; poolIn = left.toFixed(); }
+        if (quote) { total = total.plus(quote.buyAmount); route = quote.route; poolIn = left.toFixed(); swapFee = quote.networkFeeXrd; }
         else {
           // No pool for the remainder. A signed order can be given it as a better price;
           // a book order cannot, and the taker cannot be handed it back, so that plan is out.
@@ -160,7 +167,7 @@ export class Solver {
         }
       }
       // Each order taken adds to the network fee the taker pays, so compare what is left after it.
-      const gasXrd = fillGasXrd(items.length, route.length > 0);
+      const gasXrd = fillGasXrd(items.length, route.length > 0 ? swapFee ?? '0.5' : undefined);
       const gasInBuyToken = await this.gasIn(taker.buy, gasXrd);
       if (gasInBuyToken === undefined) continue; // the fee cannot be charged in this token: do not fill for nothing
       if (!best || total.minus(gasInBuyToken).gt(best.total.minus(best.gasInBuyToken))) best = { items, poolIn, route, total, gasInBuyToken };
