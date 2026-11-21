@@ -3,7 +3,7 @@ import {
   type DecodedOrder, type Ed25519Key, type Gateway, type SolverIdentity, Decimal,
   type BookOrder, type LiquidityItem, type Pool,
   accountOf, bookArbManifest, bookArbPoolFirstManifest, bookCrossManifest, buildTransaction, decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, payout,
-  pickLiquidity, planBookCross, planPoolFill, submitAndWait, takeFillManifest,
+  POOL_FILL_BUFFER_BPS, pickLiquidity, planBookCross, planPoolFill, submitAndWait, takeFillManifest,
 } from '@radix-dex/core';
 import type { BookWatcher } from './book.ts';
 import type { Config } from './config.ts';
@@ -33,6 +33,15 @@ export const fillGasXrd = (items: number, poolSwapFeeXrd?: string): Decimal => {
   if (poolSwapFeeXrd === undefined) return taken.plus('0.7');
   const n = Number(poolSwapFeeXrd);
   return taken.plus(Number.isFinite(n) && n > 0 ? poolSwapFeeXrd : '0.5').plus('0.5');
+};
+/**
+ * Network cost in XRD of buying from a book order and selling through a pool with the solver's own
+ * funds: the pool swap as measured when quoted, plus the rest. On mainnet through an Ociswap
+ * precision pool (swap 0.92) these cost 1.19 and 1.30.
+ */
+export const arbGasXrd = (poolSwapFeeXrd: string): Decimal => {
+  const n = Number(poolSwapFeeXrd);
+  return new Decimal(Number.isFinite(n) && n > 0 ? poolSwapFeeXrd : '0.6').plus('0.45');
 };
 /** Shares of a book order the solver tries to buy with its own funds when a pool pays more than the order asks, largest first. */
 const ARB_SHARES = [1, 0.5, 0.25, 0.1];
@@ -189,10 +198,12 @@ export class Solver {
       const quote = await this.data.quoter.best(this.data.pools, b.sell, b.buy, q.toFixed(), xrd).catch(() => undefined);
       if (!quote) return undefined;
       const cost = q.mul(b.price).toDecimalPlaces(buyDiv, Decimal.ROUND_UP);
-      const priced = mustCoverGas ? await this.gasIn(b.buy, new Decimal(GAS_XRD)) : '0';
+      const priced = mustCoverGas ? await this.gasIn(b.buy, arbGasXrd(quote.networkFeeXrd)) : '0';
       if (priced === undefined) return undefined;
       const gas = new Decimal(priced);
-      return new Decimal(quote.buyAmount).minus(cost).minus(gas).gt(0) ? { q, cost, route: quote.route } : undefined;
+      // The pool can move before the transaction runs, so it must also bring back the network fee or fail.
+      const minBack = cost.plus(gas).toDecimalPlaces(buyDiv, Decimal.ROUND_UP);
+      return new Decimal(quote.buyAmount).mul(10_000 - POOL_FILL_BUFFER_BPS).div(10_000).gt(minBack) ? { q, cost, minBack, route: quote.route } : undefined;
     };
     // One cheap look first: if even a small part does not sell for more than it costs, nothing will.
     if (!(await attempt(ARB_SHARES[ARB_SHARES.length - 1]!, false))) return false;
@@ -202,7 +213,7 @@ export class Solver {
       if (!plan || plan.cost.gt(float)) continue;
       const res = await this.submit(bookArbManifest({
         solver, feeLockXrd: FEE_LOCK_XRD, book: this.book!.component, id: b.id, payResource: b.buy, pay: plan.cost.toFixed(),
-        boughtResource: b.sell, route: plan.route, minBack: plan.cost.toFixed(),
+        boughtResource: b.sell, route: plan.route, minBack: plan.minBack.toFixed(),
       }), {});
       if (!res.ok) { this.bookRetryAt.set(b.id, Date.now() + 60_000); console.warn(`[solver] book order ${b.id}: ${res.error.slice(0, 200)}`); return false; }
       console.log(`[solver] bought ${plan.q.toFixed()} from book order ${b.id} and sold it through ${plan.route.map((p) => p.venue).join('>')} in ${res.txid}`);
@@ -213,8 +224,6 @@ export class Solver {
     // way round with the token the order sells: sell some through the pool, pay the proceeds into
     // the order, and end with more of that token than it started with.
     const start = await this.balance(solver.account, b.sell);
-    const gasPriced = await this.gasIn(b.sell, new Decimal(GAS_XRD));
-    if (gasPriced === undefined) return false;
     for (const share of ARB_SHARES) {
       const x = new Decimal(b.remaining).mul(share).toDecimalPlaces(sellDiv, Decimal.ROUND_DOWN);
       if (!x.gt(0) || x.gt(start)) continue;
@@ -222,10 +231,13 @@ export class Solver {
       if (!quote) continue;
       // What the pool's proceeds buy from the order, by the component's own sum.
       const back = Decimal.min(new Decimal(quote.buyAmount).div(b.price).toDecimalPlaces(sellDiv, Decimal.ROUND_DOWN), b.remaining);
-      if (!back.minus(x).minus(gasPriced).gt(0)) continue;
+      const gasPriced = await this.gasIn(b.sell, arbGasXrd(quote.networkFeeXrd));
+      if (gasPriced === undefined) return false;
+      const minBack = x.plus(gasPriced).toDecimalPlaces(sellDiv, Decimal.ROUND_UP);
+      if (!back.mul(10_000 - POOL_FILL_BUFFER_BPS).div(10_000).gt(minBack)) continue;
       const res = await this.submit(bookArbPoolFirstManifest({
         solver, feeLockXrd: FEE_LOCK_XRD, book: this.book!.component, id: b.id, startResource: b.sell, sellIn: x.toFixed(),
-        payResource: b.buy, route: quote.route, minBack: x.toFixed(),
+        payResource: b.buy, route: quote.route, minBack: minBack.toFixed(),
       }), {});
       if (!res.ok) { this.bookRetryAt.set(b.id, Date.now() + 60_000); console.warn(`[solver] book order ${b.id}: ${res.error.slice(0, 200)}`); return false; }
       console.log(`[solver] sold ${x.toFixed()} through ${quote.route.map((p) => p.venue).join('>')} and bought ${back.toFixed()} from book order ${b.id} in ${res.txid}`);
