@@ -36,14 +36,13 @@ Updated 21 Nov 2026. Decisions taken by the project owner on 20 Nov 2026:
 
 ### Can proceed without the owner
 
-1. Publish the contracts to Stokenet and run the hard-cancel path end to end (needs the
-   `scrypto` CLI in the build image to produce the package definition).
-2. Add our own pool as a venue and test a pool fill on Stokenet (so far only inventory and
-   order-against-order fills have run on a ledger; pool fills are exercised by mainnet previews).
-3. Own indexer: trades and candles from ledger events, replacing the Ociswap chart feed, and
-   a recent-trades panel.
-4. Split routing across pools; CaviarNine Shape pools as a venue while they last.
-5. Wallet balance of the whole account in the UI (portfolio view), order history export.
+(Done since this list was written: contracts on Stokenet with the hard-cancel path tested end
+to end, and pool fills through our own Stokenet pool, both in `scripts/stokenet-pool-e2e.ts`.)
+
+1. Own indexer: trades and candles from ledger events, replacing the Ociswap chart feed.
+2. Split routing across pools; CaviarNine Shape pools as a venue while they last.
+3. Move test-key creation into `stokenet-setup.ts` and delete the first-version `stokenet-e2e.ts`.
+4. Wallet balance of the whole account in the UI (portfolio view), order history export.
 
 ## Known limitations
 
