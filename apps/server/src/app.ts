@@ -51,13 +51,13 @@ export function bookLevels(market: Market, live: BookOrder[]): { bids: DepthLeve
 }
 
 /** A book order in the same shape as a signed order, for the site's order tables. */
-function bookOrderView(o: BookOrder, nowSec: number) {
+function bookOrderView(o: BookOrder, nowSec: number, placedAt = 0) {
   const sold = new Decimal(o.sellAmount).minus(o.remaining).minus(o.returned);
   const gross = new Decimal(o.sellAmount).mul(o.price).toDecimalPlaces(18).toFixed();
   const status = o.open ? (o.expiresAt !== 0 && o.expiresAt <= nowSec ? 'expired' : 'open') : sold.gte(o.sellAmount) ? 'filled' : 'cancelled';
   return {
     id: `book:${o.id}`, bookId: o.id, kind: 'book' as const, account: o.maker, sell: o.sell, sellAmount: o.sellAmount, buy: o.buy,
-    minBuyAmount: gross, limitBuyAmount: gross, expiresAt: o.expiresAt, createdAt: 0, status, fillTx: null,
+    minBuyAmount: gross, limitBuyAmount: gross, expiresAt: o.expiresAt, createdAt: placedAt, status, fillTx: null,
     sold: sold.toFixed(), remaining: o.remaining, unclaimed: o.unclaimed,
     received: sold.mul(o.price).mul(10_000 - o.makerFeeBps).div(10_000).toDecimalPlaces(18).toFixed(), outlook: null,
   };
@@ -146,13 +146,25 @@ export async function createApp(config: Config) {
     const hit = historyCache.get(account);
     if (hit && Date.now() - hit.at < 5_000) return hit.value;
     const listed = new Set(data.markets.flatMap((m) => [m.base.address, m.quote.address]));
+    // Sales from this account's orders in the on-ledger book. The tokens left the account when
+    // the order was placed, so the ledger shows only the payment arriving: take each from the book's own events.
+    await readBookSoon();
+    const mine = (book?.fills ?? []).flatMap((f) => {
+      const o = book!.orders.get(f.id);
+      return o && o.maker === account ? [{ f, o, got: new Decimal(f.paid).minus(f.fee) }] : [];
+    });
     const trades = [];
+    for (const { f, o, got } of mine) trades.push({ txid: f.txid, time: f.time, sell: o.sell, sellAmount: f.sold, buy: o.buy, buyAmount: got.toFixed(), feeXrd: '0', book: f.id });
     for (const t of await gateway.accountActivity(account)) {
+      // Leave those payments out of the account's own movement, or a trade in the same transaction would be misread.
+      // (An account that bought from its own order nets to nothing in that token, and the ledger then lists no change at all.)
+      for (const { f, o, got } of mine) if (f.txid === t.txid) t.changes[o.buy] = new Decimal(t.changes[o.buy] ?? 0).minus(got).toFixed();
       const moved = Object.entries(t.changes).filter(([r, v]) => listed.has(r) && Number(v) !== 0);
       const out = moved.filter(([, v]) => Number(v) < 0), inn = moved.filter(([, v]) => Number(v) > 0);
       if (out.length !== 1 || inn.length !== 1) continue;
       trades.push({ txid: t.txid, time: t.time, sell: out[0]![0], sellAmount: out[0]![1].replace('-', ''), buy: inn[0]![0], buyAmount: inn[0]![1], feeXrd: t.feeXrd });
     }
+    trades.sort((a, b) => b.time - a.time);
     if (historyCache.size > 500) historyCache.clear();
     historyCache.set(account, { at: Date.now(), value: trades });
     return trades;
@@ -164,7 +176,7 @@ export async function createApp(config: Config) {
     await readBookSoon();
     const now = Math.floor(Date.now() / 1000);
     return [
-      ...(book?.byMaker(account) ?? []).map((o) => bookOrderView(o, now)),
+      ...(book?.byMaker(account) ?? []).map((o) => bookOrderView(o, now, book?.placedAt.get(o.id))),
       ...store.byAccount(account).map((o) => ({ ...publicOrder(o), outlook: o.status === 'open' ? solver?.outlook.get(o.id) ?? null : null })),
     ];
   });

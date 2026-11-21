@@ -2,8 +2,8 @@ import { readFileSync, statSync } from 'node:fs';
 import {
   type DecodedOrder, type Ed25519Key, type Gateway, type SolverIdentity, Decimal,
   type BookOrder, type LiquidityItem, type Pool,
-  accountOf, bookArbManifest, buildTransaction, decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, payout,
-  pickLiquidity, planPoolFill, submitAndWait, takeFillManifest,
+  accountOf, bookArbManifest, bookCrossManifest, buildTransaction, decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, payout,
+  pickLiquidity, planBookCross, planPoolFill, submitAndWait, takeFillManifest,
 } from '@radix-dex/core';
 import type { BookWatcher } from './book.ts';
 import type { Config } from './config.ts';
@@ -202,8 +202,8 @@ export class Solver {
   }
 
   /** One pass over the open orders. Safe to call on a timer; overlapping calls are skipped. */
-  async tick(): Promise<{ crossed: number; poolFilled: number; bookBought: number }> {
-    const result = { crossed: 0, poolFilled: 0, bookBought: 0 };
+  async tick(): Promise<{ crossed: number; poolFilled: number; bookBought: number; bookCrossed: number }> {
+    const result = { crossed: 0, poolFilled: 0, bookBought: 0, bookCrossed: 0 };
     if (this.running) return result;
     this.running = true;
     try {
@@ -266,6 +266,32 @@ export class Solver {
           console.log(`[solver] filled ${o.kind} ${o.id.slice(-8)}${took.length ? ' against ' + took.join('+') : ''}${exec.route.length ? ' through ' + exec.route.map((p) => p.venue).join('>') : ''} in ${res.txid}`);
         } catch (e) { this.fail(blame, String((e as Error).message ?? e)); }
       }
+
+      // Book orders that cross each other: a buyer bidding at or above what a seller asks.
+      // The solver passes the tokens from one to the other with its own funds and keeps the difference.
+      const crossed = new Set<number>();
+      for (const first of liveBook()) {
+        for (const second of liveBook()) {
+          if (crossed.has(first.id) || crossed.has(second.id)) continue;
+          try {
+            // A free look first: most pairs do not cross, and that needs no balance from the ledger.
+            if (!planBookCross(first, second, '1e30', '0', this.divisibility)) continue;
+            const float = await this.balance(solver.account, first.buy);
+            const gas = this.gasIn(first.buy, first.sell, new Decimal(first.price), new Decimal(GAS_XRD));
+            const plan = planBookCross(first, second, float.toFixed(), gas, this.divisibility);
+            if (!plan) continue;
+            const res = await this.submit(bookCrossManifest({
+              solver, feeLockXrd: FEE_LOCK_XRD, book: this.book!.component, first: first.id, second: second.id,
+              payResource: first.buy, pay: plan.pay, middleResource: first.sell, minBack: plan.pay,
+            }), {});
+            crossed.add(first.id); crossed.add(second.id);
+            if (!res.ok) { this.bookRetryAt.set(first.id, Date.now() + 60_000); this.bookRetryAt.set(second.id, Date.now() + 60_000); console.warn(`[solver] book orders ${first.id}+${second.id}: ${res.error.slice(0, 200)}`); continue; }
+            result.bookCrossed += 1;
+            console.log(`[solver] crossed book orders ${first.id} and ${second.id} (${plan.middle} through) in ${res.txid}`);
+          } catch (e) { console.warn(`[solver] book orders ${first.id}+${second.id}: ${String((e as Error).message ?? e).slice(0, 200)}`); }
+        }
+      }
+      if (crossed.size) await this.book?.refresh().catch(() => undefined);
 
       // Book orders the market has reached.
       for (const b of liveBook()) {

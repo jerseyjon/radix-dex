@@ -82,14 +82,14 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
               {trades.map((t) => {
                 const d = describeTrade(t);
                 return (
-                  <tr key={t.txid}>
+                  <tr key={t.txid + (t.book ?? '')}>
                     <td>{fmtTime(t.time)}</td>
                     <td>{d.pair}</td>
-                    <td className={d.side === 'Buy' ? 'up' : 'down'}>{d.side}</td>
+                    <td className={d.side === 'Buy' ? 'up' : 'down'}>{d.side}{t.book ? ` (order #${t.book})` : ''}</td>
                     <td className="r">{fmtPrice(d.price)}</td>
                     <td className="r">{fmtAmount(d.size)} {d.baseSym}</td>
                     <td className="r">{fmtAmount(d.total)} {d.quoteSym}</td>
-                    <td className="r">{Number(t.feeXrd) > 0 ? `${fmtAmount(t.feeXrd)} XRD` : 'paid for you'}</td>
+                    <td className="r">{t.book ? 'none' : Number(t.feeXrd) > 0 ? `${fmtAmount(t.feeXrd)} XRD` : 'paid for you'}</td>
                     <td className="r"><a className="link" href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer">View</a></td>
                   </tr>
                 );

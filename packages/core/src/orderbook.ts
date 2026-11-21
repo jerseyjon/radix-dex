@@ -192,3 +192,83 @@ export function pickLiquidity(
   }
   return out;
 }
+
+// ---------------------------------------------------------------- events
+
+/** One purchase from a book order, as the component reported it. */
+export interface BookFill { id: number; txid: string; time: number; sold: string; paid: string; fee: string }
+
+/**
+ * The order book's own events, oldest first, from `fromStateVersion` on: when each order was
+ * placed and every purchase from it. Returns where to resume from next time.
+ */
+export async function readBookEvents(gateway: Gateway, component: string, fromStateVersion = 1, maxPages = 30): Promise<{ placed: { id: number; txid: string; time: number }[]; fills: BookFill[]; next: number }> {
+  const placed: { id: number; txid: string; time: number }[] = [], fills: BookFill[] = [];
+  let cursor: string | undefined, next = fromStateVersion;
+  for (let page = 0; page < maxPages; page++) {
+    let j: any;
+    try {
+      j = await gateway.post('/stream/transactions', {
+        affected_global_entities_filter: [component], order: 'asc', limit_per_page: 100, cursor,
+        from_ledger_state: { state_version: fromStateVersion }, opt_ins: { receipt_events: true },
+      });
+    } catch (e) {
+      // Asking from just past the newest transaction is refused rather than answered with nothing.
+      if (String((e as { body?: string }).body ?? '').includes('beyond the end of the known ledger')) break;
+      throw e;
+    }
+    for (const t of j?.items ?? []) {
+      if (typeof t?.state_version === 'number') next = Math.max(next, t.state_version + 1);
+      if (t?.transaction_status !== 'CommittedSuccess' || typeof t.intent_hash !== 'string') continue;
+      const time = Math.floor(Date.parse(t.confirmed_at ?? t.round_timestamp) / 1000);
+      for (const e of t.receipt?.events ?? []) {
+        // Only what the order book itself emitted: an event's name alone can be copied by any component.
+        if (e?.emitter?.entity?.entity_address !== component || !Array.isArray(e.data?.fields)) continue;
+        const f = (name: string) => String(field(e.data.fields, name));
+        const id = Number(f('id'));
+        if (!Number.isSafeInteger(id)) continue;
+        if (e.name === 'OrderPlacedEvent') placed.push({ id, txid: t.intent_hash, time });
+        else if (e.name === 'OrderFilledEvent') fills.push({ id, txid: t.intent_hash, time, sold: f('sold'), paid: f('paid'), fee: f('fee') });
+      }
+    }
+    cursor = j?.next_cursor ?? undefined;
+    if (!cursor) break;
+  }
+  return { placed, fills, next };
+}
+
+/**
+ * Root manifest with which the solver settles two book orders that cross: it pays `pay` into
+ * `first`, passes everything that buys into `second`, and must get at least `minBack` of the
+ * token it started with, or the transaction fails.
+ */
+export function bookCrossManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; first: number; second: number; payResource: string; pay: string; middleResource: string; minBack: string }): string {
+  return [
+    `CALL_METHOD ${addr(o.solver.account)} "lock_fee" ${dec(o.feeLockXrd)};`,
+    `CALL_METHOD ${addr(o.solver.account)} "withdraw" ${addr(o.payResource)} ${dec(o.pay)};`,
+    ...bookFillInstructions(o.book, o.first, o.payResource, o.pay, 'pay'),
+    `TAKE_ALL_FROM_WORKTOP ${addr(o.middleResource)} ${bucket('middle')};`,
+    `CALL_METHOD ${addr(o.book)} "fill" ${u64(o.second)} ${bucket('middle')};`,
+    `ASSERT_WORKTOP_CONTAINS ${addr(o.payResource)} ${dec(o.minBack)};`,
+    `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
+  ].join('\n');
+}
+
+/**
+ * How much the solver should put through two book orders that cross, or undefined if they do
+ * not cross by enough to pay `gas` (in the token it fronts). `first` sells what `second` buys.
+ * The solver pays `pay` of first.buy, receives `middle` of first.sell, and gets `back` of first.buy.
+ */
+export function planBookCross(first: BookOrder, second: BookOrder, float: string, gas: string, divisibility: (resource: string) => number): { pay: string; middle: string; back: string } | undefined {
+  if (first.id === second.id || first.sell !== second.buy || first.buy !== second.sell) return undefined;
+  const p1 = new Decimal(first.price), p2 = new Decimal(second.price);
+  if (!p1.mul(p2).lt(1)) return undefined; // prices do not cross
+  const midDiv = divisibility(first.sell), payDiv = divisibility(first.buy);
+  // The most of the middle token that both orders and the solver's funds allow.
+  const middle = Decimal.min(first.remaining, new Decimal(second.remaining).mul(p2), new Decimal(float).div(p1)).toDecimalPlaces(midDiv, Decimal.ROUND_DOWN);
+  if (!middle.gt(0)) return undefined;
+  const pay = middle.mul(p1).toDecimalPlaces(payDiv, Decimal.ROUND_UP);
+  const back = Decimal.min(middle.div(p2).toDecimalPlaces(payDiv, Decimal.ROUND_DOWN), second.remaining);
+  if (pay.gt(float) || !back.minus(pay).minus(gas).gt(0)) return undefined;
+  return { pay: pay.toFixed(), middle: middle.toFixed(), back: back.toFixed() };
+}

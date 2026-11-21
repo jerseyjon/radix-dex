@@ -110,6 +110,18 @@ if (!state.orderBook) {
   save();
 }
 
+// 3c. A second order book for the automated tests only. The test site's solver does not watch it,
+// so test runs neither race that solver nor trade against orders people place on the site.
+if (!state.orderBookTest) {
+  const r = await run('instantiate test order book', [
+    lockFee(solver),
+    'CALL_FUNCTION ' + addr(state.orderBookPackage!) + ' "OrderBook" "instantiate" 0u16 ' + addr(state.badge!) + ';',
+  ].join('\n'), solverKey);
+  state.orderBookTest = need(r.find('component_'), 'test order book address');
+  state.orderReceiptsTest = need(r.find('resource_'), 'test order receipt address');
+  save();
+}
+
 // 4. Give the test token a name and symbol so the wallet shows something readable.
 if (!state.tusdNamed) {
   // TUSD was created with no owner, so its metadata cannot be set. Record that and move on.

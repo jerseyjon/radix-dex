@@ -1,4 +1,4 @@
-import { type BookInfo, type BookOrder, type Gateway, bookOrderLive, readBook, readBookOrders } from '@radix-dex/core';
+import { type BookFill, type BookInfo, type BookOrder, type Gateway, bookOrderLive, readBook, readBookEvents, readBookOrders } from '@radix-dex/core';
 
 /** Keeps a copy of the on-ledger order book. The ledger is the only source of truth: nothing here is trusted from clients. */
 export class BookWatcher {
@@ -6,6 +6,10 @@ export class BookWatcher {
   readonly component: string;
   info: BookInfo | undefined;
   readonly orders = new Map<number, BookOrder>();
+  /** Every purchase from the book, oldest first, and when each order was placed: from the component's events. */
+  readonly fills: BookFill[] = [];
+  readonly placedAt = new Map<number, number>();
+  private eventsFrom = 1;
   private refreshedAt = 0;
   private running: Promise<void> | undefined;
 
@@ -28,6 +32,13 @@ export class BookWatcher {
         for (const o of await readBookOrders(this.gateway, info.ordersStore, ids)) this.orders.set(o.id, o);
         this.info = info;
         this.refreshedAt = Date.now();
+        // History is for display only: if it cannot be read, the book itself is still current.
+        try {
+          const ev = await readBookEvents(this.gateway, this.component, this.eventsFrom);
+          for (const p of ev.placed) this.placedAt.set(p.id, p.time);
+          this.fills.push(...ev.fills);
+          this.eventsFrom = ev.next;
+        } catch (e) { console.warn('[book] events not read:', String((e as Error).message ?? e).slice(0, 200)); }
       } finally {
         this.running = undefined;
       }

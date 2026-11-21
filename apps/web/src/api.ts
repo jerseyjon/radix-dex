@@ -26,7 +26,9 @@ export interface OrderView {
   outlook?: { available: string; needed: string; at: number } | null;
 }
 
-export interface TradeView { txid: string; time: number; sell: string; sellAmount: string; buy: string; buyAmount: string; feeXrd: string }
+export interface TradeView { txid: string; time: number; sell: string; sellAmount: string; buy: string; buyAmount: string; feeXrd: string;
+  /** Set when this is a sale from the account's order in the on-ledger book: the order's number there. */
+  book?: number }
 
 /** Static preview builds read pre-generated JSON instead of a live server. */
 export const STATIC = import.meta.env.VITE_STATIC === '1';

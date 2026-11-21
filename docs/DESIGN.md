@@ -207,6 +207,15 @@ Fees: `DEX_TAKER_FEE_BPS` (default 10) is charged to the order that takes liquid
 `DEX_MAKER_FEE_BPS` (default 0) to a signed order when another order takes it. A book order's
 maker fee is set in the contract and fixed for each order when it is placed.
 
-Not done: two book orders that cross each other are not matched directly (each fills against
-takers or a pool); the Trades tab does not list a book order's fills (the order row shows what
-has sold); a signed limit order is not split across fills.
+3. **By the solver, when two book orders cross.** A buyer bidding at or above what a seller
+   asks: the solver pays the seller with its own funds, passes the tokens to the buyer, and
+   keeps the difference. Each order gets exactly its own price.
+
+A book order's sales are read from the component's own events (`OrderFilledEvent`, accepted only
+when the order book itself emitted them) and listed in the maker's trade history.
+
+The automated tests use a second order book (`orderBookTest` in the keys file) that the test
+site's solver does not watch, so they neither race that solver nor trade against orders placed
+on the site. They still share the test pool; `scripts/stokenet-set-price.ts` puts its price back.
+
+Not done: a signed limit order is not split across fills.

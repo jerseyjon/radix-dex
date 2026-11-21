@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Decimal, findCrosses, grossNeeded, payout, pickLiquidity, pickMakers, planCross, planPoolFill, takeFillManifest, type BookOrder, type OpenOrder } from '../src/index.ts';
+import { Decimal, findCrosses, grossNeeded, payout, pickLiquidity, pickMakers, planBookCross, planCross, planPoolFill, takeFillManifest, type BookOrder, type OpenOrder } from '../src/index.ts';
 
 const X = 'resource_x', Y = 'resource_y';
 const div18 = () => 18;
@@ -124,4 +124,23 @@ test('the combined fill buys from the book before the pool leg and checks what w
   const at = (needle: string) => lines.findIndex((l) => l.includes(needle));
   assert.ok(at('"fill" 7u64 Bucket("book_0")') > at('Decimal("1.8")'));
   assert.ok(at('ASSERT_WORKTOP_CONTAINS') > at('"fill" 7u64') && at('ASSERT_WORKTOP_CONTAINS') < at('NamedIntent("taker") Bucket("out")'));
+});
+
+test('two book orders cross only when the bid reaches the ask, and only for what both can do', () => {
+  const bk = (id: number, sell: string, buy: string, remaining: string, price: string): BookOrder => ({
+    id, maker: 'account_m', sell, buy, price, sellAmount: remaining, remaining, returned: '0', unclaimed: '0', makerFeeBps: 0, expiresAt: 0, open: true,
+  });
+  const ask = bk(1, X, Y, '100', '0.09');          // sells 100 X at 0.09 Y each
+  const bid = bk(2, Y, X, '5', '10');              // sells 5 Y, wants 10 X per Y: bids 0.1 Y per X
+  // The bid can take 50 X (5 Y at 10 X each). The solver pays 4.5 Y to the ask and gets 5 Y from the bid.
+  assert.deepEqual(planBookCross(ask, bid, '1000', '0.1', div18), { pay: '4.5', middle: '50', back: '5' });
+  // Limited by the solver's own funds: 0.9 Y buys 10 X, which the bid pays 1 Y for.
+  assert.deepEqual(planBookCross(ask, bid, '0.9', '0.01', div18), { pay: '0.9', middle: '10', back: '1' });
+  // Not worth the network fee, not crossing, same side, or the same order: nothing.
+  assert.equal(planBookCross(ask, bid, '1000', '0.6', div18), undefined);
+  assert.equal(planBookCross(ask, bk(3, Y, X, '5', '12'), '1000', '0', div18), undefined); // bids 0.0833 Y per X
+  assert.equal(planBookCross(ask, bk(4, X, Y, '5', '0.08'), '1000', '0', div18), undefined);
+  assert.equal(planBookCross(ask, ask, '1000', '0', div18), undefined);
+  // The other way round works too: front X to the bid first.
+  assert.deepEqual(planBookCross(bid, ask, '1000', '1', div18), { pay: '50', middle: '5', back: '55.555555555555555555' });
 });

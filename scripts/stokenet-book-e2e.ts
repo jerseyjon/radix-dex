@@ -4,6 +4,7 @@
 //   3. a market order larger than what is left takes the rest and the pool for the remainder;
 //   4. an order is cancelled and its tokens come back;
 //   5. an order priced below what the pool pays is bought by the solver and so fills at its price.
+// Uses its own order book (orderBookTest), not the one the test site trades on.
 // Needs scripts/stokenet-setup.ts to have run.
 import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -19,7 +20,7 @@ const s = JSON.parse(readFileSync('data/stokenet-keys.json', 'utf8'));
 const gw = new Gateway(net);
 const app = await createApp(loadConfig({
   DEX_NETWORK: 'stokenet', DEX_DATA_DIR: ':memory:', DEX_SOLVER_BADGE: s.badge, DEX_SOLVER_KEY_FILE: 'data/stokenet-solver.key',
-  DEX_REGISTRY: s.registry, DEX_ORDER_BOOK: s.orderBook, DEX_MARKETS_FILE: 'data/stokenet-markets.json', DEX_TAKER_FEE_BPS: '10', DEX_MAKER_FEE_BPS: '0',
+  DEX_REGISTRY: s.registry, DEX_ORDER_BOOK: s.orderBookTest, DEX_MARKETS_FILE: 'data/stokenet-markets.json', DEX_TAKER_FEE_BPS: '10', DEX_MAKER_FEE_BPS: '0',
 }));
 await app.data.refresh();
 const server = app.api.listen(0, '127.0.0.1');
@@ -45,7 +46,7 @@ if ((await balance(bob, s.tusd)) < 80) {
   console.log('topped up the buyer with ' + give + ' TUSD: ' + (await submitAndWait(gw, tx)).status);
 }
 const cfg = await json('/api/config');
-expect(cfg.orderBook?.component === s.orderBook && cfg.orderBook.receipts === s.orderReceipts && cfg.orderBook.makerFeeBps === 0, 'server reads the order book from the ledger (maker fee ' + cfg.orderBook?.makerFeeBps + ' bps)');
+expect(cfg.orderBook?.component === s.orderBookTest && cfg.orderBook.receipts === s.orderReceiptsTest && cfg.orderBook.makerFeeBps === 0, 'server reads the order book from the ledger (maker fee ' + cfg.orderBook?.makerFeeBps + ' bps)');
 const market = encodeURIComponent((await json('/api/markets'))[0].id);
 
 /** A wallet transaction, as the user's wallet would send it: the account pays its own fee. */
@@ -58,7 +59,7 @@ async function walletTx(key: Ed25519Key, account: string, manifest: string) {
 }
 async function placeInBook(sellAmount: string, price: number) {
   const before = (await json('/api/orders?account=' + alice)).filter((o: any) => o.kind === 'book').map((o: any) => o.bookId);
-  await walletTx(aliceKey, alice, bookPlaceManifest({ account: alice, book: s.orderBook, sell: net.xrd, sellAmount, buy: s.tusd, price: n(price), expiresAt: Math.floor(Date.now() / 1000) + 3600 }));
+  await walletTx(aliceKey, alice, bookPlaceManifest({ account: alice, book: s.orderBookTest, sell: net.xrd, sellAmount, buy: s.tusd, price: n(price), expiresAt: Math.floor(Date.now() / 1000) + 3600 }));
   await app.book!.refresh();
   const mine = (await json('/api/orders?account=' + alice)).filter((o: any) => o.kind === 'book' && !before.includes(o.bookId));
   if (mine.length !== 1) throw new Error('placed order not found');
@@ -127,7 +128,7 @@ const id = await placeInBook('300', mid);
 {
   const far = await placeInBook('100', mid * 3);
   const before = await balance(alice, net.xrd);
-  await walletTx(aliceKey, alice, bookCancelManifest({ account: alice, book: s.orderBook, receipts: s.orderReceipts, id: far }));
+  await walletTx(aliceKey, alice, bookCancelManifest({ account: alice, book: s.orderBookTest, receipts: s.orderReceiptsTest, id: far }));
   const o = await bookOrder(far);
   const back = (await balance(alice, net.xrd)) - before;
   expect(o?.status === 'cancelled' && back > 99 && back < 100, 'a cancelled order returns its 100 XRD (' + back.toFixed(4) + ' after the network fee) and reads as ' + o?.status);
@@ -144,6 +145,32 @@ const id = await placeInBook('300', mid);
   const aliceGot = (await balance(alice, s.tusd)) - before;
   expect(bought >= 1 && o?.status === 'filled', 'the solver bought the order when the pool paid more than it asked (' + o?.status + ', ' + bought + ' purchase(s))');
   expect(Math.abs(aliceGot - 150 * price) < 1e-6, 'the maker got exactly her price: ' + aliceGot.toFixed(6) + ' TUSD for 150 XRD');
+}
+
+// 6. Two book orders that cross: a seller asking a little over the pool, and a buyer bidding above that.
+{
+  const sellNow = (await quote(net.xrd, s.tusd, '100')) / 100;
+  const askPrice = Number(n(sellNow * 1.02));
+  const ask = await placeInBook('300', askPrice);
+  expect((await app.solver!.tick()).bookBought === 0, 'an ask 2% over what the pool pays rests');
+  // Bob bids 8% over what the pool pays, for 20 TUSD worth: enough of a gap to pay the network fee. The contract's price is XRD per TUSD.
+  const bidPrice = sellNow * 1.08, perTusd = n(1 / bidPrice);
+  await walletTx(bobKey, bob, bookPlaceManifest({ account: bob, book: s.orderBookTest, sell: s.tusd, sellAmount: '20', buy: net.xrd, price: perTusd, expiresAt: Math.floor(Date.now() / 1000) + 3600 }));
+  await app.book!.refresh();
+  const bid = (await json('/api/orders?account=' + bob)).find((o: any) => o.kind === 'book' && o.status === 'open');
+  const before = { at: await balance(alice, s.tusd), bx: await balance(bob, net.xrd) };
+  const tick = await app.solver!.tick();
+  const a = await bookOrder(ask), b = (await json('/api/orders?account=' + bob)).find((o: any) => o.bookId === bid?.bookId);
+  const xrd = 20 * Number(perTusd);
+  expect(tick.bookCrossed === 1 && b?.status === 'filled', 'the solver crossed the two orders (' + tick.bookCrossed + '); the bid is ' + b?.status);
+  expect(Math.abs((await balance(bob, net.xrd)) - before.bx - xrd) < 1e-6, 'the buyer got ' + xrd.toFixed(4) + ' XRD, exactly their bid price');
+  expect(Math.abs((await balance(alice, s.tusd)) - before.at - xrd * askPrice) < 1e-6, 'the seller got ' + (xrd * askPrice).toFixed(6) + ' TUSD, exactly their ask price');
+  expect(a?.status === 'open' && Math.abs(Number(a.remaining) - (300 - xrd)) < 1e-6, 'the ask is part filled: ' + a?.remaining + ' XRD left');
+  const hist = await json('/api/history?account=' + alice);
+  expect(hist.some((t: any) => t.book === ask && Math.abs(Number(t.sellAmount) - xrd) < 1e-6 && t.sell === net.xrd), 'the sale shows in the seller\'s trade history against order #' + ask);
+  const placed = (await json('/api/orders?account=' + alice)).find((o: any) => o.bookId === ask);
+  expect(placed?.createdAt > Date.now() / 1000 - 600, 'the order shows the time it was placed');
+  await walletTx(aliceKey, alice, bookCancelManifest({ account: alice, book: s.orderBookTest, receipts: s.orderReceiptsTest, id: ask }));
 }
 server.close();
 console.log(process.exitCode ? 'SOME CHECKS FAILED' : 'ALL CHECKS PASSED');
