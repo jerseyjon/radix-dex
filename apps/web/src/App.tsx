@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Depth } from '@radix-dex/core/browser';
-import { type Candle, type MarketSummary, type MarketTrade, type OrderView, type ServerConfig, type TradeView, STATIC, api } from './api';
+import { type Candle, type MarketSummary, type MarketTrade, type OrderView, type ServerConfig, type TradeView, ApiError, STATIC, api } from './api';
 import { Book } from './Book';
 import { Chart } from './Chart';
 import { DepthChart } from './DepthChart';
@@ -8,7 +8,7 @@ import { fmtPrice, fmtTime, fmtUsd, shortAddr } from './format';
 import { Markets } from './Markets';
 import { OrderForm } from './OrderForm';
 import { Orders } from './Orders';
-import { type Keyed, backoffMs, forKey, headerChange, pollGuard } from './live';
+import { type Keyed, forKey, headerChange, pollGuard, retryWaitMs } from './live';
 import { Icon, Logo, Mark, TabPanel, Tabs } from './ui';
 import { type WalletAccount, getWallet } from './wallet';
 
@@ -83,7 +83,8 @@ export function App() {
         setSelected((s) => (s && m.some((x) => x.id === s) ? s : (m.find((x) => x.base.address === c.xrd) ?? m[0])?.id));
       }).catch((e: Error) => {
         if (!live) return;
-        const wait = backoffMs(attempt);
+        // Never sooner than the server asked (Retry-After on a 429).
+        const wait = retryWaitMs(attempt, e instanceof ApiError ? e.retryAfterSec : undefined);
         attempt++;
         setLoadError({ message: e.message, retryInSec: Math.round(wait / 1000), attempt });
         timer = setTimeout(go, wait);
@@ -94,6 +95,7 @@ export function App() {
   }, [reload]);
 
   const market = useMemo(() => markets.find((m) => m.id === selected), [markets, selected]);
+  const listedPools = useMemo(() => new Set(markets.flatMap((m) => m.pools ?? [])), [markets]);
   const marketId = market?.id;
   const depth = forKey(depthSet, marketId);
   const marketTrades = forKey(marketTradeSet, marketId);
@@ -249,7 +251,7 @@ export function App() {
 
       <div className="side">
         <Book depth={depth} trades={marketTrades} explorer={config.networkId === 1 ? 'https://dashboard.radixdlt.com' : 'https://stokenet-dashboard.radixdlt.com'} baseSymbol={market.base.symbol} quoteSymbol={market.quote.symbol} onPick={onPick} />
-        <OrderForm market={market} depth={depth} config={config} wallet={wallet} account={account} balances={balances} picked={picked}
+        <OrderForm market={market} depth={depth} config={config} wallet={wallet} account={account} balances={balances} picked={picked} listedPools={listedPools}
           onDone={(m) => { setToast(m); void refreshAccount(); }} />
       </div>
       {toast && <div className="toast" role="status"><Icon name="info" size={15} /><span>{toast}</span></div>}

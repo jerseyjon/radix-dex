@@ -1,7 +1,7 @@
 /// <reference types="node" />
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { backoffMs, forKey, headerChange, pollGuard } from '../src/live.ts';
+import { backoffMs, forKey, headerChange, pollGuard, retryAfterSec, retryWaitMs } from '../src/live.ts';
 
 test('a reply for another market is never shown', () => {
   assert.equal(forKey({ key: 'A', value: 1 }, 'A'), 1);
@@ -60,4 +60,18 @@ test('no trades for over a day means no change', () => {
   const now = 100 * 86_400;
   const old = [{ time: now - 5 * 86_400, open: 1, close: 1 }, { time: now - 3 * 86_400, open: 1, close: 4 }];
   assert.equal(headerChange(old, '1h', now)!.pct, 0);
+});
+
+test('Retry-After is read in seconds or as a date, and the retry never comes sooner', () => {
+  assert.equal(retryAfterSec('60'), 60);
+  assert.equal(retryAfterSec(' 5 '), 5);
+  assert.equal(retryAfterSec(null), undefined);
+  assert.equal(retryAfterSec('soon'), undefined);
+  assert.equal(retryAfterSec('0'), undefined);
+  assert.equal(retryAfterSec('99999'), 600);
+  const now = Date.parse('2026-11-22T08:00:00Z');
+  assert.equal(retryAfterSec('Sun, 22 Nov 2026 08:00:30 GMT', now), 30);
+  assert.equal(retryWaitMs(0, 60), 60_000);
+  assert.equal(retryWaitMs(0), 1000);
+  assert.equal(retryWaitMs(10, 5), 30_000);
 });

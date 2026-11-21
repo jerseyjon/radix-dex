@@ -87,34 +87,47 @@ export interface LimitTerms {
 /**
  * The amounts of a limit order from the typed price (quote per base) and size (base).
  * A buy sells `price × amount` of quote (rounded down to the quote token's places, so it never
- * spends more than typed) for `amount` of base. A sell sells `amount` for `price × amount` of quote.
+ * spends more than typed) for `amount` of base. A sell sells `amount` (rounded down to the base
+ * token's places) for `price ×` that amount of quote.
  */
 export function limitTerms(side: 'buy' | 'sell', price: string, amount: string, sellPlaces = MAX_PLACES): LimitTerms | undefined {
   const p = parsePlain(price), a = parsePlain(amount);
   if (!p || !a || p.lte(0) || a.lte(0)) return undefined;
-  const value = p.times(a);
-  const sellAmount = side === 'buy' ? positivePlain(value, sellPlaces) : positivePlain(a, sellPlaces);
-  const gross = side === 'buy' ? positivePlain(a) : positivePlain(value);
+  if (side === 'buy') {
+    const sellAmount = positivePlain(p.times(a), sellPlaces), gross = positivePlain(a);
+    return sellAmount && gross ? { sellAmount, gross } : undefined;
+  }
+  // A sell is priced on the amount really sold, after rounding to the token's places.
+  const sellAmount = positivePlain(a, sellPlaces);
+  const gross = sellAmount ? positivePlain(p.times(sellAmount)) : undefined;
   return sellAmount && gross ? { sellAmount, gross } : undefined;
 }
 
 export interface Fees { network: Dec; service: Dec }
 
 /**
- * The solver's fees on a fill, in the token bought. `gasInBuyToken` is the route's measured network
- * fee from the quote; without it, `gasXrd` is used when XRD is bought, or converted at the order's own
- * rate when XRD is sold; otherwise there is no network fee to allow for.
+ * The solver's fees on a fill, in the token bought. `gasInBuyToken` is the route's network fee from
+ * the quote: for a signed limit order its allowance (`gasAllowanceInBuyToken`, the estimate plus 25%),
+ * for a market order its estimate. Without it, `gasXrd × margin` is used when XRD is bought, or
+ * converted at the order's own rate when XRD is sold; otherwise there is no network fee to allow for
+ * (the caller must not sign such an order: see `networkFeeKnown`).
  */
 export function solverFees(o: {
-  gross: DecIn; feeBps: number; gasInBuyToken?: string | null; gasXrd: string;
+  gross: DecIn; feeBps: number; gasInBuyToken?: string | null; gasXrd: string; margin?: number;
   buyIsXrd: boolean; sellIsXrd: boolean; sellAmount: string;
 }): Fees {
   const gross = new Decimal(o.gross);
+  const fallbackXrd = new Decimal(o.gasXrd).times(String(o.margin ?? 1));
   const network = o.gasInBuyToken != null ? new Decimal(o.gasInBuyToken)
-    : o.buyIsXrd ? new Decimal(o.gasXrd)
-    : o.sellIsXrd ? gross.div(o.sellAmount).times(o.gasXrd)
+    : o.buyIsXrd ? fallbackXrd
+    : o.sellIsXrd ? gross.div(o.sellAmount).times(fallbackXrd)
     : new Decimal(0);
   return { network, service: gross.times(o.feeBps).div(10_000) };
+}
+
+/** Can the network fee be priced in the token bought: a route figure from the quote, or XRD on one side? */
+export function networkFeeKnown(o: { gasInBuyToken?: string | null; buyIsXrd: boolean; sellIsXrd: boolean }): boolean {
+  return o.gasInBuyToken != null || o.buyIsXrd || o.sellIsXrd;
 }
 
 /** The signed minimum of a limit order: gross less the network and service fees, rounded down. Undefined if not positive. */

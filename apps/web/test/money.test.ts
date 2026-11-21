@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Decimal } from '@radix-dex/core/browser';
 import {
-  bookContractPrice, exceeds, limitTerms, minAfterFees, normaliseInput, numberToPlain, parsePlain, placesFor,
+  bookContractPrice, exceeds, limitTerms, minAfterFees, networkFeeKnown, normaliseInput, numberToPlain, parsePlain, placesFor,
   shareOf, solverFees, toPlain, withSlippage,
 } from '../src/money.ts';
 
@@ -73,6 +73,23 @@ test('limit terms are exact for 18-decimal amounts and extreme prices', () => {
   assert.deepEqual(limitTerms('buy', '1', '0.5', 0), undefined);
   assert.equal(limitTerms('buy', '0', '1'), undefined);
   assert.equal(limitTerms('buy', '1e3', '1'), undefined);
+});
+
+test('a sell rounded to the token\'s places is priced on what is really sold', () => {
+  assert.deepEqual(limitTerms('sell', '2', '1.2345678', 6), { sellAmount: '1.234567', gross: '2.469134' });
+  assert.equal(limitTerms('sell', '2', '0.0000001', 6), undefined);
+});
+
+test('the fallback network allowance carries the margin; unpriced pairs are flagged', () => {
+  // No route figure, buying XRD: gasXrd 1.5 × 1.25 = 1.875.
+  const f = solverFees({ gross: '100', feeBps: 10, gasXrd: '1.5', margin: 1.25, buyIsXrd: true, sellIsXrd: false, sellAmount: '5' });
+  assert.equal(f.network.toFixed(), '1.875');
+  assert.equal(minAfterFees('100', f), '98.025');
+  // Selling XRD: converted at the order's own rate (2 per XRD).
+  assert.equal(solverFees({ gross: '100', feeBps: 0, gasXrd: '1.5', margin: 1.25, buyIsXrd: false, sellIsXrd: true, sellAmount: '50' }).network.toFixed(), '3.75');
+  assert.equal(networkFeeKnown({ gasInBuyToken: null, buyIsXrd: false, sellIsXrd: false }), false);
+  assert.equal(networkFeeKnown({ gasInBuyToken: '0.1', buyIsXrd: false, sellIsXrd: false }), true);
+  assert.equal(networkFeeKnown({ buyIsXrd: true, sellIsXrd: false }), true);
 });
 
 test('signed minimum is gross less fees, exactly', () => {

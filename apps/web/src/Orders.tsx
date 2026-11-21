@@ -34,7 +34,8 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
   const describe = (o: OrderView) => {
     const m = markets.find((x) => (x.base.address === o.sell && x.quote.address === o.buy) || (x.base.address === o.buy && x.quote.address === o.sell));
     const selling = m ? m.base.address === o.sell : true;
-    const gross = Number(o.limitBuyAmount ?? o.minBuyAmount); // the order's price times its size
+    // The order's price times its size; for a fill, what the trade really produced before fees.
+    const gross = Number((o.status === 'filled' ? o.gross : undefined) ?? o.limitBuyAmount ?? o.minBuyAmount);
     const size = selling ? Number(o.sellAmount) : gross;
     const price = selling ? gross / Number(o.sellAmount) : Number(o.sellAmount) / gross;
     return { pair: m ? `${m.base.symbol}/${m.quote.symbol}` : `${sym(o.sell)}→${sym(o.buy)}`, side: selling ? 'Sell' : 'Buy', size, price, baseSym: m?.base.symbol ?? sym(o.sell) };
@@ -46,6 +47,8 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
       const part = `${fmtAmount(o.sold)} of ${fmtAmount(o.sellAmount)} ${sym(o.sell)} sold`;
       return o.status === 'expired' ? `expired, ${part}: cancel to take back the rest` : `fills in parts: ${part}`;
     }
+    // A fill has been sent and the ledger has not answered yet: it may well have filled.
+    if (o.pending) return 'filling: waiting for the ledger, check Trades';
     if (!o.outlook) return 'checking…';
     const d = describe(o), sell = Number(o.sellAmount), avail = Number(o.outlook.available), need = Number(o.outlook.needed);
     if (avail >= need) return 'filling now';
@@ -58,7 +61,8 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
 
   // Signed orders can also be cancelled on the ledger, from the wallet, when this browser holds the
   // order's cancel secret: then no one can fill it, whatever the server does.
-  const canLedgerCancel = (o: OrderView) => o.kind !== 'book' && o.kind !== 'market' && o.status === 'open' && Boolean(registry && wallet && secrets.get(o.id));
+  // Only for an order signed with the registry check (`registry: true`); servers that do not say are trusted to have used it.
+  const canLedgerCancel = (o: OrderView) => o.kind !== 'book' && o.kind !== 'market' && o.status === 'open' && o.registry !== false && Boolean(registry && wallet && secrets.get(o.id));
   async function cancelOnLedger(o: OrderView) {
     setError(undefined); setNote(undefined);
     const secret = secrets.get(o.id);
@@ -134,7 +138,7 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
                     <td className="r">{o.kind === 'market' ? 'Market' : fmtPrice(d.price)}</td>
                     <td className="r">{fmtAmount(d.size)} {d.baseSym}</td>
                     {tab === 'open' && <td className="muted">{waiting(o)}</td>}
-                    <td>{tab === 'open' ? (o.expiresAt ? fmtTime(o.expiresAt) : 'Never') : o.status === 'filled' ? `Filled${typeof o.filledAt === 'number' && o.filledAt > 0 ? ` ${fmtTime(o.filledAt)}` : ''}, received ${fmtAmount(o.received)} ${sym(o.buy)}` : o.status[0]!.toUpperCase() + o.status.slice(1) + (o.kind === 'book' && Number(o.sold) > 0 ? `, after ${fmtAmount(o.sold)} ${sym(o.sell)} sold for ${fmtAmount(o.received)} ${sym(o.buy)}` : '')}</td>
+                    <td>{tab === 'open' ? (o.expiresAt ? fmtTime(o.expiresAt) : 'Never') : o.status === 'filled' ? `Filled${typeof o.filledAt === 'number' && o.filledAt > 0 ? ` ${fmtTime(o.filledAt)}` : ''}, received ${fmtAmount(o.received)} ${sym(o.buy)}` : o.status[0]!.toUpperCase() + o.status.slice(1) + (o.kind === 'book' && Number(o.sold) > 0 ? `, after ${fmtAmount(o.sold)} ${sym(o.sell)} sold for ${fmtAmount(o.received)} ${sym(o.buy)}` : '') + (o.pending ? ': a fill already sent may still complete, check Trades' : '')}</td>
                     <td className="r actions">{tab === 'open' && <>
                       <button className="btn-ghost" onClick={() => cancel(o)} title={o.kind === 'book' ? 'Cancel with a wallet transaction and take back what has not sold' : 'Ask the server to drop this order (free)'}>Cancel</button>
                       {canLedgerCancel(o) && <button className="btn-ghost" onClick={() => cancelOnLedger(o)} title="Record the cancel on the ledger with a wallet transaction (small network fee): the order can then never be filled, whatever the server does">On ledger</button>}

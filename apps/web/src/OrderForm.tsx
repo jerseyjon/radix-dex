@@ -4,8 +4,8 @@ import { type MarketSummary, type QuoteResult, type ServerConfig, STATIC, api } 
 import { estimate } from './book';
 import { cleanAmount, fmtAmount, fmtPrice } from './format';
 import {
-  bookContractPrice, exceeds, limitTerms, minAfterFees, normaliseInput, numberToPlain, parsePlain, placesFor, shareOf,
-  solverFees, toPlain, withSlippage,
+  bookContractPrice, exceeds, limitTerms, minAfterFees, networkFeeKnown, normaliseInput, numberToPlain, parsePlain, placesFor, placesIn,
+  positivePlain, shareOf, solverFees, toPlain, withSlippage,
 } from './money';
 import { Icon } from './ui';
 import type { Wallet } from './wallet';
@@ -31,6 +31,8 @@ function quoteFor(q: QuoteResult | undefined, sell: string, buy: string, amount:
 export function OrderForm(props: {
   market: MarketSummary; depth: Depth | undefined; config: ServerConfig; wallet: Wallet | undefined; account: string | undefined;
   balances: Record<string, string>; picked: { price: number; n: number } | undefined; onDone: (message: string) => void;
+  /** Every pool the site lists (all markets): a quoted route may only use these. */
+  listedPools: Set<string>;
 }) {
   const { market, depth, config, wallet, account, balances } = props;
   const [side, setSide] = useState<Side>('buy');
@@ -63,8 +65,11 @@ export function OrderForm(props: {
 
   // A limit order's terms, worked out exactly: what is sold, and the price times size it must fetch.
   const terms = useMemo(() => (kind === 'limit' ? limitTerms(side, price, amount, sellPlaces) : undefined), [kind, side, price, amount, sellPlaces]);
-  // What the user is selling, as a clean decimal string.
-  const sellAmount = kind === 'market' ? cleanAmount(side === 'buy' ? total : amount) : terms?.sellAmount;
+  // What the user is selling, as a clean decimal string, rounded down to the places the token allows
+  // (the server refuses more, and the ledger cannot withdraw them).
+  const typedSell = kind === 'market' ? (side === 'buy' ? total : amount) : side === 'sell' ? amount : undefined;
+  const sellAmount = kind === 'market' ? positivePlain(cleanAmount(typedSell ?? ''), sellPlaces) : terms?.sellAmount;
+  const roundedSell = typedSell !== undefined && parsePlain(typedSell) && placesIn(typedSell.replace(/,/g, '')) > sellPlaces ? sellAmount : undefined;
   const limitGross = terms?.gross;
 
   const bookEstimate = kind === 'market' && sellAmount ? estimate(depth, side, Number(sellAmount)) : undefined;
@@ -75,7 +80,12 @@ export function OrderForm(props: {
     if (!sellAmount || STATIC) return;
     let live = true;
     const t = setTimeout(() => {
-      api.quote(sellTok.address, buyTok.address, sellAmount).then((q) => live && setQuote(q)).catch((e) => live && setQuoteError(e.message));
+      api.quote(sellTok.address, buyTok.address, sellAmount).then((q) => {
+        if (!live) return;
+        // A pool short of liquidity hands part of the input back: say so rather than wait for a quote that never matches.
+        if (new Decimal(q.sellAmount).lt(sellAmount)) setQuoteError(`The pools can take only ${fmtAmount(q.sellAmount)} of ${fmtAmount(sellAmount)} ${sellTok.symbol}`);
+        else setQuote(q);
+      }).catch((e) => live && setQuoteError(e.message));
     }, 450);
     return () => { live = false; clearTimeout(t); };
   }, [kind, sellAmount, sellTok.address, buyTok.address]);
@@ -90,15 +100,23 @@ export function OrderForm(props: {
   // with the service fee, out of what the order buys. All of this is exact decimal arithmetic.
   const lo = config.limitOrders.enabled ? config.limitOrders : undefined;
   const viaSolver = Boolean(lo?.filling);
-  const feesOn = (gross: string | undefined) => {
+  const buyIsXrd = buyTok.address === config.xrd, sellIsXrd = sellTok.address === config.xrd;
+  const feesOn = (gross: string | undefined, gasInBuyToken: string | null | undefined, margin: number) => {
     if (gross === undefined || !lo || !sellAmount) return undefined;
-    return solverFees({ gross, feeBps: config.feeBps, gasInBuyToken: quote?.gasInBuyToken, gasXrd: lo.gasXrd,
-      buyIsXrd: buyTok.address === config.xrd, sellIsXrd: sellTok.address === config.xrd, sellAmount });
+    return solverFees({ gross, feeBps: config.feeBps, gasInBuyToken, gasXrd: lo.gasXrd, margin, buyIsXrd, sellIsXrd, sellAmount });
   };
-  const limitFees = feesOn(limitGross);
+  // A signed limit order allows the route's estimate plus the server's margin (25%) for the network
+  // fee: the solver fills it at its price while the allowance covers 75% of its estimate then. The
+  // fee shown is the allowance, so the form's figures are exactly what is signed.
+  const margin = lo?.gasAllowanceMargin ?? 1;
+  const limitAllowance = quote?.gasAllowanceInBuyToken
+    ?? (quote?.gasInBuyToken != null ? new Decimal(quote.gasInBuyToken).times(String(margin)).toDecimalPlaces(18, Decimal.ROUND_UP).toFixed() : null);
+  const limitFeeKnown = networkFeeKnown({ gasInBuyToken: limitAllowance, buyIsXrd, sellIsXrd });
+  const limitFees = feesOn(limitGross, limitAllowance, margin);
   const limitMinBuy = limitGross && limitFees ? minAfterFees(limitGross, limitFees) : undefined;
   const fillsNow = kind === 'limit' && quote && limitGross ? new Decimal(quote.buyAmount).gte(limitGross) : undefined;
-  const marketFees = kind === 'market' && viaSolver && quote ? feesOn(quote.buyAmount) : undefined;
+  // A market order signs its expected proceeds less the estimated fee, less the slippage allowance.
+  const marketFees = kind === 'market' && viaSolver && quote ? feesOn(quote.buyAmount, quote.gasInBuyToken, 1) : undefined;
   const marketNet = marketFees && quote ? minAfterFees(quote.buyAmount, marketFees) : undefined;
   const marketMinBuy = kind === 'market' && viaSolver && marketNet ? withSlippage(marketNet, slippage) : undefined;
   const expectedOut = marketNet !== undefined ? Number(marketNet) : marketFees ? 0 : quote ? Number(quote.buyAmount) : bookEstimate?.received;
@@ -110,9 +128,12 @@ export function OrderForm(props: {
     if (kind !== 'market' || viaSolver || !quote) return undefined;
     try {
       const path = routePath(quote.route, sellTok.address);
-      return path[path.length - 1] === buyTok.address ? undefined : `The quoted route does not end in ${buyTok.symbol}; not signing it`;
+      if (path[path.length - 1] !== buyTok.address) return `The quoted route does not end in ${buyTok.symbol}; not signing it`;
+      // Every pool must be one the site lists (a route through XRD uses another market's pool).
+      if (!quote.route.every((p) => props.listedPools.has(p.address))) return 'The quoted route uses a pool this site does not list; not signing it';
+      return undefined;
     } catch { return 'The quoted route does not connect the two tokens; not signing it'; }
-  }, [kind, viaSolver, quote, sellTok.address, buyTok.address, buyTok.symbol]);
+  }, [kind, viaSolver, quote, sellTok.address, buyTok.address, buyTok.symbol, props.listedPools]);
 
   // The order-book contract's price for this order, or why it cannot be expressed.
   const bookPrice = useBook && price ? bookContractPrice(side, price) : undefined;
@@ -146,6 +167,9 @@ export function OrderForm(props: {
   else if (kind === 'market' && viaSolver && !marketMinBuy) blocker = 'Too small for the slippage limit';
   else if (routeProblem) blocker = 'Route refused';
   else if (kind === 'limit' && !useBook && !config.limitOrders.enabled) blocker = 'Only order-book orders are enabled';
+  // A whole-only order signs the route's network allowance: wait for the quote that gives it.
+  else if (kind === 'limit' && !useBook && !quote && !quoteError) blocker = 'Getting a quote…';
+  else if (kind === 'limit' && !useBook && !limitFeeKnown) blocker = 'Cannot price the network fee for this pair now';
   else if (kind === 'limit' && !useBook && limitGross && !limitMinBuy) blocker = 'Too small to cover the network fee';
   else if (bookPrice && !bookPrice.ok) blocker = 'Price cannot be held exactly';
 
@@ -174,13 +198,16 @@ export function OrderForm(props: {
         props.onDone('Market order sent, filling…');
         const deadline = placed.expiresAt * 1000;
         let outcome = 'Market order not filled: the price moved beyond your slippage limit';
+        let pending = false;
         while (Date.now() < deadline) {
           await new Promise((r) => setTimeout(r, 2000));
           const mine = (await api.orders(account).catch(() => [])).find((o) => o.id === placed.id);
-          if (mine?.status === 'filled') { outcome = `Market order filled: received ${fmtAmount(mine.received)} ${buyTok.symbol}`; break; }
-          if (mine && mine.status !== 'open') break;
+          if (mine?.status === 'filled') { outcome = `Market order filled: received ${fmtAmount(mine.received)} ${buyTok.symbol}`; pending = false; break; }
+          // A fill transaction is in flight: its outcome comes from the ledger, so do not call it failed.
+          pending = Boolean(mine?.pending);
+          if (mine && mine.status !== 'open' && !pending) break;
         }
-        props.onDone(outcome);
+        props.onDone(pending ? 'Market order still being settled on the ledger: check Trades in a minute' : outcome);
       } else if (kind === 'market') {
         if (!quote || routeProblem) { setError(routeProblem ?? 'The quote has changed; try again.'); return; }
         const minBuy = withSlippage(quote.buyAmount, slippage);
@@ -244,6 +271,7 @@ export function OrderForm(props: {
         <label className="field"><span>Spend</span><input inputMode="decimal" autoComplete="off" value={total} onChange={num(setTotal)} placeholder="0.0" /><em>{quoteTok.symbol}</em></label>
       )}
       {hint && <p className="hint" role="status">{hint}</p>}
+      {!hint && roundedSell && <p className="hint" role="status">{sellTok.symbol} allows {sellPlaces} decimal places: {roundedSell} will be used</p>}
       <div className="pcts" role="group" aria-label="Share of available balance">{[0.25, 0.5, 0.75, 1].map((p) => <button key={p} onClick={() => setPct(p)} disabled={!(sellBalance > 0)}>{p * 100}%</button>)}</div>
 
       {kind === 'market' ? (
@@ -279,9 +307,10 @@ export function OrderForm(props: {
           {book && <div><dt>Fills</dt><dd className="seg mini" role="group" aria-label="How the order fills"><button aria-pressed="false" onClick={() => setInBook(true)}>In parts</button><button className="on" aria-pressed="true">Whole only</button></dd></div>}
           <div><dt>You pay</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>At your price you get</dt><dd>{limitGross ? `${fmtAmount(limitGross)} ${buyTok.symbol}` : '—'}</dd></div>
-          <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(feeTotal(limitFees))} ${buyTok.symbol} (network fee + ${pct(config.feeBps)})` : '—'}</dd></div>
+          <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(feeTotal(limitFees))} ${buyTok.symbol} (network fee allowance + ${pct(config.feeBps)})` : '—'}</dd></div>
           <div><dt>If another trader takes it</dt><dd>{(config.makerFeeBps ?? 0) > 0 ? `Fee ${pct(config.makerFeeBps ?? 0)}, no network fee` : 'No fee: you get your full price'}</dd></div>
           <div><dt>You receive at least</dt><dd>{limitMinBuy ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
+          {!limitFeeKnown && quoteError && <div><dt>Quote</dt><dd className="warn">{quoteError}</dd></div>}
           <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
           <div><dt>Expires in</dt><dd><select className="select" aria-label="Expires in" value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
         </dl>

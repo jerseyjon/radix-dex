@@ -23,6 +23,19 @@ export function backoffMs(attempt: number, baseMs = 1000, maxMs = 30_000): numbe
   return Math.min(maxMs, baseMs * 2 ** Math.max(0, Math.min(attempt, 20)));
 }
 
+/** Seconds from a `Retry-After` header (seconds or an HTTP date), capped at ten minutes; undefined if absent or unreadable. */
+export function retryAfterSec(h: string | null, now = Date.now()): number | undefined {
+  if (!h) return undefined;
+  const t = h.trim();
+  const n = /^\d+$/.test(t) ? Number(t) : (Date.parse(t) - now) / 1000;
+  return Number.isFinite(n) && n > 0 ? Math.min(600, Math.ceil(n)) : undefined;
+}
+
+/** Wait before retry number `attempt`: the backoff, or longer if the server asked for longer. */
+export function retryWaitMs(attempt: number, retryAfter?: number): number {
+  return Math.max(backoffMs(attempt), (retryAfter ?? 0) * 1000);
+}
+
 export const RESOLUTION_SEC: Record<string, number> = { '15m': 900, '1h': 3600, '4h': 14_400, '1d': 86_400, '1w': 604_800 };
 
 interface Bar { time: number; open: number; close: number }
