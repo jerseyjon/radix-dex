@@ -4,8 +4,11 @@ Working name: **radix-dex** (to be named). Background and reasons: [REVIEW.md](R
 
 ## Principles
 
-1. **Hold no user funds.** No pool, no escrow, no order-book vault. The only on-ledger code
-   we publish (the order registry) stores hashes and nothing else.
+1. **Hold as little user money as possible.** Signed ("Whole only") orders and market orders
+   leave the user's tokens in their own account until the fill, and the order registry stores
+   hashes and nothing else. The one exception is the on-ledger `OrderBook`, which holds the tokens
+   of "In parts" orders until they sell or are cancelled (see "Partial fills" below). Our own
+   `Pool` is not deployed on mainnet.
 2. **The user's price floor is enforced by the Radix Engine**, in the manifest they sign,
    not by trusting our backend.
 3. **Depend on the ledger, not on other people's APIs.** Quotes are transaction previews
@@ -20,7 +23,9 @@ apps/web        Trading terminal (React + Vite). Talks to the wallet and to apps
 apps/server     HTTP API: markets, candles, quotes, depth, orders. Runs the solver loop.
 packages/core   Shared library: Gateway client, venue adapters, manifest builders,
                 order (subintent) construction and validation, quoting.
-scrypto/order-registry   Cancellation registry blueprint. Holds no resources.
+scrypto/dex-contracts    OrderRegistry (hard cancel, holds no resources), OrderBook (resting
+                         orders with partial fills, holds makers' tokens), Pool (not deployed
+                         on mainnet).
 ```
 
 ### Venues (liquidity sources)
@@ -31,7 +36,7 @@ bucket through one pool. It does **not** re-implement pool maths.
 | Venue | Swap call | Notes |
 |---|---|---|
 | Ociswap Basic / Precision | `pool.swap(bucket)` | allow-listed packages only |
-| DefiPlaza | `dex.swap(bucket, output_resource)` | |
+| DefiPlaza | `pair.swap(bucket)` on the pair component | can hand back part of the input when short of liquidity |
 | CaviarNine Shape | `pool.swap(bucket)` | later; team gone, admin badge live |
 
 ### Quoting by preview
@@ -40,7 +45,7 @@ To quote "sell X of A for B on pool P" the server previews a real manifest on th
 (`/transaction/preview`, free credit, signatures assumed) that withdraws A from a large
 holder, swaps through P and reads how much B comes out. This is exact for every pool type,
 including fees and tick crossings, and needs no pool maths of our own. Results are cached
-per ledger state for a few seconds.
+for a few seconds by time, not by ledger state (quotes 8 s, depth 20 s).
 
 **Depth ladder**: the same preview at a ladder of sizes on each side gives marginal prices,
 shown as order-book levels and merged with resting limit orders.
@@ -50,8 +55,10 @@ across pools comes later.
 
 ### Market orders
 
-An ordinary wallet transaction: withdraw, swap through the chosen pool(s), assert the
-minimum received (`ASSERT_WORKTOP_CONTAINS`), deposit. The user pays the network fee.
+With a solver running, a market order is a short-lived signed subintent filled by the solver
+(see "How orders are matched" below). Only where no solver runs does the site fall back to an
+ordinary wallet transaction: withdraw, swap through the chosen pool(s), assert the minimum
+received (`ASSERT_WORKTOP_CONTAINS`), deposit, with the user paying the network fee.
 
 ### Limit orders (subintents)
 
@@ -74,17 +81,31 @@ YIELD_TO_PARENT;
   instruction by instruction with this template. Anything else is rejected.
 - **Fill**: the solver builds a root transaction that yields to the order, receives the
   sell bucket, swaps it through pools (or hands it to a crossing order), returns the buy
-  resource, and keeps the fee. It previews first and submits only if the preview succeeds.
+  resource, and keeps the fee. Before sending, it previews that exact transaction, with the
+  signed orders as children, on the Gateway's `/transaction/preview-v2` (no free credit, no
+  assumed signatures) and sends it only if the preview succeeds. The toolkit cannot build a
+  preview payload, so `previewTransactionV2Hex` in `packages/core/src/tx.ts` writes it out.
+- **Outcomes**: each sent transaction is recorded before it goes out. If its outcome is not
+  known (a timeout, a status error, a restart), its orders are not tried again until a later
+  pass reads the outcome from the ledger; a committed fill is recorded even if the order had
+  meanwhile been marked expired or cancelled.
+- **Loss limit**: network fees paid on transactions that failed on ledger are summed over the
+  last hour; past `DEX_FAILED_FEE_LIMIT_XRD` (3 XRD) the solver sends nothing until the hour has
+  passed. Failed fills are counted per order (three and it is dropped) and per account (six in
+  a day and its orders are refused and skipped).
+- **Which orders**: only orders, and book orders, whose two tokens form a market the site lists.
+  An order key may be used by one order only, and one cancelled in the registry is refused.
 - **Price improvement**: the solver returns *everything* the route produced, less the
   configured fee and the network cost, not merely the user's minimum.
-- **Order vs order**: two crossing orders are settled in one transaction; each receives the
-  other's bucket (up to 32 orders per transaction).
+- **Order vs order**: a taker takes up to four resting orders (signed or in the book) and
+  pools for the rest, in one transaction.
 - **All or nothing**: a subintent fills whole or not at all. The UI says so. Large orders
   can be placed as several slices (one signature each).
 
 ### Cancelling
 
-- **Soft cancel**: the server deletes the order. Instant, free, relies on the server.
+- **Soft cancel**: the server marks the order cancelled and stops filling it. Instant, free,
+  relies on the server. (A fill already in flight may still commit; the ledger then wins.)
 - **Hard cancel**: the order manifest calls `registry.assert_live(key)` where
   `key = hash(secret)`. The secret is generated in the browser when the order is made.
   Calling `registry.cancel(secret)` marks the key dead for ever, so the signed order can
@@ -97,7 +118,8 @@ YIELD_TO_PARENT;
 One Ed25519 key on the server: it notarises fill transactions, holds the solver badge and a
 small XRD float for fees and the collected fees. If stolen, the thief can take that float
 and can fill open orders at the users' own limit prices instead of better ones. They
-cannot take anything a user has not signed for. Float is swept regularly.
+cannot take anything a user has not signed for. The float is swept by hand with
+`scripts/mainnet-withdraw.ts`.
 
 ### Data
 
@@ -144,9 +166,10 @@ against the caller; enforce a minimum trade/contribution size so rounding gain i
 below the fee; keep reserves in internal accounting, never infer price from vault
 balances; no flash loans that can touch pricing state; independent audit before mainnet.
 
-## Out of scope for v1
+## Out of scope for now
 
-Own pools, escrow order book, partial fills, stop/trigger orders, margin, fiat.
+Our own pools on mainnet, stop/trigger orders, margin, fiat. (The escrow order book with partial
+fills, once out of scope, is live: see below.)
 
 ## How orders are matched (since 21 Nov 2026)
 
@@ -155,18 +178,33 @@ Every order, market or limit, is a signed subintent filled by the solver. Each o
 - **the trigger** (`limitBuyAmount`): its price times its size. The solver fills the order once the
   market pays that much for the whole order. It is the price shown in the book. It is not signed:
   it is the user's instruction to the solver, and the server refuses a trigger below the signed minimum.
-- **the signed minimum** (`minBuyAmount`): the trigger less the fee allowance (the network fee, about
-  1 XRD, plus the service fee). The Radix Engine enforces it, and it is the figure the wallet shows.
+- **the signed minimum** (`minBuyAmount`): the trigger less the fee allowance (the network fee
+  allowance for the route, which `/api/quote` gives as `gasAllowanceInBuyToken`: the solver's
+  estimate with a 25% margin, plus the service fee). The Radix Engine enforces it, and it is the
+  figure the wallet shows. If the solver's estimate has since risen above the allowance, it still
+  fills the order at its trigger as long as the allowance covers 75% of the estimate, and bears
+  the rest itself.
 
 So an order fills when the market reaches its price and the fees come out of the proceeds, as on an
 exchange. "Fill only at my price" is the solver's promise; "never less than the minimum" is the ledger's.
 
 On each pass the solver treats every open order as a taker, market orders first, then the newest.
-For a taker it compares filling through pools alone with taking the best one, two or three resting
-orders on the other side (whole orders only, each paid its own price less the service fee) and
-sending the rest through pools, and uses whichever gives the taker most. It settles in one
-transaction (`takeFillManifest`). The taker pays the network fee: 1 XRD, plus 0.35 XRD per resting
-order taken (measured on Stokenet: 0.96 and 1.34 XRD).
+For a taker it compares filling through pools alone with taking the best one to four resting
+orders on the other side (signed orders whole, each paid its own price less the maker fee; book
+orders in part) and sending the rest through pools, and uses whichever gives the taker most. It
+settles in one transaction (`takeFillManifest`). The taker pays the network fee, estimated as
+0.7 XRD with no pool leg, or the pool swap's measured cost plus 0.5 XRD, plus 0.38 XRD per resting
+order taken (`fillGasXrd`; on mainnet a fill costs 1.0 to 1.4 XRD).
+
+Market orders are served first on each pass, and a new one is taken between resting orders
+rather than waiting for the pass to end. Resting orders are capped per pass
+(`DEX_MAX_RESTING_PER_TICK`) and taken in turns; one whose last look found the market more than
+3% short of its price is looked at again only after a minute.
+
+If a fill that used other traders' orders fails (in preview or on ledger), the solver does not
+blame them on that alone: it holds them back for two minutes, uncharged, and tries the taker
+again at once without them. A lone resting order is charged with the failure only if the taker
+then fills without it; if the taker fails again, the failure is the taker's.
 
 A market order is the same subintent with a slippage floor as its minimum, a lifetime of three
 minutes and `kind: "market"`. It never shows in the book and is never taken by another order.
