@@ -1,5 +1,7 @@
 // Runs the real server in-process against Stokenet: two users post crossing orders over HTTP, the solver settles them.
-// Requires data/stokenet-keys.json from scripts/stokenet-e2e.ts.
+// Since 22 Nov 2026 the solver's charges are XRD only: checked here both ways (taken from the XRD the taker
+// receives, and from the XRD the taker sells), with the solver ending with no TUSD, and a pair with no
+// route through XRD is refused. Requires data/stokenet-keys.json from scripts/stokenet-e2e.ts.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { Gateway, NETWORKS, accountOf, keyFromHex, limitOrderManifest, orderKeyFromSecret, signSubintent } from '../packages/core/src/index.ts';
@@ -34,6 +36,9 @@ async function place(keyHex: string, sell: string, sellAmount: string, buy: stri
 }
 
 const alice = await accountOf(keyFromHex(keys.alice), net.networkId), bob = await accountOf(keyFromHex(keys.bob), net.networkId);
+const solverAccount = await app.solver!.account();
+// (The live Stokenet site may share this solver account; if it fills something meanwhile, the TUSD checks below can trip on that.)
+const solverTusdAtStart = await balance(solverAccount, keys.tusd);
 const before = { at: await balance(alice, keys.tusd), bx: await balance(bob, net.xrd) };
 
 // Alice sells 40 XRD for >= 3 TUSD; Bob sells 4 TUSD for >= 35 XRD. A third order is far from the market and must stay open.
@@ -50,9 +55,35 @@ expect(oa?.status === 'filled' && /^txid_/.test(oa.fillTx), `Alice's order is fi
 expect(of?.status === 'open', 'the far-from-market order is still open');
 const after = { at: await balance(alice, keys.tusd), bx: await balance(bob, net.xrd) };
 // Bob's order arrived second, so it is the taker and carries the network fee (1.08 XRD with one maker and no pool).
-// Alice gets 4 * 0.999 = 3.996 TUSD; Bob gets 40 XRD less 0.10% and the network fee = 38.88.
-expect(Math.abs(after.at - before.at - 3.996) < 1e-9, `Alice received 3.996 TUSD (got ${after.at - before.at})`);
+// The charges come out of the XRD Bob buys. A maker fee would be in TUSD, which the solver does not keep, so Alice
+// gets her full 4 TUSD; Bob gets 40 XRD less 0.10% and the network fee = 38.88.
+expect(Math.abs(after.at - before.at - 4) < 1e-9, `Alice received 4 TUSD, no maker fee in TUSD (got ${after.at - before.at})`);
 expect(Math.abs(after.bx - before.bx - 38.88) < 1e-9, `Bob received 38.88 XRD (got ${after.bx - before.bx})`);
+
+// The other way round: Bob's TUSD order rests and Alice sells XRD to take it, so the charges come out of the XRD she sells.
+{
+  const bt0 = await balance(bob, net.xrd), at0 = await balance(alice, keys.tusd), ax0 = await balance(alice, net.xrd);
+  const maker = await place(keys.bob, keys.tusd, '4', net.xrd, '35');
+  expect((await app.solver!.tick()).crossed === 0, 'a lone TUSD seller rests');
+  const taker = await place(keys.alice, net.xrd, '40', keys.tusd, '3.9');
+  const t2 = await app.solver!.tick();
+  expect(t2.crossed === 2, `solver crossed them with Alice as the taker (crossed=${t2.crossed})`);
+  // 1.08 XRD network fee and 0.04 XRD (0.10% of 40) set aside first; the maker fee (0.10%, in XRD) on what Bob is paid.
+  // Bob is paid all the rest of the 40 XRD as a better price: 38.88 less 0.10% = 38.84112. Alice gets all 4 TUSD.
+  const bobGot = (await balance(bob, net.xrd)) - bt0, aliceGot = (await balance(alice, keys.tusd)) - at0, alicePaid = ax0 - (await balance(alice, net.xrd));
+  expect(Math.abs(aliceGot - 4) < 1e-9 && Math.abs(alicePaid - 40) < 1e-9, `Alice paid exactly 40 XRD and received 4 TUSD (got ${aliceGot})`);
+  expect(Math.abs(bobGot - 38.84112) < 1e-9, `Bob received 38.84112 XRD (got ${bobGot})`);
+  void maker; void taker;
+}
+expect(Math.abs((await balance(solverAccount, keys.tusd)) - solverTusdAtStart) < 1e-12, 'the solver holds no more TUSD than before: its charges were all XRD');
+
+// A pair the solver cannot charge in XRD is refused at submission: list TUSD against a resource with no XRD pool.
+{
+  const OTHER = 'resource_tdx_2_1nfxxxxxxxxxxglcllrxxxxxxxxx002350006550xxxxxxxxxqtcnwk';
+  app.data.markets.push({ id: `${OTHER}/${keys.tusd}`, base: { address: OTHER, symbol: 'OTHER', name: '' }, quote: { address: keys.tusd, symbol: 'TUSD', name: 'Test USD' }, pools: [], tvlUsd: 0, volume24hUsd: 0 });
+  const refused = await place(keys.bob, keys.tusd, '1', OTHER, '1').then(() => '', (e) => String(e.message));
+  expect(/fees are taken in XRD/.test(refused), 'an order between TUSD and a token with no route through XRD is refused: ' + refused.slice(0, 120));
+}
 const cancel = await fetch(`${base}/api/orders/${far.id}/cancel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ secret: far.secret }) });
 expect(cancel.ok, 'far order soft-cancelled');
 void b;

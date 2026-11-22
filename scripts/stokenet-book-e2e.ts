@@ -3,7 +3,10 @@
 //   2. a market order smaller than it takes part of it, at the maker's price;
 //   3. a market order larger than what is left takes the rest and the pool for the remainder;
 //   4. an order is cancelled and its tokens come back;
-//   5. an order priced below what the pool pays is bought by the solver and so fills at its price.
+//   5. an order selling TUSD for XRD priced below what the pool pays is bought by the solver and so fills at
+//      its price; one selling XRD is left to takers, as the solver spends and earns XRD only;
+//   6. two orders that cross are settled by the solver with XRD alone;
+//   7. the solver ends holding no more TUSD than it started with.
 // Uses its own order book (orderBookTest), not the one the test site trades on.
 // Needs scripts/stokenet-setup.ts to have run.
 import { readFileSync } from 'node:fs';
@@ -36,6 +39,9 @@ const quote = async (sell: string, buy: string, amount: string) => Number((await
 
 const aliceKey = keyFromHex(s.alice), bobKey = keyFromHex(s.bob);
 const alice = await accountOf(aliceKey, net.networkId), bob = await accountOf(bobKey, net.networkId);
+const solverAccount = await app.solver!.account();
+// (The live Stokenet site shares this solver account; a fill of its own meanwhile could move its TUSD.)
+const solverTusdAtStart = await balance(solverAccount, s.tusd);
 // Keep the buyer's test account in funds: repeated runs spend its TUSD, and the seller's account collects it.
 if ((await balance(bob, s.tusd)) < 80) {
   const give = Math.floor((await balance(alice, s.tusd)) / 2);
@@ -136,19 +142,30 @@ const id = await placeInBook('300', mid);
   expect(o?.status === 'cancelled' && back > 99 && back < 100, 'a cancelled order returns its 100 XRD (' + back.toFixed(4) + ' after the network fee) and reads as ' + o?.status);
 }
 
-// 5. An order priced under what the pool pays: the solver buys it with its own funds and sells through the pool.
+// 5. Orders priced under what the pool pays. One selling XRD for TUSD is not bought by the solver (it would have to
+// pay in TUSD and hold the book's change in TUSD); one selling TUSD for XRD is: it pays XRD and sells the TUSD to the pool.
 {
   const price = Number(n(((await quote(net.xrd, s.tusd, '150')) / 150) * 0.97));
-  const cheap = await placeInBook('150', price);
-  const before = await balance(alice, s.tusd);
+  const cheapXrd = await placeInBook('150', price);
   let bought = 0;
-  for (let i = 0; i < 5 && (await bookOrder(cheap))?.status === 'open'; i++) bought += (await app.solver!.tick()).bookBought;
-  const o = await bookOrder(cheap);
-  const aliceGot = (await balance(alice, s.tusd)) - before;
-  expect(bought >= 1 && o?.status === 'filled', 'the solver bought the order when the pool paid more than it asked (' + o?.status + ', ' + bought + ' purchase(s))');
-  expect(Math.abs(aliceGot - 150 * price) < 1e-6, 'the maker got exactly her price: ' + aliceGot.toFixed(6) + ' TUSD for 150 XRD');
+  for (let i = 0; i < 2; i++) bought += (await app.solver!.tick()).bookBought;
+  expect(bought === 0 && (await bookOrder(cheapXrd))?.status === 'open', 'an order selling XRD under the pool price is left to takers: the solver only spends XRD');
+  await walletTx(aliceKey, alice, bookCancelManifest({ account: alice, book: s.orderBookTest, receipts: s.orderReceiptsTest, id: cheapXrd }));
+  // Bob sells 15 TUSD at 97% of what the pool pays in XRD for it. The contract's price is XRD per TUSD.
+  const perTusd = Number(n(((await quote(s.tusd, net.xrd, '15')) / 15) * 0.97));
+  const ids = (await json('/api/orders?account=' + bob)).filter((o: any) => o.kind === 'book').map((o: any) => o.bookId);
+  await walletTx(bobKey, bob, bookPlaceManifest({ account: bob, book: s.orderBookTest, sell: s.tusd, sellAmount: '15', buy: net.xrd, price: n(perTusd), expiresAt: Math.floor(Date.now() / 1000) + 3600 }));
+  await app.book!.refresh();
+  const cheap = (await json('/api/orders?account=' + bob)).find((o: any) => o.kind === 'book' && !ids.includes(o.bookId))?.bookId as number;
+  const before = { bx: await balance(bob, net.xrd), st: await balance(solverAccount, s.tusd) };
+  const state = async () => { await app.book!.refresh(); return (await json('/api/orders?account=' + bob)).find((o: any) => o.bookId === cheap); };
+  for (let i = 0; i < 5 && (await state())?.status === 'open'; i++) bought += (await app.solver!.tick()).bookBought;
+  const o = await state();
+  const bobGot = (await balance(bob, net.xrd)) - before.bx;
+  expect(bought >= 1 && o?.status === 'filled', 'the solver bought the TUSD order when the pool paid more than it asked (' + o?.status + ', ' + bought + ' purchase(s))');
+  expect(Math.abs(bobGot - Number(o?.sold ?? 0) * perTusd) < 1e-6, 'the maker got exactly his price: ' + bobGot.toFixed(6) + ' XRD for ' + o?.sold + ' TUSD');
+  expect(Math.abs((await balance(solverAccount, s.tusd)) - before.st) < 1e-12, 'and the solver kept none of the TUSD');
 }
-
 // 6. Two book orders that cross: a seller asking a little over the pool, and a buyer bidding above that.
 {
   const sellNow = (await quote(net.xrd, s.tusd, '100')) / 100;
@@ -163,40 +180,24 @@ const id = await placeInBook('300', mid);
   const before = { at: await balance(alice, s.tusd), bx: await balance(bob, net.xrd) };
   const tick = await app.solver!.tick();
   const a = await bookOrder(ask), b = (await json('/api/orders?account=' + bob)).find((o: any) => o.bookId === bid?.bookId);
-  const xrd = 20 * Number(perTusd);
+  // The solver fronts XRD to the TUSD seller (the bid: 20 TUSD at its price in XRD), and passes all 20 TUSD to the
+  // XRD seller (the ask), which pays 20 / askPrice XRD for them. No TUSD is left over.
+  const xrd = 20 * Number(perTusd), soldByAsk = 20 / askPrice;
   expect(tick.bookCrossed === 1 && b?.status === 'filled', 'the solver crossed the two orders (' + tick.bookCrossed + '); the bid is ' + b?.status);
-  expect(Math.abs((await balance(bob, net.xrd)) - before.bx - xrd) < 1e-6, 'the buyer got ' + xrd.toFixed(4) + ' XRD, exactly their bid price');
-  expect(Math.abs((await balance(alice, s.tusd)) - before.at - xrd * askPrice) < 1e-6, 'the seller got ' + (xrd * askPrice).toFixed(6) + ' TUSD, exactly their ask price');
-  expect(a?.status === 'open' && Math.abs(Number(a.remaining) - (300 - xrd)) < 1e-6, 'the ask is part filled: ' + a?.remaining + ' XRD left');
+  expect(Math.abs((await balance(bob, net.xrd)) - before.bx - xrd) < 1e-6, 'the TUSD seller got ' + xrd.toFixed(4) + ' XRD, exactly their price');
+  expect(Math.abs((await balance(alice, s.tusd)) - before.at - 20) < 1e-6, 'the XRD seller got all 20 TUSD, for ' + soldByAsk.toFixed(4) + ' XRD at exactly their price');
+  expect(a?.status === 'open' && Math.abs(Number(a.remaining) - (300 - soldByAsk)) < 1e-6, 'the ask is part filled: ' + a?.remaining + ' XRD left');
   const hist = await json('/api/history?account=' + alice);
-  expect(hist.some((t: any) => t.book === ask && Math.abs(Number(t.sellAmount) - xrd) < 1e-6 && t.sell === net.xrd), 'the sale shows in the seller\'s trade history against order #' + ask);
+  expect(hist.some((t: any) => t.book === ask && Math.abs(Number(t.sellAmount) - soldByAsk) < 1e-6 && t.sell === net.xrd), 'the sale shows in the seller\'s trade history against order #' + ask);
   const placed = (await json('/api/orders?account=' + alice)).find((o: any) => o.bookId === ask);
   expect(placed?.createdAt > Date.now() / 1000 - 600, 'the order shows the time it was placed');
   await walletTx(aliceKey, alice, bookCancelManifest({ account: alice, book: s.orderBookTest, receipts: s.orderReceiptsTest, id: ask }));
 }
 
-// 7. A solver that holds none of the token an order wants (on mainnet it will hold only XRD):
-// it sells XRD through the pool first and pays the proceeds into the order.
+// 7. Every charge and every purchase was in XRD: the solver holds no more TUSD than when the run began.
 {
-  const solverKey = keyFromHex(s.solver), solverAccount = await app.solver!.account();
-  const held = Math.floor(await balance(solverAccount, s.tusd));
-  const move = async (key: Ed25519Key, from: string, to: string, amount: number) => { if (amount > 0) await walletTx(key, from, 'CALL_METHOD ' + addr(from) + ' "withdraw" ' + addr(s.tusd) + ' Decimal("' + amount + '");\nCALL_METHOD ' + addr(to) + ' "try_deposit_batch_or_abort" Expression("ENTIRE_WORKTOP") None;'); };
-  await move(solverKey, solverAccount, bob, held); // park the solver's TUSD with the test buyer
-  try {
-    const price = Number(n(((await quote(net.xrd, s.tusd, '200')) / 200) * 0.96));
-    const cheap = await placeInBook('200', price);
-    const before = { at: await balance(alice, s.tusd), sx: await balance(solverAccount, net.xrd) };
-    let bought = 0;
-    for (let i = 0; i < 6 && (await bookOrder(cheap))?.status === 'open'; i++) bought += (await app.solver!.tick()).bookBought;
-    const o = await bookOrder(cheap);
-    const gain = (await balance(solverAccount, net.xrd)) - before.sx;
-    expect(bought >= 1 && Number(o?.sold) > 0, 'with no TUSD of its own the solver still filled the order (' + o?.sold + ' of 200 XRD sold, ' + bought + ' purchase(s))');
-    expect(Math.abs((await balance(alice, s.tusd)) - before.at - Number(o?.sold) * price) < 1e-6, 'the maker got exactly her price');
-    expect(gain > -1.5 * bought, 'the solver ended with ' + gain.toFixed(4) + ' XRD more, after network fees');
-    if (o?.status === 'open') await walletTx(aliceKey, alice, bookCancelManifest({ account: alice, book: s.orderBookTest, receipts: s.orderReceiptsTest, id: cheap }));
-  } finally {
-    await move(bobKey, bob, solverAccount, held);
-  }
+  const now = await balance(solverAccount, s.tusd);
+  expect(Math.abs(now - solverTusdAtStart) < 1e-12, 'the solver ends holding no more TUSD than it started with (' + solverTusdAtStart + ' → ' + now + ')');
 }
 server.close();
 console.log(process.exitCode ? 'SOME CHECKS FAILED' : 'ALL CHECKS PASSED');
