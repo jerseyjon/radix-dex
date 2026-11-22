@@ -23,7 +23,8 @@ export type OwnerPoolEvent =
   | { name: 'OwnerPoolRebalanceEvent'; amountA: string; amountB: string; reserveA: string; reserveB: string; inventoryA: string; inventoryB: string; cost: string; allowance: string; byOwner: boolean }
   | { name: 'OwnerPoolConfigEvent'; feeBps: number; paused: boolean; operatorPaused: boolean }
   | { name: 'OwnerPoolSwapEvent'; reserveA: string; reserveB: string }
-  | { name: 'OwnerPoolOperatorEvent'; operator: string | null }
+  /** `limits`: the operator limits in force after the call (field name -> value as text), when the event carries them. */
+  | { name: 'OwnerPoolOperatorEvent'; operator: string | null; limits?: Record<string, string> }
   | { name: 'OwnerPoolLiquidityEvent'; reserveA: string; reserveB: string }
   | { name: 'OwnerPoolInventoryEvent'; inventoryA: string; inventoryB: string };
 
@@ -77,7 +78,9 @@ export function parseOwnerPoolEvent(name: string, fields: any[]): OwnerPoolEvent
       const f = fieldOf(fields, 'operator');
       // Option<ResourceAddress>: Some has one field holding the address.
       const v = f?.fields?.[0]?.value;
-      return { name, operator: typeof v === 'string' ? v : null };
+      const lf = fieldOf(fields, 'limits')?.fields;
+      const limits = Array.isArray(lf) ? Object.fromEntries(lf.filter((x: any) => typeof x?.field_name === 'string').map((x: any) => [x.field_name, String(x.value)])) : undefined;
+      return { name, operator: typeof v === 'string' ? v : null, ...(limits ? { limits } : {}) };
     }
     default:
       return undefined;

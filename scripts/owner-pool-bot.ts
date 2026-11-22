@@ -11,8 +11,16 @@
 // signature, no free credit) and sent only if that preview succeeded.
 //
 // Options (defaults in OWNER_POOL_BOT_DEFAULTS, reasons in docs/owner-pool-bot.md):
-//   --sources a,b,c          price sources: ociswap, caviarnine, coingecko (mainnet, read-only),
-//                            fixed:<price>, file:<path> (JSON {"price": n, "at": iso|ms} or a bare number)
+//   --venues a,b,c           the REFERENCE: on-ledger venues of the same pair (mainnet XRD/hUSDC, read-only previews):
+//                            ociswap, ociswap-precision, caviarnine, defiplaza (default: all four); or fixed:<price>,
+//                            file:<path> (JSON {"price": n, "at": iso|ms} or a bare number) as synthetic venues for drills.
+//                            (--sources is accepted as an alias.) --quote-size <xrd> (1000) --small-fraction <f> (0.1)
+//                            --min-impact <bps> (10) --max-round-trip <f> (0.1) --min-venues <n> (1)
+//   --watch-sources a,b      WATCH ONLY, never traded on: coingecko (default). Alert when it is more than
+//                            --watch-max-deviation <f> (0.15) from the on-ledger reference; --no-watch to skip
+//   --max-disagreement <f>   live venues further apart than this (0.04): hold (no rebalance) and widen the fee by
+//                            --disagree-fee-factor <f> (0.5) x the disagreement; pause if it lasts --pause-after
+//   --spend-window <s> --max-window-spend <f>   rolling cap: at most 60% of the allowance in any 10 minutes
 //   --scale auto|<n>         pool target = reference * scale; auto: calibrated once so the first healthy
 //                            reference maps to the owner anchor (kept in the state file)
 //   --owner-anchor A:B       FALLBACK only: the owner's anchor is read from the ledger (the pool's last
@@ -22,7 +30,7 @@
 //   --alert-interval <s>     one alert per condition per interval (default 3600); --alert-behind-ticks <n> (default 10)
 //   --sent-log <path>        every submitted txid is appended here before submission (default data/owner-pool-bot-sent.jsonl),
 //                            so the watcher (scripts/owner-pool-watch.ts) can tell the bot's operator actions from anyone else's
-//   --interval <s> --min-sources <n> --max-age <s> --max-disagreement <f> --pause-after <s> --resume-after <s>
+//   --interval <s> --max-age <s> --pause-after <s> --resume-after <s>
 //   --dead-band <bps> --spend-fraction <f> --reserve-fraction <f> --min-move <bps> --side balanced|remove|add
 //   --target-depth <n> --max-anchor-distance <f> --base-fee <bps> --vol-multiplier <f> --behind-fee <bps>
 //   --min-fee-change <bps> --widen-interval <s> --narrow-interval <s> --max-tx-per-hour <n> --fee-lock <xrd>
@@ -33,12 +41,13 @@
 // Keys: the operator key is loaded from --key (default data/stokenet-owner-pool-operator.key) and never
 // printed. The bot holds no owner key and cannot do anything only the owner may do.
 import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { makePriceSources, readSource, type PriceSource } from './owner-pool-sources.ts';
+import { makePriceSources, makeVenues, readSource, readVenueSource, type PriceSource, type VenueSource } from './owner-pool-sources.ts';
 import {
-  AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, aggregateReference, anchorCheck, buildTransaction,
-  calibrateScale, decideRebalance, feeDecision, feeTarget, keyFromHex, ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
+  AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, anchorCheck, buildTransaction,
+  calibrateScale, decideRebalance, feeDecision, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
+  ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
   ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, submitAndWait,
-  txAllowance, volatilityBps, type Ed25519Key, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
+  txAllowance, volatilityBps, type Ed25519Key, type VenueReference, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
 } from '../packages/core/src/index.ts';
 
 // ------------------------------------------------------------------ arguments
@@ -67,9 +76,17 @@ if (SEND && NETWORK !== 'stokenet') {
 
 const cfg = {
   intervalSec: num('interval', D.intervalSec),
-  minSources: num('min-sources', D.minSources),
+  minVenues: num('min-venues', D.minVenues),
   maxSourceAgeSec: num('max-age', D.maxSourceAgeSec),
   maxDisagreement: num('max-disagreement', D.maxDisagreement),
+  quoteSizeXrd: num('quote-size', D.quoteSizeXrd),
+  smallQuoteFraction: num('small-fraction', D.smallQuoteFraction),
+  minImpactBps: num('min-impact', D.minImpactBps),
+  maxRoundTrip: num('max-round-trip', D.maxRoundTrip),
+  disagreeFeeFactor: num('disagree-fee-factor', D.disagreeFeeFactor),
+  watchMaxDeviation: num('watch-max-deviation', D.coingeckoMaxDeviation),
+  spendWindowSec: num('spend-window', D.spendWindowSec),
+  maxWindowSpendShare: num('max-window-spend', D.maxWindowSpendShare),
   pauseAfterSec: num('pause-after', D.pauseAfterSec),
   resumeAfterSec: num('resume-after', D.resumeAfterSec),
   deadBandBps: opt('dead-band') !== undefined ? num('dead-band', 0) : D.deadBandBps,
@@ -92,7 +109,8 @@ const cfg = {
   haltSec: num('halt', D.haltSec),
   feeLockXrd: opt('fee-lock') ?? D.feeLockXrd,
   feeControl: !flag('no-fee'),
-  sources: (opt('sources') ?? 'ociswap,caviarnine,coingecko').split(',').map((s) => s.trim()).filter(Boolean),
+  venues: (opt('venues') ?? opt('sources') ?? 'ociswap,ociswap-precision,caviarnine,defiplaza').split(',').map((s) => s.trim()).filter(Boolean),
+  watchSources: flag('no-watch') ? [] : (opt('watch-sources') ?? 'coingecko').split(',').map((s) => s.trim()).filter(Boolean),
   scale: opt('scale') ?? 'auto',
   ownerAnchorFlag: opt('owner-anchor') !== undefined ? parseAnchorFlag(opt('owner-anchor')!) : undefined,
   anchorRecheckSec: num('anchor-recheck', D.anchorRecheckSec),
@@ -108,6 +126,8 @@ const cfg = {
 };
 if (!['balanced', 'remove', 'add'].includes(cfg.side)) throw new Error('--side must be balanced, remove or add');
 if (!(cfg.spendFraction > 0 && cfg.spendFraction <= 1) || cfg.reserveFraction < 0 || cfg.reserveFraction >= 1) throw new Error('bad --spend-fraction / --reserve-fraction');
+if (!(cfg.maxWindowSpendShare > 0 && cfg.maxWindowSpendShare <= 1) || !(cfg.spendWindowSec > 0)) throw new Error('bad --max-window-spend / --spend-window');
+if (!(cfg.quoteSizeXrd > 0) || !(cfg.smallQuoteFraction > 0 && cfg.smallQuoteFraction < 1)) throw new Error('bad --quote-size / --small-fraction');
 
 const net = NETWORKS[NETWORK];
 const gw = new Gateway(net);
@@ -136,6 +156,10 @@ interface BotState {
   behindTicks?: number;
   /** Alert rate limiter: last alert time per condition. */
   alertLast?: Record<string, number>;
+  /** The bot's own budget spends (cost from the ledger event, else the plan), for the rolling cap. */
+  spends?: { at: number; cost: number; txid: string }[];
+  /** The last fee change that failed (preview or send): not retried at once. */
+  lastFeeFailure?: { feeBps: number; at: number };
 }
 const loadState = (): BotState => {
   const fresh: BotState = { history: [], txTimes: [], pause: { pausedByBot: false }, consecutiveFailures: 0 };
@@ -152,6 +176,11 @@ async function alert(key: string, text: string, into?: Record<string, unknown>):
   const rec = { key, sent: r.sent, ...(r.suppressed ? { suppressed: true } : {}), ...(r.error ? { error: r.error } : {}), ...(alerts.enabled ? {} : { noUrl: true }) };
   if (into) ((into.alerts ??= []) as unknown[]).push(rec);
   else log({ event: 'alert', ...rec, text: r.text });
+}
+async function forceAlert(key: string, text: string): Promise<void> {
+  const r = await alerts.alert(key, text, Date.now(), { force: true });
+  state.alertLast = alerts.limiter.last;
+  log({ event: 'alert', key, sent: r.sent, ...(r.error ? { error: r.error } : {}), ...(alerts.enabled ? {} : { noUrl: true }), text: r.text });
 }
 const saveState = () => {
   const tmp = `${cfg.statePath}.tmp`;
@@ -172,7 +201,12 @@ const unlock = () => { try { unlinkSync(lockPath); } catch { /* gone */ } };
 
 // ------------------------------------------------------------------ price sources (mainnet, read-only)
 
-const sources: PriceSource[] = makePriceSources(cfg.sources, mainnetGw);
+/** The reference: on-ledger venues of the same pair. */
+const venues: VenueSource[] = makeVenues(cfg.venues, mainnetGw, { sizeXrd: cfg.quoteSizeXrd, smallFraction: cfg.smallQuoteFraction });
+/** Watch only (CoinGecko): compared with the reference, never traded on. */
+const watchSources: PriceSource[] = makePriceSources(cfg.watchSources, mainnetGw);
+/** The watch comparison makes sense only when every venue is a real one (synthetic venues are in pool units). */
+const watchComparable = cfg.venues.every((v) => !v.startsWith('fixed:') && !v.startsWith('file:'));
 
 // ------------------------------------------------------------------ ledger reads
 
@@ -202,8 +236,8 @@ type Sent = { type: string; preview: { ok: boolean; feeXrd: string; error?: stri
 /** Preview the exact transaction now; send it (with --send) only if the preview succeeded and the caps allow. */
 async function execute(type: string, manifest: string): Promise<Sent> {
   const now = Date.now();
-  if (SEND && state.haltedUntil && now < state.haltedUntil) {
-    return { type, preview: { ok: false, feeXrd: '0' }, sent: false, skipped: `halted after ${cfg.maxConsecutiveFailures} failed transactions until ${new Date(state.haltedUntil).toISOString()}` };
+  if (SEND && sendHalted(state, now)) {
+    return { type, preview: { ok: false, feeXrd: '0' }, sent: false, skipped: `halted after ${cfg.maxConsecutiveFailures} failed transactions until ${new Date(state.haltedUntil ?? 0).toISOString()}` };
   }
   if (SEND && txAllowance(state.txTimes, now, cfg.maxTxPerHour) <= 0) {
     return { type, preview: { ok: false, feeXrd: '0' }, sent: false, skipped: `transaction cap reached (${cfg.maxTxPerHour} per hour)` };
@@ -219,10 +253,11 @@ async function execute(type: string, manifest: string): Promise<Sent> {
   appendFileSync(cfg.sentLog, JSON.stringify({ at: new Date().toISOString(), txid: tx.intentHashId, type, pool: cfg.pool, network: NETWORK }) + '\n');
   const out = await submitAndWait(gw, tx, 180_000);
   const ok = out.status === 'CommittedSuccess';
-  state.consecutiveFailures = ok ? 0 : state.consecutiveFailures + 1;
-  if (state.consecutiveFailures >= cfg.maxConsecutiveFailures) {
-    state.haltedUntil = Date.now() + cfg.haltSec * 1000;
-    await alert('halt', `HALTED: ${state.consecutiveFailures} failed sends in a row (last ${type} ${tx.intentHashId}: ${out.status}${'error' in out ? ' ' + out.error.slice(0, 120) : ''}). No sends until ${new Date(state.haltedUntil).toISOString()}.`);
+  const so = recordSendOutcome(state, ok, Date.now(), { maxFailures: cfg.maxConsecutiveFailures, haltMs: cfg.haltSec * 1000 });
+  state.consecutiveFailures = so.consecutiveFailures;
+  state.haltedUntil = so.haltedUntil;
+  if (so.halted) {
+    await alert('halt', `HALTED: ${state.consecutiveFailures} failed sends in a row (last ${type} ${tx.intentHashId}: ${out.status}${'error' in out ? ' ' + out.error.slice(0, 120) : ''}). No sends until ${new Date(state.haltedUntil ?? 0).toISOString()}.`);
   }
   state.lastTx = { at: new Date().toISOString(), type, txid: tx.intentHashId, status: out.status };
   saveState();
@@ -276,11 +311,27 @@ async function tick(): Promise<void> {
   const actions: Sent[] = [];
   line.actions = actions;
 
-  // 1. Reference.
-  const samples = await Promise.all(sources.map(readSource));
-  const ref = aggregateReference(samples, now, { minSources: cfg.minSources, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement });
-  line.sources = samples.map((s) => ({ source: s.source, price: s.error ? null : s.price, ageSec: s.error ? null : Math.round((now - s.at) / 1000), ...(s.error ? { error: s.error } : {}) }));
-  line.reference = ref.ok ? { ok: true, price: ref.price, disagreement: round(ref.disagreement, 5) } : { ok: false, reason: ref.reason, disagreement: ref.disagreement === undefined ? null : round(ref.disagreement, 5) };
+  // 1. Reference: on-ledger venues only. Watch sources (CoinGecko) are read beside them, never used.
+  const [quotes, watch] = await Promise.all([Promise.all(venues.map(readVenueSource)), Promise.all(watchSources.map(readSource))]);
+  const vref: VenueReference = aggregateVenues(quotes, now, { minVenues: cfg.minVenues, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement, maxRoundTrip: cfg.maxRoundTrip, minImpactBps: cfg.minImpactBps });
+  const ref = vref.status === 'ok' ? { ok: true as const, price: vref.price } : { ok: false as const, reason: vref.reason };
+  const r6 = (x: number | undefined) => (x === undefined ? null : Number(x.toPrecision(6)));
+  line.reference = {
+    status: vref.status, price: vref.price ?? null, disagreement: vref.disagreement === undefined ? null : round(vref.disagreement, 5), live: vref.live, reason: vref.reason,
+    venues: vref.venues.map((v) => ({ venue: v.venue, used: v.used, mid: r6(v.mid), roundTrip: r6(v.roundTrip), impact: r6(v.impact), depth: r6(v.depth), weight: r6(v.weight), ...(v.dropped ? { dropped: v.dropped } : {}) })),
+  };
+  if (vref.live === 1) line.referenceWarning = `only ONE live venue (${vref.venues.find((v) => v.used)!.venue}): its price is not checked against another venue`;
+  const watchLines = watch.map((w) => {
+    if (w.error) return { source: w.source, error: w.error };
+    const c = watchComparable ? watchPriceCheck(vref.price, w.price, cfg.watchMaxDeviation) : { alarm: false, deviation: undefined };
+    return { source: w.source, price: w.price, ageSec: Math.round((now - w.at) / 1000), deviation: c.deviation === undefined ? null : round(c.deviation, 5), alarm: c.alarm };
+  });
+  line.watch = watchLines;
+  for (const w of watchLines) {
+    // Watch only: an alert, never a change to what the bot does.
+    if ('alarm' in w && w.alarm) await alert(`watch-${w.source}`, `WATCH: ${w.source} ${w.price} is ${((w.deviation ?? 0) * 100).toFixed(1)}% from the on-ledger reference ${r6(vref.price)} (limit ${(cfg.watchMaxDeviation * 100).toFixed(0)}%). Trading is NOT affected; check the venues.`, line);
+    else if ('alarm' in w && w.deviation !== null) alerts.limiter.clear(`watch-${w.source}`);
+  }
   if (ref.ok) {
     state.history.push({ at: now, price: ref.price });
     state.history = state.history.filter((h) => now - h.at <= D.historyKeepSec * 1000);
@@ -336,8 +387,8 @@ async function tick(): Promise<void> {
     await alert('anchor-stop', `ANCHOR STOP: ${line.ownerMustAct}`, line);
   } else alerts.limiter.clear('anchor-stop');
   if (!ref.ok && state.pause.unhealthySince !== undefined && now - state.pause.unhealthySince >= cfg.pauseAfterSec * 1000) {
-    await alert('sources-unhealthy', `Price sources unhealthy for ${Math.round((now - state.pause.unhealthySince) / 60_000)} min (${ref.reason}).`, line);
-  } else if (ref.ok) alerts.limiter.clear('sources-unhealthy');
+    await alert('reference-unhealthy', `On-ledger reference unusable for ${Math.round((now - state.pause.unhealthySince) / 60_000)} min (${ref.reason}).`, line);
+  } else if (ref.ok) alerts.limiter.clear('reference-unhealthy');
 
   const isOperator = st.operator === cfg.badge && s.operator === cfg.badge;
   if (!isOperator) {
@@ -366,12 +417,21 @@ async function tick(): Promise<void> {
   state.pause = pd.state;
   if (s.ownerPaused) { line.decision = 'owner pause on: nothing to do (only the owner reopens)'; return void log(line); }
   if (s.operatorPaused) { line.decision = 'operator pause on: no rebalance or fee change'; return void log(line); }
-  if (!ref.ok || !target) { line.decision = `no reference (${ref.ok ? 'no target' : ref.reason}): no rebalance`; return void log(line); }
   if (!ownerAnchorNow) { line.decision = 'owner anchor unknown: no rebalance, no fee change'; return void log(line); }
+  if (vref.status === 'disagree') {
+    // Hold the position (no rebalance) and widen the fee: the venues do not agree where the price is.
+    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, vref.disagreement, actions, line) : undefined;
+    line.decision = `HOLD: ${vref.reason}${fr ? `; ${fr}` : ''}`;
+    return void log(line);
+  }
+  if (!ref.ok || !target) { line.decision = `no reference (${ref.ok ? 'no target' : ref.reason}): no rebalance, no fee change`; return void log(line); }
   if (!anchor.ok) { line.decision = 'beyond the owner anchor distance: not following'; return void log(line); }
 
   // 6. Rebalance.
-  const dec = decideRebalance(pool, epoch, target, { deadBandBps: cfg.deadBandBps, spendFraction: cfg.spendFraction, reserveFraction: cfg.reserveFraction, minMoveBps: cfg.minMoveBps, side: cfg.side, targetDepth });
+  state.spends = (state.spends ?? []).filter((x) => now - x.at < 86_400_000);
+  const win = windowSpendRoom(state.spends, Number(allowanceLocal), now, { windowMs: cfg.spendWindowSec * 1000, maxShare: cfg.maxWindowSpendShare });
+  line.spendWindow = { spentInWindow: round(win.spentInWindow, 9), room: round(win.room, 9), maxShare: cfg.maxWindowSpendShare, windowSec: cfg.spendWindowSec };
+  const dec = decideRebalance(pool, epoch, target, { deadBandBps: cfg.deadBandBps, spendFraction: cfg.spendFraction, reserveFraction: cfg.reserveFraction, minMoveBps: cfg.minMoveBps, side: cfg.side, targetDepth, spendCap: win.room });
   line.deadBandBps = dec.deadBandBps;
   let behind = dec.behind;
   let feeNow = pool.feeBps;
@@ -382,36 +442,49 @@ async function tick(): Promise<void> {
     }));
     actions.push(r);
     if (r.status === 'CommittedSuccess' && r.txid) {
-      const ev = await rebalanceEvent(r.txid).catch(() => ({}));
+      const ev: { cost?: string; allowance?: string } = await rebalanceEvent(r.txid).catch(() => ({}));
+      state.spends.push({ at: Date.now(), cost: Number(ev.cost ?? dec.plan.cost), txid: r.txid });
       const after = (await readOwnerPools(gw, [cfg.pool], OWNER_POOL_PACKAGES[NETWORK]))[0]!;
       feeNow = after.feeBps;
       line.after = { event: ev, price: new Decimal(after.reserveB).div(after.reserveA).toNumber(), reserveA: after.reserveA, reserveB: after.reserveB, gapBps: round(priceDistance(new Decimal(after.reserveB).div(after.reserveA).toNumber(), target) * 10_000, 2) };
     } else if (!r.sent && !r.preview.ok) behind = true;
   } else line.rebalance = { action: 'none', reason: dec.reason, allowance: dec.allowance, spendable: dec.spendable };
 
-  state.behindTicks = behind ? (state.behindTicks ?? 0) + 1 : 0;
+  const bu = behindUpdate(state.behindTicks, behind, cfg.alertBehindTicks);
+  state.behindTicks = bu.ticks;
   line.behindTicks = state.behindTicks;
-  if (state.behindTicks >= cfg.alertBehindTicks) {
+  if (bu.alert) {
     await alert('behind', `Bot BEHIND for ${state.behindTicks} ticks: pool ${round(price, 9)} vs target ${round(target, 9)} (gap ${round(priceDistance(price, target) * 10_000, 1)} bps; ${dec.action === 'none' ? dec.reason : 'clipped move'}).`, line);
-  } else if (state.behindTicks === 0) alerts.limiter.clear('behind');
+  } else if (bu.cleared) alerts.limiter.clear('behind');
 
   // 7. Fee.
-  if (cfg.feeControl) {
-    const volBps = volatilityBps(state.history, now, cfg.volWindowSec * 1000, cfg.intervalSec * 1000);
-    const ft = feeTarget({ volBps, behind, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, cfg });
-    const fd = feeDecision({ currentFeeBps: feeNow, targetFeeBps: ft, lastChangeAt: state.lastFeeChangeAt, now, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, cfg: { minFeeChangeBps: cfg.minFeeChangeBps, widenIntervalMs: cfg.widenIntervalSec * 1000, narrowIntervalMs: cfg.narrowIntervalSec * 1000 } });
-    line.fee = { current: feeNow, target: ft, volBps: round(volBps, 2), behind, decision: fd.reason };
-    if (fd.action === 'set') {
-      const r = await execute(`operator_set_fee(${fd.feeBps})`, ownerPoolOperatorSetFeeManifest({ pool: cfg.pool, operator: signer, feeBps: fd.feeBps, feeLockXrd: cfg.feeLockXrd }));
-      actions.push(r);
-      if (r.status === 'CommittedSuccess') state.lastFeeChangeAt = Date.now();
-    }
-  }
+  if (cfg.feeControl) await feeStep(now, feeNow, s, behind, undefined, actions, line);
   line.decision = actions.length ? actions.map((a) => `${a.type}: ${a.sent ? a.status : a.skipped ?? (a.preview.ok ? 'previewed ok (dry run)' : 'PREVIEW FAILED, not sent')}`).join('; ') : 'nothing to do';
   log(line);
 }
 
 const round = (x: number, d: number) => Math.round(x * 10 ** d) / 10 ** d;
+
+/**
+ * The fee step: target from the rule (base + volatility + behind + the venues' disagreement while they
+ * disagree), clamped to the owner's operator range (logged when clamped), with hysteresis; a change that
+ * failed is not retried at once. Returns a short summary.
+ */
+async function feeStep(now: number, feeNow: number, s: NonNullable<OwnerPoolState['split']>, behind: boolean, disagreement: number | undefined, actions: Sent[], line: Record<string, unknown>): Promise<string> {
+  const volBps = volatilityBps(state.history, now, cfg.volWindowSec * 1000, cfg.intervalSec * 1000);
+  const ft = feeTargetDetail({ volBps, behind, disagreement, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, cfg });
+  const fd = feeDecision({ currentFeeBps: feeNow, targetFeeBps: ft.feeBps, lastChangeAt: state.lastFeeChangeAt, now, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, lastFailure: state.lastFeeFailure, cfg: { minFeeChangeBps: cfg.minFeeChangeBps, widenIntervalMs: cfg.widenIntervalSec * 1000, narrowIntervalMs: cfg.narrowIntervalSec * 1000 } });
+  line.fee = {
+    current: feeNow, target: ft.feeBps, rule: ft.rawBps, ...(ft.clamped ? { clamped: `${ft.clamped} of the operator range ${s.limits.minFeeBps}-${s.limits.maxFeeBps} bps` } : {}),
+    volBps: round(volBps, 2), behind, ...(disagreement !== undefined ? { disagreement: round(disagreement, 5) } : {}), decision: fd.reason,
+  };
+  if (fd.action !== 'set') return `fee: ${fd.reason}`;
+  const r = await execute(`operator_set_fee(${fd.feeBps})`, ownerPoolOperatorSetFeeManifest({ pool: cfg.pool, operator: signer, feeBps: fd.feeBps, feeLockXrd: cfg.feeLockXrd }));
+  actions.push(r);
+  if (r.status === 'CommittedSuccess') { state.lastFeeChangeAt = Date.now(); state.lastFeeFailure = undefined; }
+  else if (r.sent || (!r.preview.ok && !r.skipped)) state.lastFeeFailure = { feeBps: fd.feeBps, at: Date.now() };
+  return `operator_set_fee(${fd.feeBps}): ${r.sent ? r.status : r.skipped ?? (r.preview.ok ? 'previewed ok (dry run)' : 'PREVIEW FAILED, not sent')}`;
+}
 
 // ------------------------------------------------------------------ loop
 
@@ -422,30 +495,31 @@ process.on('SIGINT', () => stop('SIGINT'));
 process.on('SIGTERM', () => stop('SIGTERM'));
 const sleep = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); wake = () => { clearTimeout(t); r(); }; });
 
-log({ event: 'start', mode: SEND ? 'send' : 'dry-run', network: NETWORK, pool: cfg.pool, operatorAccount, badge: cfg.badge, sources: sources.map((s) => s.name), config: redactedCfg() });
-if (!ONCE) await alert('start', `Bot started (pid ${process.pid}) on ${cfg.pool.slice(0, 24)}...: sources ${cfg.sources.join(',')}, disagreement bound ${(cfg.maxDisagreement * 100).toFixed(1)}%.`);
+log({ event: 'start', mode: SEND ? 'send' : 'dry-run', network: NETWORK, pool: cfg.pool, operatorAccount, badge: cfg.badge, venues: venues.map((s) => s.name), watch: watchSources.map((s) => s.name), config: redactedCfg() });
+// Start and stop are never rate-limited: every restart (a crash loop included) must be seen.
+if (!ONCE) await forceAlert('start', `Bot started (pid ${process.pid}) on ${cfg.pool.slice(0, 24)}...: venues ${cfg.venues.join(',')}, quote size ${cfg.quoteSizeXrd} XRD, disagreement bound ${(cfg.maxDisagreement * 100).toFixed(1)}%.`);
 let errors = 0;
 try {
   while (!stopping) {
-    try {
-      await tick();
-      if (errors >= cfg.alertErrorTicks) alerts.limiter.clear('tick-errors');
-      errors = 0;
-    } catch (e) {
-      errors++;
-      const message = String((e as Error)?.message ?? e).slice(0, 400);
-      log({ event: 'error', tick: tickNo, consecutiveErrors: errors, message });
-      if (errors >= cfg.alertErrorTicks) await alert('tick-errors', `Bot ticks failing: ${errors} in a row (backing off). Last: ${message.slice(0, 200)}`);
+    let failed: unknown;
+    try { await tick(); } catch (e) { failed = e ?? new Error('tick failed'); }
+    const prev = errors;
+    const to = tickOutcome(errors, failed !== undefined, { intervalMs: cfg.intervalSec * 1000, alertTicks: cfg.alertErrorTicks });
+    errors = to.errors;
+    if (failed !== undefined) {
+      // A tick that throws (Gateway down, ...) has sent nothing after the failing read: no action this tick.
+      const message = String((failed as Error)?.message ?? failed).slice(0, 400);
+      log({ event: 'error', tick: tickNo, consecutiveErrors: errors, nextInSec: Math.round(to.delayMs / 1000), message });
+      if (to.alert) await alert('tick-errors', `Bot ticks failing: ${errors} in a row (backing off ${Math.round(to.delayMs / 1000)} s). Last: ${message.slice(0, 200)}`);
       if (ONCE) process.exitCode = 1;
-    }
+    } else if (prev >= cfg.alertErrorTicks) alerts.limiter.clear('tick-errors');
     saveState();
     if (ONCE || stopping) break;
     // Back off on errors: interval * 2^errors, at most 15 minutes.
-    const delay = Math.min(cfg.intervalSec * 1000 * 2 ** errors, 900_000);
-    await sleep(delay);
+    await sleep(to.delayMs);
   }
 } finally {
-  if (!ONCE) await alert('stop', `Bot stopped after ${tickNo} ticks${stopping ? '' : ' (unexpectedly)'}.`);
+  if (!ONCE) await forceAlert('stop', `Bot stopped after ${tickNo} ticks${stopping ? '' : ' (unexpectedly)'}.`);
   saveState();
   unlock();
   log({ event: 'stopped', ticks: tickNo });

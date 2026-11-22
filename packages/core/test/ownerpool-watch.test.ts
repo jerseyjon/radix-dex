@@ -2,7 +2,7 @@
 // the Stokenet pool's real history (22 Nov 2026).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { OWNER_POOL_WATCH_DEFAULTS as W, driftFindings, operatorActions, watchTransaction, type OwnerPoolEvent, type OwnerPoolTx, type WatchContext, type WatchState } from '../src/index.ts';
+import { OWNER_POOL_WATCH_DEFAULTS as W, driftFindings, limitsRecord, parseOwnerPoolEvent, operatorActions, watchTransaction, type OwnerPoolEvent, type OwnerPoolTx, type WatchContext, type WatchState } from '../src/index.ts';
 
 const OWNER = 'resource_owner_badge';
 const OP = 'resource_operator_badge';
@@ -84,4 +84,45 @@ test('watch: drift of the owner anchor and of the pool against the reference', (
   assert.deepEqual(rules(driftFindings({ reference: 0.00085, poolPrice: 0.00084, ownerAnchor: ['1250', '1'], maxAnchorDrift: 0.05, maxPoolDrift: 0.03 })), ['warn:anchor-drift']);
   assert.deepEqual(rules(driftFindings({ reference: 0.0008, poolPrice: 0.00083, ownerAnchor: ['1250', '1'], maxAnchorDrift: 0.05, maxPoolDrift: 0.03 })), ['warn:pool-drift']);
   assert.deepEqual(rules(driftFindings({ reference: 0.0008, poolPrice: 0.00083, maxAnchorDrift: 0.05, maxPoolDrift: 0.03 })), ['warn:pool-drift'], 'no anchor known: pool check only');
+});
+
+test('watch: "half, then half" within 10 minutes is caught by the window rule though no single move is large', () => {
+  const st = fresh();
+  const c = ctx({ maxWindowSpendShare: W.maxWindowSpendShare, spendWindowMs: W.spendWindowSec * 1000 });
+  // The soak's 18:58-18:59 moves: 0.007482 of 0.014964 (50%), then 0.003949 of 0.007899 (50%): together 74% of 0.014964.
+  assert.deepEqual(watchTransaction(tx([reb('0.007482', '0.007482')], { at: t0 }), st, c), []);
+  const f = watchTransaction(tx([reb('0.003949', '0.00395')], { at: t0 + 60_000 }), st, c);
+  assert.deepEqual(rules(f), ['alert:window-spend']);
+  assert.match(f[0]!.text, /74\.3% of the allowance available in 2 moves within 10 min/);
+  // The same two moves 10 minutes apart: each judged alone (50%), no window finding.
+  const st2 = fresh();
+  watchTransaction(tx([reb('0.007482', '0.007482')], { at: t0 }), st2, c);
+  assert.deepEqual(watchTransaction(tx([reb('0.003949', '0.00395')], { at: t0 + 600_000 }), st2, c), []);
+  // The bot under its own cap: 50%, then the room left (60% - 50% = 10% of the start): exactly 60%, not above.
+  const st3 = fresh();
+  watchTransaction(tx([reb('0.005', '0.005')], { at: t0 }), st3, c);
+  assert.deepEqual(watchTransaction(tx([reb('0.001', '0.004')], { at: t0 + 60_000 }), st3, c), []);
+  // Not configured: not checked.
+  const st4 = fresh();
+  watchTransaction(tx([reb('0.007482', '0.007482')], { at: t0 }), st4, ctx());
+  assert.deepEqual(watchTransaction(tx([reb('0.003949', '0.00395')], { at: t0 + 60_000 }), st4, ctx()), []);
+});
+
+test('watch: an operator limits change is flagged; the same limits re-announced are not', () => {
+  const L = { move_budget_bps: '300', window_epochs: '72', max_reserve_a: '22000', max_reserve_b: '17.6', min_reserve_a: '10000', min_reserve_b: '8', min_fee_bps: '10', max_fee_bps: '100' };
+  const st = { ...fresh(), limits: L };
+  const ev = (limits: Record<string, string>): OwnerPoolEvent => ({ name: 'OwnerPoolOperatorEvent', operator: OP, limits });
+  assert.deepEqual(watchTransaction(tx([ev(L)], { methods: ['set_operator_limits'] }), st, ctx()), []);
+  const f = watchTransaction(tx([ev({ ...L, move_budget_bps: '3000', max_fee_bps: '200' })], { methods: ['set_operator_limits'], resources: [OWNER] }), st, ctx());
+  assert.deepEqual(rules(f), ['alert:limits-change']);
+  assert.equal(f[0]!.text, 'Operator limits changed (set_operator_limits): move_budget_bps 300 -> 3000, max_fee_bps 100 -> 200.');
+  assert.equal(st.limits!.move_budget_bps, '3000');
+  // The baseline taken from the pool's state has the event's shape.
+  assert.deepEqual(limitsRecord({ moveBudgetBps: 300, windowEpochs: 72, maxReserveA: '22000', maxReserveB: '17.6', minReserveA: '10000', minReserveB: '8', minFeeBps: 10, maxFeeBps: 100 }), L);
+  // The event payload is parsed with its limits.
+  const parsed = parseOwnerPoolEvent('OwnerPoolOperatorEvent', [
+    { field_name: 'operator', kind: 'Enum', variant_id: '1', fields: [{ kind: 'Reference', value: OP }] },
+    { field_name: 'limits', kind: 'Tuple', fields: Object.entries(L).map(([k, v]) => ({ field_name: k, kind: 'Decimal', value: v })) },
+  ]);
+  assert.deepEqual(parsed, { name: 'OwnerPoolOperatorEvent', operator: OP, limits: L });
 });

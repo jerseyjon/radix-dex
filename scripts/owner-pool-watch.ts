@@ -9,8 +9,11 @@
 //                            unless --alert-on-replay); otherwise a first run starts from now
 //   --max-spend-share <f>    one operator move spending more than this share of the allowance (default 0.6)
 //   --max-spend-24h <n>      operator spend in 24 h above n full budgets (default 1)
+//   --max-window-spend <f> --spend-window <s>   operator moves within any 10 min spending more than 60% of the
+//                            allowance available at the window's start (the bot's own cap; catches "half, then half")
 //   --max-anchor-drift <f>   owner anchor vs reference (default 0.05); --max-pool-drift <f> pool vs reference (default 0.03)
-//   --sources a,b,c --scale auto|<n> --max-disagreement <f> --min-sources <n> --max-age <s>   reference, as the bot's;
+//   --venues a,b,c --quote-size <xrd> --scale auto|<n> --max-disagreement <f> --max-age <s>   reference, as the bot's
+//                            (on-ledger venues; drift checked only while they agree);
 //                            --scale auto takes the bot's calibration from --bot-state, else calibrates to the owner anchor
 //   --bot-sent-log <path>    the bot's sent log (default data/owner-pool-bot-sent.jsonl): operator actions not in it are flagged
 //   --bot-state <path>       the bot's state file (default data/owner-pool-bot-state.json), read only, for the scale
@@ -19,11 +22,11 @@
 //   --interval <s> --pool <component> --network stokenet
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import {
-  AlertSink, Decimal, Gateway, NETWORKS, OWNER_POOL_BOT_DEFAULTS as BD, OWNER_POOL_PACKAGES, OWNER_POOL_WATCH_DEFAULTS as W, aggregateReference, calibrateScale,
+  AlertSink, Decimal, Gateway, NETWORKS, OWNER_POOL_BOT_DEFAULTS as BD, OWNER_POOL_PACKAGES, OWNER_POOL_WATCH_DEFAULTS as W, aggregateVenues, calibrateScale, limitsRecord,
   driftFindings, findOwnerAnchor, lastOwnerAnchor, readOwnerPoolTransactions, readOwnerPools, watchTransaction,
   type NetworkName, type OwnerAnchorStatement, type WatchFinding, type WatchState,
 } from '../packages/core/src/index.ts';
-import { makePriceSources, readSource } from './owner-pool-sources.ts';
+import { makeVenues, readVenueSource } from './owner-pool-sources.ts';
 
 const argv = process.argv.slice(2);
 const flag = (n: string) => argv.includes(`--${n}`);
@@ -46,11 +49,14 @@ const cfg = {
   intervalSec: num('interval', W.intervalSec),
   maxSpendShare: num('max-spend-share', W.maxSpendShare),
   maxSpend24hBudgets: num('max-spend-24h', W.maxSpend24hBudgets),
+  maxWindowSpendShare: num('max-window-spend', W.maxWindowSpendShare),
+  spendWindowSec: num('spend-window', W.spendWindowSec),
   maxAnchorDrift: num('max-anchor-drift', W.maxAnchorDrift),
   maxPoolDrift: num('max-pool-drift', W.maxPoolDrift),
-  sources: (opt('sources') ?? 'ociswap,caviarnine,coingecko').split(',').map((s) => s.trim()).filter(Boolean),
+  venues: (opt('venues') ?? opt('sources') ?? 'ociswap,ociswap-precision,caviarnine,defiplaza').split(',').map((s) => s.trim()).filter(Boolean),
+  quoteSizeXrd: num('quote-size', BD.quoteSizeXrd),
   scale: opt('scale') ?? 'auto',
-  minSources: num('min-sources', BD.minSources),
+  minVenues: num('min-venues', BD.minVenues),
   maxSourceAgeSec: num('max-age', BD.maxSourceAgeSec),
   maxDisagreement: num('max-disagreement', BD.maxDisagreement),
   botSentLog: opt('bot-sent-log') ?? 'data/owner-pool-bot-sent.jsonl',
@@ -63,7 +69,7 @@ const cfg = {
 
 const gw = new Gateway(NETWORKS[NETWORK]);
 const mainnetGw = new Gateway(NETWORKS.mainnet);
-const sources = makePriceSources(cfg.sources, mainnetGw);
+const venues = makeVenues(cfg.venues, mainnetGw, { sizeXrd: cfg.quoteSizeXrd, smallFraction: BD.smallQuoteFraction });
 const log = (o: Record<string, unknown>) => console.log(JSON.stringify({ t: new Date().toISOString(), ...o }));
 
 interface State {
@@ -123,7 +129,7 @@ async function tick(): Promise<void> {
     if (replaying) state.next = cfg.from ?? 1;
     else {
       state.next = (pool.stateVersion ?? 0) + 1;
-      state.watch = { spends: [], config: { feeBps: pool.feeBps, paused: s.ownerPaused, operatorPaused: s.operatorPaused }, operator: s.operator };
+      state.watch = { spends: [], config: { feeBps: pool.feeBps, paused: s.ownerPaused, operatorPaused: s.operatorPaused }, operator: s.operator, limits: limitsRecord(s.limits) };
       const f = await findOwnerAnchor(gw, cfg.pool);
       state.ownerAnchor = f.statement;
     }
@@ -139,6 +145,7 @@ async function tick(): Promise<void> {
     findings.push(...watchTransaction(t, state.watch, {
       operatorBadge: s.operator, ownerBadge: s.ownerBadge, budget: s.limits.moveBudgetBps / 10_000,
       botTxids: bl?.txids, botLogSince: bl?.since, maxSpendShare: cfg.maxSpendShare, maxSpend24hBudgets: cfg.maxSpend24hBudgets,
+      maxWindowSpendShare: cfg.maxWindowSpendShare, spendWindowMs: cfg.spendWindowSec * 1000,
     }));
   }
   const newest = lastOwnerAnchor(r.txs);
@@ -147,8 +154,9 @@ async function tick(): Promise<void> {
   for (const f of findings) await report(f, live);
 
   // Reference and drift (live state only).
-  const samples = await Promise.all(sources.map(readSource));
-  const ref = aggregateReference(samples, now, { minSources: cfg.minSources, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement });
+  const quotes = await Promise.all(venues.map(readVenueSource));
+  const vref = aggregateVenues(quotes, now, { minVenues: cfg.minVenues, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement, maxRoundTrip: BD.maxRoundTrip, minImpactBps: BD.minImpactBps });
+  const ref = vref.status === 'ok' ? { ok: true as const, price: vref.price, disagreement: vref.disagreement } : { ok: false as const, reason: vref.reason };
   let scale: number | undefined, scaleFrom = 'flag';
   if (cfg.scale !== 'auto') scale = Number(cfg.scale);
   else {

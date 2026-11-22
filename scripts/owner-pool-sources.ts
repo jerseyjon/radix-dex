@@ -1,7 +1,13 @@
 // Price sources for the OwnerPool bot and watcher (docs/owner-pool-bot.md, "Reference price").
 // Mainnet is only READ here: entity details and free previews; nothing is ever signed for it.
+//
+// Two kinds:
+// - VENUES (`makeVenues`): on-ledger pools of the SAME pair, each quoted both ways by previewing real
+//   swaps through the project's Quoter. The bot's reference comes ONLY from these.
+// - WATCH sources (`makePriceSources`): CoinGecko and the old single-number readings. Watch only: they
+//   are compared with the reference and alerted on, never traded on.
 import { readFileSync, statSync } from 'node:fs';
-import { Gateway, NETWORKS, Quoter, listCaviarNine, type PriceSample } from '../packages/core/src/index.ts';
+import { Gateway, NETWORKS, Quoter, filterAllowedPools, listCaviarNine, type Pool, type PriceSample, type VenueQuote } from '../packages/core/src/index.ts';
 
 const MAINNET_XRD = NETWORKS.mainnet.xrd;
 const HUSDC = 'resource_rdx1thxj9m87sn5cc9ehgp9qxp6vzeqxtce90xm5cp33373tclyp4et4gv';
@@ -88,6 +94,88 @@ const fileSource = (path: string): PriceSource => ({
     return { source: this.name, price, at };
   },
 });
+
+// ------------------------------------------------------------------ venues (the reference)
+
+export interface VenueSource { name: string; read(): Promise<VenueQuote> }
+
+/** The mainnet XRD/hUSDC pools: Ociswap basic (3% fee) and precision (0.05%), CaviarNine QuantaSwap, DefiPlaza PlazaPair. */
+const VENUE_POOLS: Record<string, { venue: Pool['venue']; address: string; note: string }> = {
+  ociswap: { venue: 'ociswap', address: OCI_COMPONENT, note: 'Ociswap BasicPool XRD/hUSDC' },
+  'ociswap-precision': { venue: 'ociswap', address: 'component_rdx1czy2naejcqx8gv46zdsex2syuxrs4jnqzug58e66zr8wglxzvu97qr', note: 'Ociswap PrecisionPool XRD/hUSDC (0.05%)' },
+  caviarnine: { venue: 'caviarnine', address: C9_COMPONENT, note: 'CaviarNine QuantaSwap XRD/hUSDC' },
+  defiplaza: { venue: 'defiplaza', address: 'component_rdx1crj9ne37kf0tw2efc3dsl03pzg3qavkhauyu6nvz8z05qrdp009jt0', note: 'DefiPlaza PlazaPair hUSDC/XRD' },
+};
+export const VENUE_NAMES = Object.keys(VENUE_POOLS);
+
+/**
+ * One venue, quoted by previews (free, nothing signed): sell `sizeXrd` XRD (the bid) and sell hUSDC
+ * worth about `sizeXrd` XRD (the ask), and the same at `smallFraction` of the size, for the impact.
+ * The pool must be a component of an allow-listed package and blueprint (checked on ledger once).
+ * A quote that fails, or that the pool only part-fills (it handed input back), fails the venue.
+ */
+const venueSource = (name: string, def: { venue: Pool['venue']; address: string }, gw: Gateway, quoter: Quoter, o: { sizeXrd: number; smallFraction: number }): VenueSource => {
+  let checked: Promise<Pool> | undefined;
+  const pool = (): Promise<Pool> => {
+    checked ??= filterAllowedPools(gw, [{ venue: def.venue, address: def.address, kind: '', tokens: [MAINNET_XRD, HUSDC], feeRate: 0, tvlUsd: 0, volume24hUsd: 0, reserves: [0, 0] }])
+      .then((ps) => { if (ps.length !== 1) throw new Error(`${def.address} is not an allow-listed ${def.venue} pool`); return ps[0]!; });
+    checked.catch(() => { checked = undefined; });
+    return checked;
+  };
+  const sell = async (p: Pool, token: string, amount: number): Promise<{ sold: number; got: number }> => {
+    const q = await quoter.simulate([p], token, amount.toFixed(6));
+    if (!q) throw new Error(`preview failed selling ${amount.toPrecision(6)} ${token === HUSDC ? 'hUSDC' : 'XRD'}: ${(quoter.lastFailure ?? 'no quote').slice(0, 140)}`);
+    const sold = Number(q.sellAmount), got = Number(q.buyAmount);
+    if (!(sold >= amount * 0.999)) throw new Error(`part fill: sold ${sold.toPrecision(6)} of ${amount.toPrecision(6)} (the pool handed input back)`);
+    return { sold, got };
+  };
+  return {
+    name,
+    async read() {
+      const p = await pool();
+      const at = Date.now();
+      const size = o.sizeXrd, small = o.sizeXrd * o.smallFraction;
+      const [b, bs] = await Promise.all([sell(p, MAINNET_XRD, size), sell(p, MAINNET_XRD, small)]);
+      const bid = b.got / b.sold, bidSmall = bs.got / bs.sold;
+      // Buy about the same amount of XRD: sell hUSDC worth it at the bid.
+      const [a, as] = await Promise.all([sell(p, HUSDC, size * bid), sell(p, HUSDC, small * bidSmall)]);
+      const ask = a.sold / a.got, askSmall = as.sold / as.got;
+      return { venue: name, at, sizeA: size, smallA: small, bid, ask, bidSmall, askSmall };
+    },
+  };
+};
+
+/** A synthetic venue at one price (fixed:<p>, file:<path>): tests and drills, in pool units with --scale 1. */
+const syntheticVenue = (s: PriceSource): VenueSource => ({
+  name: s.name,
+  async read() {
+    const r = await s.read();
+    return { venue: s.name, at: r.at, sizeA: 1, smallA: 0.1, bid: r.price, ask: r.price, bidSmall: r.price, askSmall: r.price };
+  },
+});
+
+export function makeVenues(names: string[], mainnetGw: Gateway, o: { sizeXrd: number; smallFraction: number }): VenueSource[] {
+  const quoter = new Quoter(mainnetGw);
+  return names.map((n) => {
+    const def = VENUE_POOLS[n];
+    if (def) return venueSource(n, def, mainnetGw, quoter, o);
+    if (n.startsWith('fixed:') || n.startsWith('file:')) return syntheticVenue(makePriceSources([n], mainnetGw)[0]!);
+    throw new Error(`Unknown venue ${n} (known: ${VENUE_NAMES.join(', ')}, fixed:<price>, file:<path>)`);
+  });
+}
+
+export const readVenueSource = async (s: VenueSource): Promise<VenueQuote> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([s.read(), new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error('timed out after 45 s')), 45_000); })]);
+  } catch (e) {
+    return { venue: s.name, at: 0, sizeA: 0, smallA: 0, bid: NaN, ask: NaN, bidSmall: NaN, askSmall: NaN, error: String((e as Error)?.message ?? e).slice(0, 200) };
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// ------------------------------------------------------------------ watch sources
 
 export function makePriceSources(names: string[], mainnetGw: Gateway): PriceSource[] {
   return names.map((s, i) => {

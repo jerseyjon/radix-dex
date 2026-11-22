@@ -1,5 +1,14 @@
 import { priceDistance, anchorPrice } from './ownerpool-bot.ts';
 import type { OwnerPoolEvent, OwnerPoolTx } from './ownerpool-events.ts';
+import type { OwnerPoolOperatorLimits } from './ownerpool.ts';
+
+/** The pool's operator limits (read from its state) in the form `OwnerPoolOperatorEvent` carries them: field name -> text. */
+export function limitsRecord(l: OwnerPoolOperatorLimits): Record<string, string> {
+  return {
+    move_budget_bps: String(l.moveBudgetBps), window_epochs: String(l.windowEpochs), max_reserve_a: l.maxReserveA, max_reserve_b: l.maxReserveB,
+    min_reserve_a: l.minReserveA, min_reserve_b: l.minReserveB, min_fee_bps: String(l.minFeeBps), max_fee_bps: String(l.maxFeeBps),
+  };
+}
 
 /**
  * Rules of the read-only OwnerPool watcher (scripts/owner-pool-watch.ts, docs/owner-pool-bot.md).
@@ -18,6 +27,9 @@ export const OWNER_POOL_WATCH_DEFAULTS = {
   maxSpendShare: 0.6,
   /** Operator spend over the last 24 h above this many full budgets (one budget refills per window). */
   maxSpend24hBudgets: 1,
+  /** Operator moves within any `spendWindowSec` spending more than this share of the allowance available at the window's start (the bot's own cap is the same). */
+  maxWindowSpendShare: 0.6,
+  spendWindowSec: 600,
   /** The owner's anchor more than this far from the reference: the owner should restate it. */
   maxAnchorDrift: 0.05,
   /** The pool's price more than this far from the reference (mapped). */
@@ -28,7 +40,7 @@ export const OWNER_POOL_WATCH_DEFAULTS = {
 export type WatchSeverity = 'alert' | 'warn' | 'info';
 
 export interface WatchFinding {
-  rule: 'large-spend' | 'spend-24h' | 'fee-change' | 'pause-change' | 'operator-change' | 'anchor-restated' | 'not-bot' | 'anchor-drift' | 'pool-drift';
+  rule: 'large-spend' | 'window-spend' | 'spend-24h' | 'limits-change' | 'fee-change' | 'pause-change' | 'operator-change' | 'anchor-restated' | 'not-bot' | 'anchor-drift' | 'pool-drift';
   severity: WatchSeverity;
   txid?: string;
   stateVersion?: number;
@@ -39,9 +51,11 @@ export interface WatchFinding {
 export interface WatchState {
   /** The pool's last known config (fee, owner pause, operator pause). */
   config?: { feeBps: number; paused: boolean; operatorPaused: boolean };
-  /** Operator spends (budget cost) with their times, last 24 h. */
-  spends: { at: number; cost: number; txid: string }[];
+  /** Operator spends (budget cost, and the allowance left after it) with their times, last 24 h. */
+  spends: { at: number; cost: number; txid: string; after?: number }[];
   operator?: string | null;
+  /** The operator limits last announced (OwnerPoolOperatorEvent), as text. */
+  limits?: Record<string, string>;
 }
 
 export interface WatchContext {
@@ -55,6 +69,9 @@ export interface WatchContext {
   botLogSince?: number;
   maxSpendShare: number;
   maxSpend24hBudgets: number;
+  /** Rolling window rule; absent: not checked. */
+  maxWindowSpendShare?: number;
+  spendWindowMs?: number;
 }
 
 /** Who made a transaction's operator-side changes, from what its manifest called and proved. */
@@ -90,7 +107,18 @@ export function watchTransaction(t: OwnerPoolTx, st: WatchState, ctx: WatchConte
         out.push({ rule: 'large-spend', severity: 'alert', ...base, text: `Operator move spent ${fmtPct(share)} of the allowance available (cost ${e.cost} of ${before.toPrecision(6)}; limit ${fmtPct(ctx.maxSpendShare)}). The bot never spends more than half: check the operator key.` });
       }
       if (cost > 0) {
-        st.spends.push({ at: t.at, cost, txid: t.txid });
+        st.spends.push({ at: t.at, cost, txid: t.txid, after });
+        // Rolling window: the moves of the last spendWindowMs (this one included) against the allowance
+        // available when the first of them was made (spent in the window + left now). Catches a thief
+        // copying the bot's "half, then half" pattern, which no single move gives away.
+        if (ctx.maxWindowSpendShare !== undefined && ctx.spendWindowMs) {
+          const win = st.spends.filter((s) => t.at - s.at < ctx.spendWindowMs! && s.at <= t.at);
+          const spent = win.reduce((a, s) => a + s.cost, 0);
+          const wshare = spent / (spent + after);
+          if (win.length >= 2 && wshare > ctx.maxWindowSpendShare) {
+            out.push({ rule: 'window-spend', severity: 'alert', ...base, text: `Operator spent ${fmtPct(wshare)} of the allowance available in ${win.length} moves within ${Math.round(ctx.spendWindowMs / 60_000)} min (${spent.toPrecision(6)}; limit ${fmtPct(ctx.maxWindowSpendShare)}). The bot caps itself at ${fmtPct(ctx.maxWindowSpendShare)}: check the operator key.` });
+          }
+        }
         const total = st.spends.reduce((a, s) => a + s.cost, 0);
         const limit = ctx.maxSpend24hBudgets * ctx.budget;
         if (total > limit * (1 + 1e-9)) out.push({ rule: 'spend-24h', severity: 'alert', ...base, text: `Operator spent ${total.toPrecision(6)} of budget in 24 h over ${st.spends.length} moves (limit ${limit.toPrecision(6)} = ${ctx.maxSpend24hBudgets} budget(s)).` });
@@ -107,6 +135,12 @@ export function watchTransaction(t: OwnerPoolTx, st: WatchState, ctx: WatchConte
     if (e.name === 'OwnerPoolOperatorEvent' && (st.operator === undefined || st.operator !== e.operator)) {
       if (st.operator !== undefined) out.push({ rule: 'operator-change', severity: 'alert', ...base, text: `Operator ${e.operator ? `set to ${e.operator}` : 'REVOKED'} (was ${st.operator ?? 'none'}).` });
       st.operator = e.operator;
+    }
+    if (e.name === 'OwnerPoolOperatorEvent' && e.limits) {
+      const prev = st.limits;
+      const changed = prev ? Object.keys({ ...prev, ...e.limits }).filter((k) => prev[k] !== e.limits![k]) : [];
+      if (changed.length) out.push({ rule: 'limits-change', severity: 'alert', ...base, text: `Operator limits changed (${t.methods.length ? t.methods.join(',') : 'unknown call'}): ${changed.map((k) => `${k} ${prev![k] ?? '-'} -> ${e.limits![k] ?? '-'}`).join(', ')}.` });
+      st.limits = e.limits;
     }
     if (e.name === 'OwnerPoolAnchorEvent') out.push({ rule: 'anchor-restated', severity: 'info', ...base, text: `Owner stated the anchor ${e.anchorA}:${e.anchorB} (price ${(Number(e.anchorB) / Number(e.anchorA)).toPrecision(6)}); operator allowance restarts from zero.` });
   }

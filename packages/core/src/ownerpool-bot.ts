@@ -16,11 +16,27 @@ import { ownerPoolAllowanceNow, ownerPoolPlanRebalance, type OwnerPoolRebalanceP
 /** Every default, with its reason in docs/owner-pool-bot.md. Seconds unless the name says otherwise. */
 export const OWNER_POOL_BOT_DEFAULTS = {
   intervalSec: 60,
-  /** Reference health. */
+  /** Reference health (on-ledger venues of the same pair, see `aggregateVenues`). */
+  minVenues: 1,
+  /** Kept for the old median reference (`aggregateReference`), which the bot no longer uses. */
   minSources: 2,
   maxSourceAgeSec: 300,
-  /** Highest / lowest fresh source - 1. */
-  maxDisagreement: 0.02,
+  /** Highest / lowest live venue midpoint - 1. Beyond it: hold (no rebalance) and widen the fee. */
+  maxDisagreement: 0.04,
+  /** Each venue is quoted both ways at this size (XRD), and at `smallQuoteFraction` of it for the impact. */
+  quoteSizeXrd: 1000,
+  smallQuoteFraction: 0.1,
+  /** Depth = quote size / impact, with the impact floored at this (one quote cannot show more depth than that). */
+  minImpactBps: 10,
+  /** A venue whose round trip (ask / bid - 1) at the quote size is wider than this does not bound the price: dropped. */
+  maxRoundTrip: 0.1,
+  /** While the venues disagree: fee + this fraction of the disagreement (in bps), inside the operator range. */
+  disagreeFeeFactor: 0.5,
+  /** CoinGecko (watch only) this far from the on-ledger reference: alert. Never affects a trade. */
+  coingeckoMaxDeviation: 0.15,
+  /** Rolling spend cap: at most this share of the allowance available at the start of any window of this length. */
+  spendWindowSec: 600,
+  maxWindowSpendShare: 0.6,
   /** Unhealthy reference for this long: set the operator pause. Healthy for this long: clear it (only if the bot set it). */
   pauseAfterSec: 600,
   resumeAfterSec: 900,
@@ -36,8 +52,8 @@ export const OWNER_POOL_BOT_DEFAULTS = {
   maxAnchorDistance: 0.05,
   /** ...and resume only once it is back within this fraction of that distance. */
   anchorResumeFactor: 0.8,
-  /** Fee rule. */
-  baseFeeBps: 30,
+  /** Fee rule. 100 bps needs an operator fee range of about 50-200 bps on mainnet; Stokenet's 10-100 clamps it at 100. */
+  baseFeeBps: 100,
   volMultiplier: 2,
   volWindowSec: 3600,
   behindFeeBps: 10,
@@ -104,6 +120,146 @@ export function aggregateReference(samples: PriceSample[], nowMs: number, o: { m
     return { ok: false, reason: `sources disagree by ${(disagreement * 100).toFixed(2)}% (bound ${(o.maxDisagreement * 100).toFixed(2)}%)`, fresh, disagreement };
   }
   return { ok: true, price: median(prices), fresh, disagreement };
+}
+
+// ------------------------------------------------------------------ on-ledger venue reference
+
+/**
+ * One venue's executable quotes for the pair (prices in B per A, e.g. hUSDC per XRD), from previews of
+ * real swaps: `bid` = what selling `sizeA` of A gets per A, `ask` = what buying about `sizeA` of A costs
+ * per A; `bidSmall`/`askSmall` the same at `smallA`. A synthetic venue (fixed: / file:, tests and drills)
+ * has all four equal.
+ */
+export interface VenueQuote {
+  venue: string;
+  /** When the quotes were made (ms): the previews run on the ledger state of that moment. */
+  at: number;
+  sizeA: number;
+  smallA: number;
+  bid: number;
+  ask: number;
+  bidSmall: number;
+  askSmall: number;
+  error?: string;
+}
+
+export interface VenueReading {
+  venue: string;
+  /** sqrt(bid * ask): a proportional swap fee charged both ways cancels out of it. */
+  mid?: number;
+  /** ask / bid - 1 at the quote size: fees both ways plus impact both ways. */
+  roundTrip?: number;
+  /** Price impact going from the small size to the quote size, mean of both sides (fee-free: the fee is the same share at both sizes). */
+  impact?: number;
+  /** quote size / max(impact, floor), in A: the reserve of a constant-product pool with the same impact. */
+  depth?: number;
+  weight?: number;
+  used: boolean;
+  dropped?: string;
+}
+
+export type VenueReference =
+  /** ok: the reference. disagree: a depth-weighted price exists but the live venues are too far apart to trade on. none: no live venue. */
+  | { status: 'ok' | 'disagree'; price: number; disagreement: number; live: number; venues: VenueReading[]; reason: string }
+  | { status: 'none'; price?: undefined; disagreement?: undefined; live: 0; venues: VenueReading[]; reason: string };
+
+/** The fee-free midpoint, round trip, impact and depth of one venue's quotes (no health checks). */
+export function readVenue(q: VenueQuote, minImpact: number): Required<Pick<VenueReading, 'mid' | 'roundTrip' | 'impact' | 'depth'>> {
+  const mid = Math.sqrt(q.bid * q.ask);
+  const roundTrip = q.ask / q.bid - 1;
+  // Selling more gets a worse (lower) bid, buying more a worse (higher) ask.
+  const impact = Math.max(0, ((q.bidSmall / q.bid - 1) + (q.ask / q.askSmall - 1)) / 2);
+  const depth = q.sizeA / Math.max(impact, minImpact);
+  return { mid, roundTrip, impact, depth };
+}
+
+/**
+ * The reference from on-ledger venues of the SAME pair. Each live venue's midpoint (net of its own
+ * fee, `readVenue`) is weighted by its depth; the reference is the weighted geometric mean.
+ * Dropped: a venue whose quotes failed or are unusable, older than `maxAgeMs` (or in the future), or
+ * whose round trip at the quote size is wider than `maxRoundTrip` (its two quotes then bound the
+ * price too loosely to be a reference). With fewer than `minVenues` live: none. When the highest and
+ * lowest live midpoint differ by more than `maxDisagreement`: disagree (the price is reported for
+ * the logs and the fee, never traded on).
+ */
+export function aggregateVenues(quotes: VenueQuote[], nowMs: number, o: { minVenues: number; maxAgeMs: number; maxDisagreement: number; maxRoundTrip: number; minImpactBps: number }): VenueReference {
+  const venues: VenueReading[] = quotes.map((q) => {
+    if (q.error) return { venue: q.venue, used: false, dropped: q.error };
+    const vals = [q.bid, q.ask, q.bidSmall, q.askSmall, q.sizeA];
+    if (!vals.every((v) => Number.isFinite(v) && v > 0)) return { venue: q.venue, used: false, dropped: 'quotes unusable' };
+    if (nowMs - q.at > o.maxAgeMs || q.at > nowMs + 60_000) return { venue: q.venue, used: false, dropped: `stale (${Math.round((nowMs - q.at) / 1000)} s old)` };
+    const r = readVenue(q, o.minImpactBps / 10_000);
+    if (!(r.roundTrip >= -1e-9)) return { venue: q.venue, ...r, used: false, dropped: `ask below bid (round trip ${(r.roundTrip * 100).toFixed(2)}%)` };
+    if (r.roundTrip > o.maxRoundTrip) return { venue: q.venue, ...r, used: false, dropped: `round trip ${(r.roundTrip * 100).toFixed(2)}% > ${(o.maxRoundTrip * 100).toFixed(1)}%` };
+    return { venue: q.venue, ...r, used: true };
+  });
+  const live = venues.filter((v) => v.used);
+  if (live.length < Math.max(1, o.minVenues)) {
+    return { status: 'none', live: 0, venues, reason: `only ${live.length} live venue(s), need ${Math.max(1, o.minVenues)}` };
+  }
+  const total = live.reduce((a, v) => a + v.depth!, 0);
+  for (const v of live) v.weight = v.depth! / total;
+  const price = Math.exp(live.reduce((a, v) => a + v.weight! * Math.log(v.mid!), 0));
+  const mids = live.map((v) => v.mid!);
+  const disagreement = Math.max(...mids) / Math.min(...mids) - 1;
+  const one = live.length === 1 ? ' (ONLY ONE live venue: nothing to check it against)' : '';
+  if (disagreement > o.maxDisagreement + 1e-12) {
+    return { status: 'disagree', price, disagreement, live: live.length, venues, reason: `venues disagree by ${(disagreement * 100).toFixed(2)}% (bound ${(o.maxDisagreement * 100).toFixed(1)}%): hold and widen` };
+  }
+  return { status: 'ok', price, disagreement, live: live.length, venues, reason: `${live.length} live venue(s)${one}` };
+}
+
+/**
+ * CoinGecko (or any off-ledger price) is WATCH ONLY: compared with the on-ledger reference, both in the
+ * same unit (e.g. USD per XRD), never used for a price or a trade. `alarm` when they are more than
+ * `maxDeviation` apart (d(x, y) = max(x/y, y/x) - 1).
+ */
+export function watchPriceCheck(reference: number | undefined, watch: number | undefined, maxDeviation: number): { alarm: boolean; deviation?: number } {
+  if (!(reference! > 0) || !(watch! > 0)) return { alarm: false };
+  const deviation = priceDistance(reference!, watch!);
+  return { alarm: deviation > maxDeviation, deviation };
+}
+
+// ------------------------------------------------------------------ rolling spend cap
+
+/**
+ * The most the operator may spend now so that, over the last `windowMs`, its moves spend at most
+ * `maxShare` of the allowance that was available when the window began. Spent S in the window and
+ * allowance A now, that allowance was S + A (a refill inside the window only adds to it), so the next
+ * move c must keep (S + c) / (S + A) <= maxShare: c <= maxShare * (S + A) - S. The watcher's
+ * `window-spend` rule checks the same quantity from the pool's events.
+ */
+export function windowSpendRoom(spends: { at: number; cost: number }[], allowanceNow: number, now: number, o: { windowMs: number; maxShare: number }): { room: number; spentInWindow: number } {
+  const spentInWindow = spends.filter((s) => s.at <= now && now - s.at < o.windowMs).reduce((a, s) => a + s.cost, 0);
+  const room = Math.max(0, o.maxShare * (spentInWindow + Math.max(0, allowanceNow)) - spentInWindow);
+  return { room, spentInWindow };
+}
+
+// ------------------------------------------------------------------ send failures
+
+/** After a send: reset or count failures; halt sending for `haltMs` when `maxFailures` fail in a row. */
+export function recordSendOutcome(st: { consecutiveFailures: number; haltedUntil?: number }, ok: boolean, now: number, o: { maxFailures: number; haltMs: number }): { consecutiveFailures: number; haltedUntil?: number; halted: boolean } {
+  const consecutiveFailures = ok ? 0 : st.consecutiveFailures + 1;
+  if (consecutiveFailures >= o.maxFailures) return { consecutiveFailures, haltedUntil: now + o.haltMs, halted: true };
+  return { consecutiveFailures, haltedUntil: st.haltedUntil, halted: false };
+}
+
+/** Whether sending is halted at `now`. */
+export const sendHalted = (st: { haltedUntil?: number }, now: number): boolean => st.haltedUntil !== undefined && now < st.haltedUntil;
+
+/**
+ * After a tick: consecutive failed ticks (a Gateway outage throws before anything is sent), whether to
+ * alert (`alertTicks` in a row), and the wait before the next tick: interval * 2^errors, at most `maxMs`.
+ */
+export function tickOutcome(prevErrors: number, failed: boolean, o: { intervalMs: number; alertTicks: number; maxMs?: number }): { errors: number; alert: boolean; delayMs: number } {
+  const errors = failed ? prevErrors + 1 : 0;
+  return { errors, alert: failed && errors >= o.alertTicks, delayMs: Math.min(o.intervalMs * 2 ** errors, o.maxMs ?? 900_000) };
+}
+
+/** The "behind" counter after a tick, and whether to alert (at `alertTicks` in a row, rate-limited by the caller). */
+export function behindUpdate(prevTicks: number | undefined, behind: boolean, alertTicks: number): { ticks: number; alert: boolean; cleared: boolean } {
+  const ticks = behind ? (prevTicks ?? 0) + 1 : 0;
+  return { ticks, alert: ticks >= alertTicks, cleared: ticks === 0 };
 }
 
 /**
@@ -189,6 +345,8 @@ export interface RebalanceConfig {
   side: RebalanceSide;
   /** For side 'balanced': the depth sqrt(Ra * Rb) to keep the curve near. */
   targetDepth?: number;
+  /** Further cap on this tick's spend (the rolling-window room, `windowSpendRoom`). */
+  spendCap?: number;
 }
 
 export type RebalanceDecision =
@@ -231,9 +389,11 @@ export function decideRebalance(pool: OwnerPoolState, epoch: number, target: num
   if (!(target > 0) || !Number.isFinite(target)) return none('no target price');
   if (gapBps <= deadBandBps) return none('inside the dead band');
   const allowance = ownerPoolAllowanceNow(pool, epoch);
-  const spendable = spendableAllowance(allowance, s.limits.moveBudgetBps, cfg);
+  const base = spendableAllowance(allowance, s.limits.moveBudgetBps, cfg);
+  const windowCapped = cfg.spendCap !== undefined && base.gt(Math.max(0, cfg.spendCap));
+  const spendable = windowCapped ? new Decimal(Math.max(0, cfg.spendCap!)).toDecimalPlaces(18, Decimal.ROUND_DOWN) : base;
   const extra = { allowance, spendable: spendable.toFixed() };
-  if (spendable.lte(0)) return none('allowance spent (or inside the reserve): waiting for refill', true, extra);
+  if (spendable.lte(0)) return none(windowCapped ? 'rolling spend cap reached: waiting for the window to pass' : 'allowance spent (or inside the reserve): waiting for refill', true, extra);
 
   const T = new Decimal(target);
   const up = target > price;
@@ -323,10 +483,19 @@ export function volatilityBps(history: { at: number; price: number }[], now: num
   return Math.sqrt(v) * 10_000;
 }
 
-/** fee = base + volMultiplier * volatility (+ behindFeeBps when the bot cannot catch up), rounded, inside [min, max]. */
-export function feeTarget(o: { volBps: number; behind: boolean; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'baseFeeBps' | 'volMultiplier' | 'behindFeeBps'> }): number {
-  const raw = o.cfg.baseFeeBps + o.cfg.volMultiplier * o.volBps + (o.behind ? o.cfg.behindFeeBps : 0);
-  return Math.min(o.maxFeeBps, Math.max(o.minFeeBps, Math.round(raw)));
+/**
+ * fee = base + volMultiplier * volatility (+ behindFeeBps when the bot cannot catch up) (+ disagreeFeeFactor
+ * * the venues' disagreement, in bps, while they disagree), rounded, inside [min, max].
+ */
+export function feeTarget(o: { volBps: number; behind: boolean; disagreement?: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'baseFeeBps' | 'volMultiplier' | 'behindFeeBps'> & { disagreeFeeFactor?: number } }): number {
+  return feeTargetDetail(o).feeBps;
+}
+
+/** `feeTarget` with the unclamped value, and whether the owner's range clamped it. */
+export function feeTargetDetail(o: { volBps: number; behind: boolean; disagreement?: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'baseFeeBps' | 'volMultiplier' | 'behindFeeBps'> & { disagreeFeeFactor?: number } }): { feeBps: number; rawBps: number; clamped: 'min' | 'max' | null } {
+  const rawBps = Math.round(o.cfg.baseFeeBps + o.cfg.volMultiplier * o.volBps + (o.behind ? o.cfg.behindFeeBps : 0) + (o.disagreement ? (o.cfg.disagreeFeeFactor ?? 0) * o.disagreement * 10_000 : 0));
+  const feeBps = Math.min(o.maxFeeBps, Math.max(o.minFeeBps, rawBps));
+  return { feeBps, rawBps, clamped: rawBps > o.maxFeeBps ? 'max' : rawBps < o.minFeeBps ? 'min' : null };
 }
 
 /**
@@ -334,9 +503,15 @@ export function feeTarget(o: { volBps: number; behind: boolean; minFeeBps: numbe
  * change was at least `widenIntervalMs` ago to widen (protection: soon) or `narrowIntervalMs` ago to
  * narrow (calm must last). The operator has fee power only when the owner's range is not a single value.
  */
-export function feeDecision(o: { currentFeeBps: number; targetFeeBps: number; lastChangeAt?: number; now: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'minFeeChangeBps' | 'widenIntervalMs' | 'narrowIntervalMs'> }): { action: 'set'; feeBps: number; reason: string } | { action: 'none'; reason: string } {
+export function feeDecision(o: { currentFeeBps: number; targetFeeBps: number; lastChangeAt?: number; now: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'minFeeChangeBps' | 'widenIntervalMs' | 'narrowIntervalMs'>; lastFailure?: { feeBps: number; at: number } }): { action: 'set'; feeBps: number; reason: string } | { action: 'none'; reason: string } {
   if (o.minFeeBps >= o.maxFeeBps) return { action: 'none', reason: 'the operator has no fee range' };
   const diff = o.targetFeeBps - o.currentFeeBps;
+  // Already at the edge of the range and the target is clamped there: nothing to do, whatever minFeeChange says.
+  if (o.targetFeeBps === o.currentFeeBps) return { action: 'none', reason: `fee ${o.currentFeeBps} bps is the target` };
+  // A change to this fee failed (preview or send) recently: do not retry the same thing every tick.
+  if (o.lastFailure && o.lastFailure.feeBps === o.targetFeeBps && o.now - o.lastFailure.at < o.cfg.narrowIntervalMs) {
+    return { action: 'none', reason: `fee change to ${o.targetFeeBps} bps failed ${Math.round((o.now - o.lastFailure.at) / 1000)} s ago: not retried before ${Math.round(o.cfg.narrowIntervalMs / 1000)} s` };
+  }
   if (Math.abs(diff) < o.cfg.minFeeChangeBps) return { action: 'none', reason: `fee ${o.currentFeeBps} bps within ${o.cfg.minFeeChangeBps} bps of target ${o.targetFeeBps}` };
   const wait = diff > 0 ? o.cfg.widenIntervalMs : o.cfg.narrowIntervalMs;
   const since = o.lastChangeAt === undefined ? Infinity : o.now - o.lastChangeAt;

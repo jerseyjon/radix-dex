@@ -54,9 +54,11 @@ export class AlertSink {
   /**
    * Alert for condition `key` with `text`, unless the same key alerted within the interval. With no
    * URL nothing is sent (the result says so; the limiter still records it, so logs show what would have gone).
+   * `force`: never rate-limited (start and stop: every restart must be seen, a crash loop included).
    */
-  async alert(key: string, text: string, now = Date.now()): Promise<AlertResult> {
+  async alert(key: string, text: string, now = Date.now(), o: { force?: boolean } = {}): Promise<AlertResult> {
     const body = (this.prefix + text).slice(0, ALERT_MAX_CHARS);
+    if (o.force) this.limiter.clear(key);
     if (!this.limiter.allow(key, now)) return { key, sent: false, suppressed: true, text: body };
     if (!this.url) return { key, sent: false, text: body };
     try {
