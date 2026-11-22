@@ -8,7 +8,8 @@ not had an independent audit, and the owner has accepted that risk. An internal 
 code review and bug test were done on 21 November 2026 (`docs/review-2026-11-21/`).
 
 - Market orders are short-lived pre-authorizations filled within seconds at the best price from
-  resting limit orders and existing pools (Ociswap, DefiPlaza) in one transaction. Where no
+  resting limit orders and existing pools (Ociswap, DefiPlaza, and two CaviarNine pools on a
+  best-effort basis) in one transaction. Where no
   solver runs they fall back to an ordinary wallet transaction through the pools.
 - Limit orders come in two kinds. **"In parts"** (the form's default) places the tokens in the
   on-ledger `OrderBook` contract, which anyone can fill a part at a time at the order's price.

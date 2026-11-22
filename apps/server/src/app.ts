@@ -2,7 +2,7 @@ import { mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   type BookOrder, type Depth, type DepthLevel, type Market, Decimal, chargeAt, Gateway, GatewayError, OrderRejected, decodeSignedPartialTransaction, isAccount, isResource,
-  orderKeyCancelled, orderKeyFromSecret, validateLimitOrder,
+  chargedSwapFeeXrd, orderKeyCancelled, orderKeyFromSecret, validateLimitOrder,
 } from '@radix-dex/core';
 import { BookWatcher } from './book.ts';
 import type { Config } from './config.ts';
@@ -224,7 +224,8 @@ export async function createApp(config: Config) {
     const hop = at === 'hop' ? await data.hopQuote(sell, buy, new Decimal(amount).toFixed()).catch(() => undefined) : undefined;
     const q = hop ?? await data.quote(sell, buy, new Decimal(amount).toFixed());
     if (!q) throw new HttpError(404, 'No route with enough liquidity');
-    const gasXrd = fillGasXrd(0, q.networkFeeXrd);
+    // Charged with the venue's safety margin, if any; q.networkFeeXrd is the fee as measured.
+    const gasXrd = fillGasXrd(0, chargedSwapFeeXrd(q));
     const allowanceXrd = gasXrd.mul(GAS_ALLOWANCE_MARGIN).toDecimalPlaces(18, Decimal.ROUND_UP);
     // The network fee of a fill through this route, in the token being bought, so the site can show it before an order is signed.
     // gasInBuyToken is the solver's estimate; gasAllowanceInBuyToken adds a margin. Kept for older pages: the charge itself is in XRD (below).

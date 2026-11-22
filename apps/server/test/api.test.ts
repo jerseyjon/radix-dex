@@ -2,7 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
-import { NETWORKS, accountOf, keyFromHex, limitOrderManifest, orderKeyFromSecret, signSubintent, swapsInTransaction } from '@radix-dex/core';
+import { NETWORKS, accountOf, chargedSwapFeeXrd, keyFromHex, limitOrderManifest, orderKeyFromSecret, signSubintent, swapsInTransaction } from '@radix-dex/core';
 import { createApp, marketTrades, orderLevels } from '../src/app.ts';
 import { rateKey } from '../src/http.ts';
 import { normaliseCandle } from '../src/marketdata.ts';
@@ -135,6 +135,10 @@ test('the network fee charged follows what the route costs to swap through', () 
   assert.equal(fillGasXrd(0, '0.92').toFixed(), '1.42', 'a costly pool is charged more');
   assert.equal(fillGasXrd(1, '0.5').toFixed(), '1.38');
   assert.equal(fillGasXrd(0, 'x').toFixed(), '1', 'an unreadable measurement falls back');
+  // A CaviarNine leg is charged its measured fee plus the venue's 0.3 XRD margin; other venues as measured.
+  const c9 = { venue: 'caviarnine', address: 'component_x', kind: 'shape', tokens: ['a', 'b'], feeRate: 0, tvlUsd: 0, volume24hUsd: 0, reserves: [1, 1] } as const;
+  assert.equal(fillGasXrd(0, chargedSwapFeeXrd({ networkFeeXrd: '1.2', route: [c9 as any] })).toFixed(), '2', 'CaviarNine: 1.2 + 0.3 + 0.5');
+  assert.equal(fillGasXrd(0, chargedSwapFeeXrd({ networkFeeXrd: '0.51', route: [{ ...c9, venue: 'ociswap' } as any] })).toFixed(), '1.01');
 });
 
 test('market trades: one row per transaction, priced in the quote token, on the side of whoever took it', () => {

@@ -29,8 +29,12 @@ export interface Token {
   iconUrl?: string;
 }
 
-/** 'radixdex' is this project's own Pool blueprint; 'ownerpool' its OwnerPool blueprint (liquidity from one owner). */
-export type VenueId = 'ociswap' | 'defiplaza' | 'radixdex' | 'ownerpool';
+/**
+ * 'radixdex' is this project's own Pool blueprint; 'ownerpool' its OwnerPool blueprint (liquidity
+ * from one owner). 'caviarnine' is two CaviarNine Shape Liquidity pools, routed through on a
+ * best-effort basis only (see `BEST_EFFORT_VENUES`).
+ */
+export type VenueId = 'ociswap' | 'defiplaza' | 'radixdex' | 'caviarnine' | 'ownerpool';
 
 /** One swappable pool on some venue. Amounts are decimal strings or plain numbers for display-only stats. */
 export interface Pool {
@@ -44,7 +48,10 @@ export interface Pool {
   /** Display-only statistics from the venue's own API. */
   tvlUsd: number;
   volume24hUsd: number;
-  /** Roughly half the pool's value expressed in tokens[0] and in tokens[1]. Used only to size depth probes. */
+  /**
+   * How much of tokens[0] and of tokens[1] the pool can take in: roughly the value of its other
+   * side expressed in that token (for a balanced pool, half its value). Used only to size depth probes.
+   */
   reserves: [number, number];
   /**
    * Native pool entities (`pool_…`) named in the component's own state, which hold its funds for

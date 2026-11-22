@@ -2,7 +2,7 @@ import { readFileSync, statSync } from 'node:fs';
 import {
   type DecodedOrder, type Ed25519Key, type Gateway, type SolverIdentity, Decimal,
   type BookOrder, type ChargeAt, type LiquidityItem, type Pool, type Quote,
-  GAS_SHORTFALL_TOLERANCE, accountOf, bookArbManifest, bookCrossManifest, buildTransaction, chargeAt,
+  GAS_SHORTFALL_TOLERANCE, accountOf, chargedSwapFeeXrd, bookArbManifest, bookCrossManifest, buildTransaction, chargeAt,
   decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, orderKeyCancelled, payout,
   POOL_FILL_BUFFER_BPS, pickLiquidity, planBookCrossExact, planPoolFill, planXrdLegFill, reducedXrdCharges, retryXrdTake, routeMinimums, takeFillManifest,
   xrdCharges, xrdLegNeeded,
@@ -48,8 +48,8 @@ const UNKNOWN_FAILED_FEE_XRD = '1';
 
 /**
  * Network cost of a fill in XRD: the taker's order alone 0.7, each resting order taken 0.38, and
- * for a pool leg what that swap costs on its own (measured when it was quoted) plus 0.5 for running
- * it inside the fill. Pool kinds differ widely: on mainnet an Ociswap basic pool swap costs about
+ * for a pool leg what that swap costs on its own (measured when it was quoted, plus any venue margin:
+ * pass `chargedSwapFeeXrd(quote)`) plus 0.5 for running it inside the fill. Pool kinds differ widely: on mainnet an Ociswap basic pool swap costs about
  * 0.5 and a precision pool about 0.9, and their fills cost 1.0 and 1.4.
  */
 export const fillGasXrd = (items: number, poolSwapFeeXrd?: string): Decimal => {
@@ -407,7 +407,7 @@ export class Solver {
     if (at === 'input') {
       const r = await this.poolQuote(taker.sell, taker.buy, S);
       if (r.error) return undefined;
-      refSwapFee = r.quote?.networkFeeXrd;
+      refSwapFee = r.quote ? chargedSwapFeeXrd(r.quote) : undefined;
     }
     const pick = (sellAmount: Decimal) => (sellAmount.gt(0) ? pickLiquidity({ ...taker, sellAmount: sellAmount.toFixed() }, resting, book, makerFee, this.divisibility, nowSec) : []);
     const maxItems = pick(S).length;
@@ -432,7 +432,7 @@ export class Solver {
         if (left.gt(0)) {
           const r = await this.poolQuote(taker.sell, taker.buy, left);
           if (r.error) return undefined;
-          if (r.quote) { total = total.plus(r.quote.buyAmount); poolOut = new Decimal(r.quote.buyAmount); route = r.quote.route; poolIn = left.toFixed(); swapFee = r.quote.networkFeeXrd; }
+          if (r.quote) { total = total.plus(r.quote.buyAmount); poolOut = new Decimal(r.quote.buyAmount); route = r.quote.route; poolIn = left.toFixed(); swapFee = chargedSwapFeeXrd(r.quote); }
           else {
             // No pool for the remainder: a signed order can take it as a better price; nothing else can, as the solver must not keep it.
             const given = giveToFirstOrder(items, left);
@@ -455,7 +455,7 @@ export class Solver {
           const r = await this.poolQuote(taker.sell, taker.buy, left);
           if (r.error) return undefined;
           if (r.quote) {
-            const gasXrd = fillGasXrd(k, r.quote.networkFeeXrd);
+            const gasXrd = fillGasXrd(k, chargedSwapFeeXrd(r.quote));
             // Charges by the route really used, never more than set aside; anything set aside beyond them also goes into the pool.
             const take = Decimal.min(kPool, xrdCharges(S, gasXrd, feeBps));
             const total = sumOf(items, (m) => m.gives).plus(r.quote.buyAmount);
@@ -503,7 +503,7 @@ export class Solver {
     if (whole === null || leg1 === null) return undefined;
     if (!whole || !leg1 || new Decimal(leg1.sellAmount).lt(S)) return undefined;
     const x = new Decimal(leg1.buyAmount);
-    const gasXrd = fillGasXrd(0, whole.networkFeeXrd);
+    const gasXrd = fillGasXrd(0, chargedSwapFeeXrd(whole));
     const take = xrdCharges(x, gasXrd, this.config.feeBps);
     if (!take.lt(x)) return undefined;
     const leg2 = await sim([route[1]!], xrd, x.minus(take));
@@ -689,7 +689,7 @@ export class Solver {
       const quote = await this.data.quoter.best(this.data.pools, b.sell, b.buy, q.toFixed(), xrd).catch(() => undefined);
       if (!quote || new Decimal(quote.sellAmount).lt(q)) return undefined;
       const cost = q.mul(b.price).toDecimalPlaces(buyDiv, Decimal.ROUND_UP);
-      const gas = mustCoverGas ? arbGasXrd(quote.networkFeeXrd) : new Decimal(0);
+      const gas = mustCoverGas ? arbGasXrd(chargedSwapFeeXrd(quote)) : new Decimal(0);
       // The pool can move before the transaction runs, so it must also bring back the network fee or fail.
       const minBack = cost.plus(gas).toDecimalPlaces(buyDiv, Decimal.ROUND_UP);
       return new Decimal(quote.buyAmount).mul(10_000 - POOL_FILL_BUFFER_BPS).div(10_000).gt(minBack) ? { q, cost, minBack, route: quote.route } : undefined;

@@ -1,6 +1,18 @@
 // Display formatting. Numbers here are for reading only; anything signed goes through money.ts.
 import { parsePlain } from './money';
 
+const VENUE_NAMES: Record<string, string> = {
+  ociswap: 'Ociswap',
+  defiplaza: 'DefiPlaza',
+  // Routed through on a best-effort basis: the project is no longer maintained.
+  caviarnine: 'CaviarNine (unmaintained)',
+};
+
+/** A venue id as shown to people ("caviarnine" → "CaviarNine (unmaintained)"). Unknown ids, and "orders", are shown as they are. */
+export function venueName(id: string): string {
+  return Object.hasOwn(VENUE_NAMES, id) ? VENUE_NAMES[id]! : id;
+}
+
 /** Price with about five significant digits, however small: 0.00095123 → "0.00095123", 1234.5678 → "1,234.6". */
 export function fmtPrice(v: number | null | undefined): string {
   if (v == null || !Number.isFinite(v) || v <= 0) return '—';

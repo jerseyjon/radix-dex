@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { Depth } from '@radix-dex/core/browser';
 import type { MarketTrade } from './api';
 import { ladder } from './book';
-import { fmtAmount, fmtPrice, shownPrice } from './format';
+import { fmtAmount, fmtPrice, shownPrice, venueName } from './format';
 import { Empty, SkeletonRows, TabPanel, Tabs } from './ui';
 
 const ROWS = 11;
@@ -22,7 +22,7 @@ export function Book({ depth, trades, explorer, baseSymbol, quoteSymbol, onPick 
   const spread = asks[0] && bids[0] ? ((asks[0].price - bids[0].price) / ((asks[0].price + bids[0].price) / 2)) * 100 : undefined;
 
   const row = (side: 'ask' | 'bid') => (l: (typeof asks)[number], i: number) => (
-    <button key={side + i} className={`book-row ${side}`} onClick={() => onPick(l.price)} title={`Liquidity from ${l.sources.join(', ')}`}>
+    <button key={side + i} className={`book-row ${side}`} onClick={() => onPick(l.price)} title={`Liquidity from ${l.sources.map((s) => (s === 'orders' ? 'limit orders' : venueName(s))).join(', ')}`}>
       <span className="bar" style={{ width: `${(l.total / max) * 100}%` }} />
       <span className="p">{fmtPrice(l.price)}</span>
       <span>{fmtAmount(l.size)}</span>
@@ -53,7 +53,7 @@ export function Book({ depth, trades, explorer, baseSymbol, quoteSymbol, onPick 
         <div className="trade-list">
           {(trades ?? []).map((t, i) => (
             <a key={t.txid + i} className={`book-row ${t.side === 'buy' ? 'bid' : 'ask'}`} href={`${explorer}/transaction/${t.txid}`} target="_blank" rel="noreferrer"
-              title={`${t.side === 'buy' ? 'Bought' : 'Sold'} ${baseSymbol} ${t.venue === 'here' ? 'on this exchange' : 'on ' + t.venue}. Open the transaction.`}>
+              title={`${t.side === 'buy' ? 'Bought' : 'Sold'} ${baseSymbol} ${t.venue === 'here' ? 'on this exchange' : 'on ' + venueName(t.venue)}. Open the transaction.`}>
               <span className="p">{fmtPrice(t.price)}</span>
               <span>{fmtAmount(t.size)}</span>
               <span className="src">{t.venue === 'here' ? <i className="here" aria-label="made here">●</i> : ''}{clock(t.time)}</span>

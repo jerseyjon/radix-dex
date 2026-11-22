@@ -1,7 +1,7 @@
 /// <reference types="node" />
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { cleanAmount, fmtAmount, fmtAxisPrice, fmtPrice, pricePrecision, shownPrice } from '../src/format.ts';
+import { cleanAmount, fmtAmount, fmtAxisPrice, fmtPrice, pricePrecision, shownPrice, venueName } from '../src/format.ts';
 
 test('fmtAmount: no exponents, sensible units', () => {
   assert.equal(fmtAmount(9e-7), '0.0000009');
@@ -50,4 +50,12 @@ test('shownPrice: the number fmtPrice displays, for picking', () => {
   assert.equal(shownPrice(0), undefined);
   assert.equal(shownPrice(NaN), undefined);
   for (const v of [0.000951234567, 1.234567, 1234.5678, 0.0421337]) assert.equal(fmtPrice(shownPrice(v)), fmtPrice(v));
+});
+
+test('venue names as shown: CaviarNine is marked unmaintained; unknown ids pass through', () => {
+  assert.equal(venueName('caviarnine'), 'CaviarNine (unmaintained)');
+  assert.equal(venueName('ociswap'), 'Ociswap');
+  assert.equal(venueName('defiplaza'), 'DefiPlaza');
+  assert.equal(venueName('radixdex'), 'radixdex');
+  assert.equal(venueName('toString'), 'toString');
 });
