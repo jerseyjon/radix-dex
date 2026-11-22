@@ -310,7 +310,8 @@ export function OrderForm(props: {
           <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(feeTotal(limitFees))} ${buyTok.symbol} (network fee allowance + ${pct(config.feeBps)})` : '—'}</dd></div>
           <div><dt>If another trader takes it</dt><dd>{(config.makerFeeBps ?? 0) > 0 ? `Fee ${pct(config.makerFeeBps ?? 0)}, no network fee` : 'No fee: you get your full price'}</dd></div>
           <div><dt>You receive at least</dt><dd>{limitMinBuy ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
-          {!limitFeeKnown && quoteError && <div><dt>Quote</dt><dd className="warn">{quoteError}</dd></div>}
+          {/* Without a quote the network allowance is the server's fallback (gasXrd × margin): say why. */}
+          {quoteError && <div><dt>Quote</dt><dd className="warn">{quoteError}</dd></div>}
           <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
           <div><dt>Expires in</dt><dd><select className="select" aria-label="Expires in" value={expiry} onChange={(e) => setExpiry(Number(e.target.value))}>{EXPIRIES.map(([l, s]) => <option key={s} value={s}>{l}</option>)}</select></dd></div>
         </dl>
