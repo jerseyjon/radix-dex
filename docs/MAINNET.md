@@ -15,14 +15,16 @@ from its own account, paying fees from the XRD sent to it.
   and fill open signed orders at their limit price instead of better. It cannot take users' funds
   beyond what their orders allow. The owner can recall the solver badge to stop all filling.
 - **The solver's float.** Each fill costs the solver a network fee (1.0 to 1.4 XRD measured on
-  mainnet), recovered from the order in the bought token. A fill that fails on ledger still costs
+  mainnet), recovered from the order in XRD (since 22 Nov 2026; before that, in the bought token). A fill that fails on ledger still costs
   its fee. Every transaction is previewed in full first and not sent if the preview fails, and the
   solver stops sending once fees lost on failed transactions in the last hour reach
   `DEX_FAILED_FEE_LIMIT_XRD` (3 XRD by default). Buying book orders needs the float plus 10 XRD
   for the fee lock, which the solver never spends.
-- **Fees in thin tokens (audit H3, not fixed).** The network fee is recovered in whatever token
-  the order buys, valued at its best pool's price. An attacker's own token with its own small pool
-  can make that worthless. See `docs/review-2026-11-21/fixes.md` for the options.
+- **Fees in thin tokens (audit H3): fixed 22 Nov 2026.** The solver's charges are always XRD: from
+  the XRD an order buys, from the XRD it sells (before the swap), or between two swaps through XRD.
+  Every solver transaction ends with an assertion that only XRD is left for the solver, so it cannot
+  be paid in anything else. Pairs with no XRD and no route through XRD are refused. Details:
+  `docs/review-2026-11-21/fee-side.md`.
 - Liquidity on Radix is thin (most markets hold a few thousand dollars), so large orders move prices.
 
 ## Steps
@@ -90,7 +92,24 @@ checks it, writes it mode 600 and keeps the newest 30. `deploy/radix-dex-backup.
 ## Still to do after the first release
 
 Split routing across several pools; splitting signed limit orders; an independent review of
-`OrderBook`; a decision on fees in thin tokens (audit H3); running under a separate user (audit M4).
+`OrderBook`; converting fees to XRD for pairs with no route through XRD (rule 2(b) in
+`docs/review-2026-11-21/fee-side.md`); running under a separate user (audit M4).
+
+## The fee rule and `DEX_FEE_TOKENS`
+
+The solver takes its network fee and service fee in XRD only, and the exchange holds nothing else.
+Which pairs it fills follows from the listed pools: XRD on one side, or a listed pool from each
+token to XRD (it then routes through XRD and takes its charges between the two swaps). Nothing needs
+setting for that.
+
+`DEX_FEE_TOKENS` is a comma-separated list of resource addresses: tokens that could be converted to
+XRD inside a fill to pay the charges, for pairs with no route through XRD. That conversion is not
+built yet (see `docs/review-2026-11-21/fee-side.md`, rule 2(b)), so today the list is only published
+in `/api/config` (`fees.feeTokens`). The default, by network, is in `apps/server/src/config.ts`
+(mainnet: hUSDC and DFP2, with the evidence for each address in `fee-side.md`). To change it, set the
+variable in the service's environment (`scripts/run-mainnet.sh` or the unit) and restart; to change
+the default, edit `DEFAULT_FEE_TOKENS` and record the evidence. A malformed address, or one for the
+other network, stops the server at start-up. Always by address: symbols can be copied by anyone.
 
 ## Taking out the solver's earnings
 
@@ -100,6 +119,8 @@ The solver account's key is only on the server, so its funds are moved from ther
     npx tsx scripts/mainnet-withdraw.ts --send     # send it to the owner account from the set-up
 
 It keeps 250 XRD in the solver (`--keep <n>` to change) as its float for network fees and for buying
-book orders, and sends the rest, with every other token collected as fees, to the owner account. The
+book orders, and sends the rest, with every other token it holds, to the owner account. Since the
+solver takes its fees in XRD only, any other token there is old (collected before 22 Nov 2026) or was
+sent to it; `/api/health` reports "solver holds N token(s) other than XRD" until it is moved. The
 solver badge never moves. The balance can be watched at
 `https://dashboard.radixdlt.com/account/<solver account>`.

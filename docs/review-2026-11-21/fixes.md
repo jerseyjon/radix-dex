@@ -34,7 +34,7 @@ is clean, and the three Stokenet e2e scripts pass (see the end).
 |---|---|---|
 | H1 | **Fixed** (`2cdc78a`, `9dd90ca`, `7b730ae`) | Every transaction is previewed with `/transaction/preview-v2` as the exact transaction (root intent plus the signed orders as children, signers by public key, no free credit, no assumed signatures) and only sent if that succeeds. Verified on Stokenet with real signed orders. A key already used by any stored order is refused (409); a key cancelled in the registry is refused at submission (400) and closes the order before a fill. Failures count per order and per account (6 a day bars the account). Loss limit (circuit breaker) on failed-transaction fees. |
 | H2 | **Fixed** (`9dd90ca`) | Book orders and signed orders are only considered when their two tokens form a listed market; frozen or recalled vaults now fail in preview (free); book purchases and crosses back off 1, 4, 16 min and then wait until the order changes. Reading token roles (recall/freeze locked) was not added: with previews it would only save Gateway calls. |
-| H3 | **Needs owner decision** | Not changed, as instructed. Options and recommendation below. |
+| H3 | **Fixed** (branch `fee-side`, 22 Nov) | The owner chose: the solver's charges are always XRD. Taken from the XRD side of every fill, or between two swaps through XRD; pairs with neither are refused. See [fee-side.md](fee-side.md). |
 | M1 | **Fixed** (`9dd90ca`) | See "Blame" below. |
 | M2 | **Partly fixed** (`9dd90ca`, `7b730ae`) | Resting orders and book orders capped per pass (20 each) and taken in turns; resting orders far from the market re-quoted at most once a minute; book crossing compares price-sorted groups (no O(n²)); book orders under 5 XRD ignored by the solver; `/api/quote` counts as 4 requests and refuses non-plain amounts. Not done: rounding quote amounts for the cache, one quote per market per pass, own Gateway, and `BookWatcher` still re-reads every open book order on each refresh. |
 | M3 | Not fixed | Front end (hard cancel in the UI, recoverable secrets): out of scope tonight. |
@@ -151,6 +151,10 @@ is closed; an account short of funds is held, not charged; a preview rejected fo
 fee lock, or a solver below its fee lock, charges nobody.
 
 ## H3: fees in a worthless token (owner's decision)
+
+**Fixed on branch `fee-side` (22 Nov 2026).** The owner's rule: the solver's charges always end up as
+XRD. What changed, the worked examples and the deploy notes are in [fee-side.md](fee-side.md). The
+options below are kept as they were written.
 
 The network fee and the 0.10% are taken in the token the order buys, valued through that token's
 best listed pool. An attacker's own token, with its own pool over the $300 listing floor, can make

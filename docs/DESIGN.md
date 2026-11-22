@@ -81,7 +81,7 @@ YIELD_TO_PARENT;
   instruction by instruction with this template. Anything else is rejected.
 - **Fill**: the solver builds a root transaction that yields to the order, receives the
   sell bucket, swaps it through pools (or hands it to a crossing order), returns the buy
-  resource, and keeps the fee. Before sending, it previews that exact transaction, with the
+  resource, and keeps its charges, in XRD only (see "Fees: always XRD" below). Before sending, it previews that exact transaction, with the
   signed orders as children, on the Gateway's `/transaction/preview-v2` (no free credit, no
   assumed signatures) and sends it only if the preview succeeds. The toolkit cannot build a
   preview payload, so `previewTransactionV2Hex` in `packages/core/src/tx.ts` writes it out.
@@ -97,6 +97,8 @@ YIELD_TO_PARENT;
   An order key may be used by one order only, and one cancelled in the registry is refused.
 - **Price improvement**: the solver returns *everything* the route produced, less the
   configured fee and the network cost, not merely the user's minimum.
+- **Which pairs**: XRD on one side, or a listed pool from each token to XRD. Orders in any other
+  pair are refused at submission (400), and such orders already stored stay open with the reason.
 - **Order vs order**: a taker takes up to four resting orders (signed or in the book) and
   pools for the rest, in one transaction.
 - **All or nothing**: a subintent fills whole or not at all. The UI says so. Large orders
@@ -179,14 +181,52 @@ Every order, market or limit, is a signed subintent filled by the solver. Each o
   market pays that much for the whole order. It is the price shown in the book. It is not signed:
   it is the user's instruction to the solver, and the server refuses a trigger below the signed minimum.
 - **the signed minimum** (`minBuyAmount`): the trigger less the fee allowance (the network fee
-  allowance for the route, which `/api/quote` gives as `gasAllowanceInBuyToken`: the solver's
-  estimate with a 25% margin, plus the service fee). The Radix Engine enforces it, and it is the
-  figure the wallet shows. If the solver's estimate has since risen above the allowance, it still
-  fills the order at its trigger as long as the allowance covers 75% of the estimate, and bears
-  the rest itself.
+  allowance for the route, which `/api/quote` gives as `gasAllowanceXrd`: the solver's estimate with
+  a 25% margin, plus the service fee), as they apply on the side they are taken (below). The Radix
+  Engine enforces it, and it is the figure the wallet shows. If the solver's estimate has since risen
+  above the allowance, it still fills the order at its trigger as long as the allowance covers 75% of
+  the estimate, and bears the rest itself.
 
-So an order fills when the market reaches its price and the fees come out of the proceeds, as on an
+So an order fills when the market reaches its price and the fees come out of it, as on an
 exchange. "Fill only at my price" is the solver's promise; "never less than the minimum" is the ledger's.
+
+### Fees: always XRD (since 22 Nov 2026)
+
+The solver's charges, the network fee it pays plus the service fee (`DEX_TAKER_FEE_BPS`), are taken
+in XRD and nothing else, so the exchange earns and holds XRD only (audit H3: before this, they were
+taken in whatever token the order bought, which an attacker's own token made worthless).
+
+| The order | Where the charges come from | What the user gets | Service fee on |
+|---|---|---|---|
+| buys XRD | the XRD it receives, after the swap (as before) | the proceeds less the charges | the XRD received |
+| sells XRD | the XRD it sells, set aside before the swap | everything the rest of the XRD buys | the XRD sold |
+| neither is XRD | between two swaps: token → XRD, charges, XRD → token | everything the second swap produces | the XRD from the first swap |
+
+When the charges are set aside before the last swap, the order's trigger is applied to what is
+actually swapped: the solver fills when the XRD left after its charges fetches at least the order's
+price (`trigger × (base − charges) / base`, rounded down to the bought token's places), and at least
+the signed minimum plus the usual 5 bp margin (`xrdLegNeeded`, `planXrdLegFill` in
+`packages/core/src/solver.ts`). At the order's own price that is the same figure as before, so orders
+signed under the old rule still fill (tested). If the full charges do not fit, the solver tries once
+with less (down to its network fee less the 25% tolerance), quoting the pool leg again.
+
+A pair with no XRD goes through a listed pool from each token to XRD, and only through pools:
+other traders' orders are not used for it, and the solver does not buy book orders in it. A pair
+with no such route is not filled at all.
+
+Every solver transaction ends `ASSERT_WORKTOP_RESOURCES_ONLY { XRD }` before the solver sweeps the
+worktop, so a transaction that would leave it any other token (a pool handing back input, change
+from the order book) fails, in preview, for free. The same rule shapes the rest:
+
+- A maker fee is charged only when it is paid in XRD (the taker sells XRD); otherwise the maker gets
+  its full price.
+- A taker buying XRD from book orders needs a pool leg to absorb any change the book hands back in
+  the token it sells; without one, that plan is not used.
+- The solver buys book orders with its own funds only when they want XRD (it pays XRD and sells what
+  it bought back to XRD), and crosses two book orders only with XRD, only where the book's own sums
+  leave no change in the other token (`planBookCrossExact`). Book orders that sell XRD for a token
+  are left to takers.
+- `/api/health` reports a problem when the solver's account holds any token other than XRD and its badge.
 
 On each pass the solver treats every open order as a taker, market orders first, then the newest.
 For a taker it compares filling through pools alone with taking the best one to four resting
@@ -240,14 +280,17 @@ How they get filled:
 2. **By the solver, when a pool reaches the price.** A book order is paid its price and no
    more. When a pool pays more than the order asks, the solver buys from the order with its own
    funds, sells through the pool and keeps the difference, which is what pays the network fee.
+   Only for orders that want XRD: the solver spends and earns XRD alone.
 
 Fees: `DEX_TAKER_FEE_BPS` (default 10) is charged to the order that takes liquidity;
-`DEX_MAKER_FEE_BPS` (default 0) to a signed order when another order takes it. A book order's
+`DEX_MAKER_FEE_BPS` (default 0) to a signed order when another order takes it, and paid in XRD (see
+"Fees: always XRD"). A book order's
 maker fee is set in the contract and fixed for each order when it is placed.
 
 3. **By the solver, when two book orders cross.** A buyer bidding at or above what a seller
    asks: the solver pays the seller with its own funds, passes the tokens to the buyer, and
-   keeps the difference. Each order gets exactly its own price.
+   keeps the difference. Each order gets exactly its own price. The solver fronts XRD to the order
+   that sells a token for XRD, and only for amounts the book's sums settle with no change left.
 
 A book order's sales are read from the component's own events (`OrderFilledEvent`, accepted only
 when the order book itself emitted them) and listed in the maker's trade history.
