@@ -186,6 +186,13 @@ export class Quoter {
     const buy = path[path.length - 1]!;
     // A lone OwnerPool is quoted from its state, no preview needed. Longer routes through one are previewed like any other.
     if (route.length === 1 && route[0]!.venue === 'ownerpool') return this.ownerPoolQuote(route[0]!, sell, amount);
+    // A paused OwnerPool (the owner's pause, the operator's, or a revoked operator) is not a route at all:
+    // no preview of a route through it, so it is never offered and never ranked.
+    for (const p of route) {
+      if (p.venue !== 'ownerpool') continue;
+      const st = await this.ownerPoolState(p.address);
+      if (st.paused) { this.lastFailure = `${p.address}: Swaps are paused`; return undefined; }
+    }
     const epoch = await this.currentEpoch();
     const funders = (await this.fundersFor(sell)).filter((f) => f.amount.gte(amount)).slice(0, 3);
     for (const funder of funders) {
@@ -250,7 +257,7 @@ export class Quoter {
    * NETWORK FEE wins (`netOfGas`; `hub` is XRD), for every venue, so a cheaper route wins a near tie
    * on a small trade and the better price wins on a large one. The fee is the measured one, without
    * any venue's charging margin. Fees differ by venue: on mainnet an Ociswap basic pool swap previews
-   * at ~0.5 XRD, a precision pool ~0.9, CaviarNine 0.9 to 1.5; on Stokenet an OwnerPool 0.46.
+   * at ~0.5 XRD, a precision pool ~0.9, CaviarNine 0.9 to 1.5; on Stokenet an OwnerPool 0.46 (split package 0.49).
    *
    * All routes' fees are valued in the bought token at one rate: 1 when buying XRD, the best quote's
    * own price when selling XRD, and otherwise `xrdRate` (one cached preview per token, only for pairs

@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import {
-  Decimal, Gateway, NETWORKS, accountOf, keyFromHex, limitOrderManifest, orderKeyFromSecret, ownerPoolQuote, readOwnerPools, signSubintent,
+  Decimal, Gateway, NETWORKS, OWNER_POOL_SWAP_FEE_XRD, accountOf, keyFromHex, limitOrderManifest, orderKeyFromSecret, ownerPoolQuote, readOwnerPools, signSubintent,
 } from '../packages/core/src/index.ts';
 import { createApp } from '../apps/server/src/app.ts';
 import { loadConfig } from '../apps/server/src/config.ts';
@@ -28,6 +28,8 @@ const s = JSON.parse(readFileSync(`${dataDir}/stokenet-keys.json`, 'utf8'));
 const op = JSON.parse(readFileSync(`${dataDir}/stokenet-owner-pool.json`, 'utf8'));
 const TEUR: string = op.teur, POOL: string = op.pool;
 const gw = new Gateway(net);
+/** The fill estimate the server quotes for a one-swap fill: the pool's swap fee plus the fill's own 0.5 XRD. */
+const GAS_ESTIMATE = new Decimal(OWNER_POOL_SWAP_FEE_XRD).plus('0.5').toFixed();
 
 // This instance's own markets file: XRD/TEUR on the OwnerPool, nothing else.
 const marketsFile = join(mkdtempSync(join(tmpdir(), 'owner-pool-e2e-')), 'markets.json');
@@ -86,6 +88,13 @@ async function waitFilled(id: string) {
 const solverTeur0 = await balance(solverAccount, TEUR);
 const fees: { direction: string; txid: string; feeXrd: string; estimateXrd: string }[] = [];
 
+// 0. On a split pool: an operator is appointed and the pool holds inventory, which no quote may count.
+{
+  const p = await poolState();
+  if (p.split) expect(p.split.operator !== null && new Decimal(p.split.inventoryA).gt(0) && !p.paused,
+    `split pool: operator ${p.split.operator}, inventory ${p.split.inventoryA} XRD / ${p.split.inventoryB} TEUR kept out of the reserves (${p.reserveA} / ${p.reserveB})`);
+}
+
 // 1. Listing, quote, depth.
 const markets = await json('/api/markets');
 expect(markets.length === 1 && markets[0].venues[0] === 'ownerpool' && markets[0].pools[0] === POOL, 'this instance lists only XRD/TEUR, on the OwnerPool by its address');
@@ -94,7 +103,7 @@ expect(markets.length === 1 && markets[0].venues[0] === 'ownerpool' && markets[0
   const q = await json(`/api/quote?sell=${XRD}&buy=${TEUR}&amount=50`);
   const local = ownerPoolQuote(before, XRD, '50');
   expect(q.buyAmount === local && q.route?.[0]?.venue === 'ownerpool', `quote for 50 XRD: ${q.buyAmount} TEUR, the OwnerPool arithmetic on its ledger state gives ${local}`);
-  expect(q.networkFeeXrd === '0.46' && q.gasXrd === '0.96', `quote carries the measured swap fee ${q.networkFeeXrd} XRD; fill estimate ${q.gasXrd} XRD`);
+  expect(q.networkFeeXrd === OWNER_POOL_SWAP_FEE_XRD && q.gasXrd === GAS_ESTIMATE, `quote carries the measured swap fee ${q.networkFeeXrd} XRD; fill estimate ${q.gasXrd} XRD`);
   const depth = await json('/api/depth?market=' + encodeURIComponent(markets[0].id));
   expect(depth.bids.length === 6 && depth.asks.length === 6 && depth.bids[0].price < depth.asks[0].price, `depth from the pool: ${depth.bids.length} bids (best ${depth.bids[0]?.price}), ${depth.asks.length} asks (best ${depth.asks[0]?.price})`);
 }
@@ -117,7 +126,7 @@ expect(markets.length === 1 && markets[0].venues[0] === 'ownerpool' && markets[0
     expect(poolOut.toFixed() === ownerPoolQuote(before, XRD, poolIn.toFixed()), `the pool paid ${poolOut} TEUR for ${poolIn} XRD, exactly its quote for that input at the state before`);
     expect(/"swap_with_minimum"/.test(d.manifest) && !/"swap" /.test(d.manifest), 'the fill called swap_with_minimum on the pool');
     console.log('      pool call: ' + (/"swap_with_minimum"\s+Bucket\("[^"]+"\)\s+Decimal\("[^"]+"\)/.exec(d.manifest)?.[0] ?? '?').replace(/\s+/g, ' '));
-    fees.push({ direction: 'XRD->TEUR', txid: st.fillTx, feeXrd: d.fee.toFixed(), estimateXrd: '0.96' });
+    fees.push({ direction: 'XRD->TEUR', txid: st.fillTx, feeXrd: d.fee.toFixed(), estimateXrd: GAS_ESTIMATE });
   }
 }
 
@@ -141,7 +150,7 @@ expect(markets.length === 1 && markets[0].venues[0] === 'ownerpool' && markets[0
     expect(got.gte(min) && got.plus(kept).eq(poolOut), `alice received ${got} XRD (min ${min}); the solver took ${kept} XRD (its charges; it paid ${d.fee} XRD network fee)`);
     expect(/"swap_with_minimum"/.test(d.manifest), 'the fill called swap_with_minimum on the pool');
     console.log('      pool call: ' + (/"swap_with_minimum"\s+Bucket\("[^"]+"\)\s+Decimal\("[^"]+"\)/.exec(d.manifest)?.[0] ?? '?').replace(/\s+/g, ' '));
-    fees.push({ direction: 'TEUR->XRD', txid: st.fillTx, feeXrd: d.fee.toFixed(), estimateXrd: '0.96' });
+    fees.push({ direction: 'TEUR->XRD', txid: st.fillTx, feeXrd: d.fee.toFixed(), estimateXrd: GAS_ESTIMATE });
   }
 }
 

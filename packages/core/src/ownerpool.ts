@@ -20,7 +20,10 @@ export const OWNER_POOL_PACKAGES: Record<string, string[]> = {
   mainnet: [],
   // Published 22 Nov 2026 from scrypto/owner-pool at c8c2be0 with throwaway keys (scripts/stokenet-owner-pool.ts).
   // Code hash (blake2b-256 of the wasm) 1dd88642…6eed78b9d3; wasm sha256 390362e6…c8e68091.
-  stokenet: ['package_tdx_2_1p4tzj0gfzh8uzr9ca4y26jrwrevgu8uur7aukzmj3050vmp4y4vrzw'],
+  // Published 22 Nov 2026 from scrypto/owner-pool at 934c904 (pool-split: cold owner badge, hot operator
+  // badge, inventory) with throwaway keys, txid_tdx_2_1s9hkv8j4rml4v722epz4q6ycnn0gdca4fy30mzjxmx0rlvsukngsgce0je.
+  // Code hash 0b460d5f…446a7872; wasm sha256 16aed69e…f6acb0dd.
+  stokenet: ['package_tdx_2_1p4tzj0gfzh8uzr9ca4y26jrwrevgu8uur7aukzmj3050vmp4y4vrzw', 'package_tdx_2_1pklhl0ma6mepuxakg0pk2tgf4ej05uwgwu8gm0ajv5xa9acsjd4fll'],
 };
 export const OWNER_POOL_BLUEPRINT = 'OwnerPool';
 /** The blueprint's hard cap on the swap fee (`OWNER_POOL_MAX_FEE_BPS` in lib.rs). */
@@ -29,11 +32,13 @@ export const OWNER_POOL_MAX_FEE_BPS = 500;
 /**
  * Network fee, in XRD, of previewing `withdraw` + one OwnerPool `swap` + `deposit_batch` (the same
  * shape `Quoter.simulate` previews for other venues, so the figures compare like for like).
- * Measured on Stokenet on 22 Nov 2026 with `scripts/stokenet-owner-pool.ts gas`: 10 previews, both
- * directions, 0.01 to 6,000 XRD and 0.000123 to 2 TEUR, all between 0.45578 and 0.45654 XRD (the
- * existing radixdex test Pool, same shape: 0.5253). Rounded up. The figure barely moves with size.
+ * Measured on Stokenet on 22 Nov 2026 with `scripts/stokenet-owner-pool.ts gas`, 10 previews each,
+ * both directions, 0.01 to 6,000 XRD and 0.000123 to 2 TEUR: the first package (c8c2be0) 0.45578 to
+ * 0.45654 XRD; the split package (934c904, larger state read on every call) 0.49082 to 0.49157 XRD
+ * (the existing radixdex test Pool, same shape: 0.5253). One figure for both, rounded up from the
+ * larger. The figure barely moves with size.
  */
-export const OWNER_POOL_SWAP_FEE_XRD = '0.46';
+export const OWNER_POOL_SWAP_FEE_XRD = '0.5';
 
 export interface OwnerPoolState {
   address: string;
@@ -42,13 +47,46 @@ export interface OwnerPoolState {
   resourceB: string;
   divisibilityA: number;
   divisibilityB: number;
-  /** Vault balances, as exact decimal strings. */
+  /** Trading reserves (the curve's two vaults), as exact decimal strings. Never the inventory. */
   reserveA: string;
   reserveB: string;
   feeBps: number;
+  /** True while swaps are refused: the owner's pause OR (split pools) the operator's pause. */
   paused: boolean;
   /** Ledger state version the Gateway read this at. */
   stateVersion?: number;
+  /** Split (cold owner / hot operator) pools only: everything else the component holds and says. */
+  split?: OwnerPoolSplitState;
+}
+
+/** What the operator may do (`OperatorLimits` in lib.rs). Decimals as exact strings. */
+export interface OwnerPoolOperatorLimits {
+  moveBudgetBps: number;
+  windowEpochs: number;
+  maxReserveA: string;
+  maxReserveB: string;
+  minReserveA: string;
+  minReserveB: string;
+  minFeeBps: number;
+  maxFeeBps: number;
+}
+
+/** The split blueprint's extra state (pool-split, 934c904 and later). */
+export interface OwnerPoolSplitState {
+  ownerPaused: boolean;
+  operatorPaused: boolean;
+  /** Inventory vaults: owned by the pool's owner, not traded, not part of any quote. */
+  inventoryA: string;
+  inventoryB: string;
+  ownerBadge: string;
+  /** The operator badge, or null when there is none (never appointed, or revoked). */
+  operator: string | null;
+  limits: OwnerPoolOperatorLimits;
+  /** Stored allowance as of `allowanceEpoch`; use `ownerPoolAllowanceNow` for what is available. */
+  allowance: string;
+  allowanceEpoch: number;
+  /** The anchor (A, B): "B of token B for A of token A". ['0', '0'] until the owner states one. */
+  anchor: [string, string];
 }
 
 /** A quote the ledger would refuse, with the blueprint's own panic message. */
@@ -145,16 +183,73 @@ export function ownerPoolAfterSwap(state: OwnerPoolState, inputResource: string,
 
 // ------------------------------------------------------------------ reading the ledger
 
-const fieldOf = (fields: any[], name: string): any => {
+const fieldNode = (fields: any[], name: string): any => {
   const f = (fields ?? []).find((x: any) => x?.field_name === name);
   if (!f) throw new Error(`OwnerPool state has no field "${name}"`);
-  return f.value;
+  return f;
+};
+const fieldOf = (fields: any[], name: string): any => fieldNode(fields, name).value;
+const hasField = (fields: any[], name: string): boolean => (fields ?? []).some((x: any) => x?.field_name === name);
+
+/** A Decimal field of programmatic JSON, checked. */
+const decimalOf = (v: any, what: string): string => {
+  const s = String(v?.value ?? v);
+  try { toAttos(s); } catch { throw new Error(`OwnerPool ${what} is not a decimal: ${s}`); }
+  return s;
+};
+const intOf = (v: any, what: string, max: number): number => {
+  const n = Number(v?.value ?? v);
+  if (!Number.isSafeInteger(n) || n < 0 || n > max) throw new Error(`OwnerPool ${what} out of range: ${v?.value ?? v}`);
+  return n;
 };
 
+/** The split blueprint's state fields (present only when the component has an `inventory_a` field). */
+function parseSplit(fields: any[], vaultAmount: (field: string) => string): OwnerPoolSplitState {
+  const operatorPaused = fieldOf(fields, 'operator_paused');
+  if (typeof operatorPaused !== 'boolean') throw new Error('OwnerPool operator_paused is not a boolean');
+  // Option<ResourceAddress>: an Enum whose Some variant holds one Reference.
+  const op = fieldNode(fields, 'operator');
+  const variant = op.variant_name ?? (op.variant_id === '1' || op.variant_id === 1 ? 'Some' : op.variant_id === '0' || op.variant_id === 0 ? 'None' : undefined);
+  let operator: string | null;
+  if (variant === 'None') operator = null;
+  else if (variant === 'Some' && typeof op.fields?.[0]?.value === 'string') operator = op.fields[0].value;
+  else throw new Error('OwnerPool operator is not an Option<ResourceAddress>');
+  const lf = fieldNode(fields, 'limits').fields;
+  const limits: OwnerPoolOperatorLimits = {
+    moveBudgetBps: intOf(fieldOf(lf, 'move_budget_bps'), 'move_budget_bps', 10_000),
+    windowEpochs: intOf(fieldOf(lf, 'window_epochs'), 'window_epochs', Number.MAX_SAFE_INTEGER),
+    maxReserveA: decimalOf(fieldOf(lf, 'max_reserve_a'), 'max_reserve_a'),
+    maxReserveB: decimalOf(fieldOf(lf, 'max_reserve_b'), 'max_reserve_b'),
+    minReserveA: decimalOf(fieldOf(lf, 'min_reserve_a'), 'min_reserve_a'),
+    minReserveB: decimalOf(fieldOf(lf, 'min_reserve_b'), 'min_reserve_b'),
+    minFeeBps: intOf(fieldOf(lf, 'min_fee_bps'), 'min_fee_bps', OWNER_POOL_MAX_FEE_BPS),
+    maxFeeBps: intOf(fieldOf(lf, 'max_fee_bps'), 'max_fee_bps', OWNER_POOL_MAX_FEE_BPS),
+  };
+  const anchor = fieldNode(fields, 'anchor').fields ?? [];
+  if (anchor.length !== 2) throw new Error('OwnerPool anchor is not a pair');
+  return {
+    ownerPaused: fieldOf(fields, 'paused') === true,
+    operatorPaused,
+    inventoryA: vaultAmount('inventory_a'),
+    inventoryB: vaultAmount('inventory_b'),
+    ownerBadge: String(fieldOf(fields, 'owner_badge')),
+    operator,
+    limits,
+    allowance: decimalOf(fieldOf(fields, 'allowance'), 'allowance'),
+    allowanceEpoch: intOf(fieldOf(fields, 'allowance_epoch'), 'allowance_epoch', Number.MAX_SAFE_INTEGER),
+    anchor: [decimalOf(anchor[0], 'anchor'), decimalOf(anchor[1], 'anchor')],
+  };
+}
+
 /**
- * Parse one item of `/state/entity/details` (default options) for an OwnerPool component. Checks
- * the blueprint, and the package when `allowedPackages` is given. Reserves are the component's
- * fungible balances, which are exactly its two vaults (it holds no others).
+ * Parse one item of `/state/entity/details` for an OwnerPool component. Checks the blueprint, and
+ * the package when `allowedPackages` is given.
+ *
+ * Reserves are read vault by vault: the state names each vault (`vault_a`, `vault_b`, and on split
+ * pools `inventory_a`, `inventory_b`), and the item must be read with `aggregation_level: "Vault"`
+ * so each vault's own balance is listed. A split pool holds each token in TWO vaults (reserve and
+ * inventory), so a per-resource total would overstate the curve; such an item is refused. The
+ * pre-split blueprint holds exactly two vaults, so a per-resource total is still accepted for it.
  */
 export function parseOwnerPoolDetails(item: any, allowedPackages?: string[], stateVersion?: number): OwnerPoolState {
   const d = item?.details;
@@ -172,24 +267,44 @@ export function parseOwnerPoolDetails(item: any, allowedPackages?: string[], sta
   if (typeof paused !== 'boolean') throw new Error('OwnerPool paused is not a boolean');
   const items: any[] = item?.fungible_resources?.items ?? [];
   if (item?.fungible_resources?.next_cursor) throw new Error('OwnerPool holds more resources than expected');
-  const balance = (resource: string) => {
+  const isSplit = hasField(fields, 'inventory_a');
+  const byVault = items.some((i) => i?.vaults !== undefined);
+  const vaults = new Map<string, string>();
+  for (const it of items) {
+    if (it?.vaults?.next_cursor) throw new Error('OwnerPool holds more vaults than expected');
+    for (const v of it?.vaults?.items ?? []) vaults.set(String(v.vault_address), String(v.amount));
+  }
+  const checked = (amount: string) => { toAttos(amount); return amount; };
+  /** The balance of the vault a state field names. A vault never funded may be listed with 0 or not at all. */
+  const vaultAmount = (field: string) => {
+    const v = fieldOf(fields, field);
+    if (typeof v !== 'string' || !v.startsWith('internal_vault_')) throw new Error(`OwnerPool ${field} is not a vault`);
+    return checked(vaults.get(v) ?? '0');
+  };
+  const total = (resource: string) => {
     const it = items.find((i) => i?.resource_address === resource);
-    // A vault that has never been funded may be listed with 0 or not at all.
-    const amount = it === undefined ? '0' : String(it.amount);
-    toAttos(amount);
-    return amount;
+    return checked(it === undefined ? '0' : String(it.amount));
   };
-  return {
+  if (isSplit && !byVault) throw new Error('OwnerPool with inventory: read it with aggregation_level "Vault" (a per-token total includes the inventory)');
+  const reserveA = byVault ? vaultAmount('vault_a') : total(resourceA);
+  const reserveB = byVault ? vaultAmount('vault_b') : total(resourceB);
+  const out: OwnerPoolState = {
     address: String(item.address), packageAddress: String(d.package_address), resourceA, resourceB, divisibilityA, divisibilityB,
-    reserveA: balance(resourceA), reserveB: balance(resourceB), feeBps, paused, stateVersion,
+    reserveA, reserveB, feeBps, paused, stateVersion,
   };
+  if (isSplit) {
+    out.split = parseSplit(fields, vaultAmount);
+    // Swaps (and the ledger's `quote`) are refused while EITHER pause is on.
+    out.paused = out.split.ownerPaused || out.split.operatorPaused;
+  }
+  return out;
 }
 
-/** Read OwnerPool components from the ledger, in one Gateway call per 20. */
+/** Read OwnerPool components from the ledger, vault by vault, in one Gateway call per 20. */
 export async function readOwnerPools(gateway: Gateway, addresses: string[], allowedPackages?: string[]): Promise<OwnerPoolState[]> {
   const out: OwnerPoolState[] = [];
   for (let i = 0; i < addresses.length; i += 20) {
-    const j = await gateway.post('/state/entity/details', { addresses: addresses.slice(i, i + 20) });
+    const j = await gateway.post('/state/entity/details', { addresses: addresses.slice(i, i + 20), aggregation_level: 'Vault' });
     const sv = j?.ledger_state?.state_version;
     for (const a of addresses.slice(i, i + 20)) {
       const item = (j?.items ?? []).find((x: any) => x?.address === a);

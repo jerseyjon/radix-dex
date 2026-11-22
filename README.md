@@ -32,7 +32,7 @@ Why it is built this way: [docs/REVIEW.md](docs/REVIEW.md). How it works:
 | `apps/server` | HTTP API (markets, candles, depth, quotes, orders) and the solver loop |
 | `apps/web` | The trading terminal (React + Vite) |
 | `scrypto/dex-contracts` | `OrderRegistry` (hard cancel), `Pool` (rounding-safe constant-product pool) and `OrderBook` (resting orders with partial fills) |
-| `scrypto/owner-pool` | `OwnerPool`: a constant-product pool only the owner badge can fund or withdraw from, for a market-making bot. Its own crate and package (published on Stokenet only, `scripts/stokenet-owner-pool.ts`; not on mainnet), so `dex-contracts` still rebuilds to the published wasm. Before instantiating: the badge must be a non-fungible, or a 0-divisibility fungible with supply 1, with no minter and every role locked (a proof of any amount of the badge is full, permanent ownership); both pooled tokens must have recall, freeze and mint denied and locked. See `docs/review-2026-11-21/owner-pool-audit.md`. |
+| `scrypto/owner-pool` | `OwnerPool`: a constant-product pool only the owner badge can fund or withdraw from, for a market-making bot. Its own crate and package (published on Stokenet only, `scripts/stokenet-owner-pool.ts`; not on mainnet), so `dex-contracts` still rebuilds to the published wasm. Before instantiating: the badge must be a non-fungible, or a 0-divisibility fungible with supply 1, with no minter and every role locked (a proof of any amount of the badge is full, permanent ownership); both pooled tokens must have recall, freeze and mint denied and locked. See `docs/review-2026-11-21/owner-pool-audit.md`. Since the cold/hot split (`docs/review-2026-11-21/owner-pool-split-design.md`) an optional operator badge can move funds between the pool's inventory and its reserves within owner-set limits; manifests for every owner and operator call, and the operator's budget arithmetic, are in `packages/core/src/ownerpool-ops.ts`. |
 | `scripts` | Live checks and Stokenet end-to-end tests |
 
 ## Run it
@@ -92,7 +92,7 @@ npx tsx scripts/stokenet-e2e.ts        # first-version test; still the script th
 npx tsx scripts/stokenet-server-e2e.ts # two signed orders crossed through the HTTP API and solver
 npx tsx scripts/stokenet-setup.ts      # publish contracts, pool, registry and dApp definition on Stokenet
 npx tsx scripts/stokenet-pool-e2e.ts   # pool fill and on-ledger cancel against that deployment
-npx tsx scripts/stokenet-owner-pool.ts setup|exercise|quotes|gas [--send] [--data DIR]   # OwnerPool on Stokenet (preview unless --send)
+npx tsx scripts/stokenet-owner-pool.ts setup|exercise|operator|revoke|restore|quotes|gas|status [--send] [--data DIR]   # split OwnerPool on Stokenet (preview unless --send)
 npx tsx scripts/stokenet-owner-pool-e2e.ts [--data DIR]   # market orders both ways through it, separate in-process server
 npx tsx scripts/stokenet-book-e2e.ts   # on-ledger order book: partial fills, cancel, fill when a pool reaches the price
 scripts/run-stokenet.sh                # run the Stokenet test site with wallet connect on port 8788
