@@ -27,6 +27,13 @@ export interface Config {
   maxOpenOrdersPerAccount: number;
   /** Optional JSON file of extra tokens and pools (used on Stokenet, where no venue API exists). */
   marketsFile: string | undefined;
+  /**
+   * OwnerPool components to route through, by component address (`DEX_OWNER_POOLS`, comma-separated).
+   * Anyone can instantiate an OwnerPool, so pools are only ever listed by address, never discovered;
+   * each must also be an `OwnerPool` of a package in `OWNER_POOL_PACKAGES` for the network, checked
+   * on the ledger. On Stokenet the markets file may list them too (venue "ownerpool").
+   */
+  ownerPools: string[];
   /** dApp definition account the wallet checks the site against. Without it the site is read-only. */
   dAppDefinition: string | undefined;
   /** Header carrying the visitor's address when the server sits behind a proxy (for example `cf-connecting-ip` behind Cloudflare). */
@@ -108,12 +115,12 @@ const DEFAULT_FEE_TOKENS: Record<string, string[]> = {
  */
 export const DEFAULT_MIN_BOOK_ORDER_XRD: Record<string, number> = { mainnet: 100, stokenet: 5 };
 
-/** A comma-separated list of resource addresses on this network; a bad entry stops the server. */
-function resources(env: NodeJS.ProcessEnv, name: string, dflt: string[], hrp: string): string[] {
+/** A comma-separated list of resource (or other entity) addresses on this network; a bad entry stops the server. */
+function resources(env: NodeJS.ProcessEnv, name: string, dflt: string[], hrp: string, entity = 'resource'): string[] {
   const v = env[name];
   if (v === undefined) return dflt;
   const list = v.split(',').map((x) => x.trim()).filter(Boolean);
-  for (const r of list) if (!new RegExp(`^resource_${hrp}1[02-9ac-hj-np-z]{50,70}$`).test(r)) throw new Error(`${name}: "${r}" is not a resource address on this network`);
+  for (const r of list) if (!new RegExp(`^${entity}_${hrp}1[02-9ac-hj-np-z]{50,70}$`).test(r)) throw new Error(`${name}: "${r}" is not a ${entity} address on this network`);
   return [...new Set(list)];
 }
 
@@ -141,6 +148,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxOrderLifetimeSec: int(env, 'DEX_MAX_ORDER_LIFETIME_SEC', 30 * 86400, 60, 365 * 86400),
     maxOpenOrdersPerAccount: int(env, 'DEX_MAX_OPEN_ORDERS', 50, 1, 10_000),
     marketsFile: env.DEX_MARKETS_FILE,
+    ownerPools: resources(env, 'DEX_OWNER_POOLS', [], name === 'mainnet' ? 'rdx' : 'tdx_2_', 'component'),
     dAppDefinition: env.DEX_DAPP_DEFINITION,
     clientIpHeader: env.DEX_CLIENT_IP_HEADER,
     ratePerMinute: int(env, 'DEX_RATE_PER_MINUTE', 240, 1, 1_000_000),

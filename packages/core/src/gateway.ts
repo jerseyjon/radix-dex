@@ -300,10 +300,10 @@ export function swapsInTransaction(t: any, base: string, quote: string, holders?
 
 /**
  * Liquidity events of the pools we read: Ociswap precision pools and DefiPlaza pairs (Add/RemoveLiquidityEvent),
- * native pools behind Ociswap basic pools and DefiPlaza pairs (Contribution/RedemptionEvent), and the
- * test pool used on Stokenet (LiquidityEvent).
+ * native pools behind Ociswap basic pools and DefiPlaza pairs (Contribution/RedemptionEvent), the
+ * test pool used on Stokenet (LiquidityEvent), and OwnerPools (OwnerPoolLiquidityEvent: the owner's deposits and withdrawals).
  */
-const LIQUIDITY_EVENT = /^(AddLiquidity|RemoveLiquidity|Liquidity|Contribution|Redemption)Event$/;
+const LIQUIDITY_EVENT = /^(AddLiquidity|RemoveLiquidity|Liquidity|OwnerPoolLiquidity|Contribution|Redemption)Event$/;
 
 /** Whether one of `holders` (any non-account entity without them) emitted a liquidity event in the transaction. */
 function changesLiquidity(t: any, holders?: Set<string>): boolean {

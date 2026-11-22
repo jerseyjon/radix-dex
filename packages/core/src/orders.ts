@@ -80,7 +80,7 @@ export function marketOrderManifest(p: MarketOrderParams): string {
   return [
     `CALL_METHOD ${addr(p.account)} "withdraw" ${addr(p.sell)} ${dec(p.sellAmount)};`,
     `TAKE_ALL_FROM_WORKTOP ${addr(p.sell)} ${bucket('in0')};`,
-    ...routeInstructions(p.route, p.sell),
+    ...routeInstructions(p.route, p.sell, 'in', p.minBuyAmount),
     `ASSERT_WORKTOP_CONTAINS ${addr(buy)} ${dec(p.minBuyAmount)};`,
     `CALL_METHOD ${addr(p.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
   ].join('\n');
@@ -108,14 +108,14 @@ const head = (s: SolverIdentity, feeLockXrd: string) => [
  * Root manifest that fills one order through pools.
  * The solver keeps exactly `solverTake` of the bought token; everything else the route produced goes to the user.
  */
-export function poolFillManifest(o: { solver: SolverIdentity; feeLockXrd: string; sell: string; route: Pool[]; solverTake: string }): string {
+export function poolFillManifest(o: { solver: SolverIdentity; feeLockXrd: string; sell: string; route: Pool[]; solverTake: string; routeMin?: string }): string {
   const path = routePath(o.route, o.sell);
   const buy = path[path.length - 1]!;
   const lines = [
     ...head(o.solver, o.feeLockXrd),
     `YIELD_TO_CHILD NamedIntent("order");`,
     `TAKE_ALL_FROM_WORKTOP ${addr(o.sell)} ${bucket('in0')};`,
-    ...routeInstructions(o.route, o.sell),
+    ...routeInstructions(o.route, o.sell, 'in', o.routeMin),
   ];
   if (new Decimal(o.solverTake).gt(0)) {
     lines.push(
@@ -183,6 +183,11 @@ export function takeFillManifest(o: {
   bookFills?: { book: string; id: number; pay: string }[];
   /** What the makers and the book must have delivered between them before the pool leg, or the transaction fails. */
   assertBought?: string;
+  /**
+   * Least output of the pool leg (see `routeInstructions`): one figure for `proceeds` and `input`,
+   * two for `hop` (each swap). Needed when the route goes through an OwnerPool; `routeMinimums` works them out.
+   */
+  routeMins?: string[];
 }): string {
   const at = o.chargeAt ?? 'proceeds';
   const take = new Decimal(o.solverTake);
@@ -212,14 +217,14 @@ export function takeFillManifest(o: {
     // Pools only: sell → XRD, keep the charges, XRD → buy.
     const path = routePath(o.route, o.sell);
     if (o.route.length !== 2 || path[1] !== o.xrd || path[2] !== o.buy || o.makerPays.length || o.bookFills?.length) throw new Error('a hop fill needs a two-pool route through XRD and nothing else');
-    lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(o.sell)} ${bucket('in0')};`, ...routeInstructions([o.route[0]!], o.sell));
+    lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(o.sell)} ${bucket('in0')};`, ...routeInstructions([o.route[0]!], o.sell, 'in', o.routeMins?.[0]));
     if (take.gt(0)) lines.push(...keep('fee'));
-    lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(o.xrd)} ${bucket('hop0')};`, ...routeInstructions([o.route[1]!], o.xrd, 'hop'));
+    lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(o.xrd)} ${bucket('hop0')};`, ...routeInstructions([o.route[1]!], o.xrd, 'hop', o.routeMins?.[1]));
   } else if (o.route.length && new Decimal(o.poolIn).gt(0)) {
     const path = routePath(o.route, o.sell);
     if (path[path.length - 1] !== o.buy) throw new Error('route does not end in the bought token');
     // All that is left of the sold token, including any change a book order handed back.
-    lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(o.sell)} ${bucket('in0')};`, ...routeInstructions(o.route, o.sell));
+    lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(o.sell)} ${bucket('in0')};`, ...routeInstructions(o.route, o.sell, 'in', o.routeMins?.[0]));
   }
   if (at === 'proceeds' && take.gt(0)) lines.push(...keep('fee'));
   lines.push(

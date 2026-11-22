@@ -4,7 +4,7 @@ import {
   type BookOrder, type ChargeAt, type LiquidityItem, type Pool, type Quote,
   GAS_SHORTFALL_TOLERANCE, accountOf, bookArbManifest, bookCrossManifest, buildTransaction, chargeAt,
   decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, orderKeyCancelled, payout,
-  POOL_FILL_BUFFER_BPS, pickLiquidity, planBookCrossExact, planPoolFill, planXrdLegFill, reducedXrdCharges, retryXrdTake, takeFillManifest,
+  POOL_FILL_BUFFER_BPS, pickLiquidity, planBookCrossExact, planPoolFill, planXrdLegFill, reducedXrdCharges, retryXrdTake, routeMinimums, takeFillManifest,
   xrdCharges, xrdLegNeeded,
 } from '@radix-dex/core';
 import type { BookWatcher } from './book.ts';
@@ -279,6 +279,8 @@ export class Solver {
       let s;
       try { s = await this.gateway.transactionStatus(tx.intentHashId); } catch { continue; }
       if (s.status === 'Pending') continue;
+      // Reserves of any OwnerPool it went through have moved: quote the next order from fresh state.
+      this.data.quoter.forgetOwnerPools?.();
       return this.settle(this.store.getTransaction(tx.intentHashId)!, s.status, s.error ?? '');
     }
     console.warn(`[solver] ${tx.intentHashId}: no outcome after ${this.waitMs / 1000} s; left pending`);
@@ -598,6 +600,9 @@ export class Solver {
         xrd: this.config.network.xrd, chargeAt: exec.at,
         bookFills: bookItems.map((m) => ({ book: this.book!.component, id: m.order.id, pay: m.cost })),
         assertBought: bookItems.length ? exec.items.reduce((sum, m) => sum.plus(m.gives), new Decimal(0)).toFixed() : undefined,
+        routeMins: exec.route.length ? routeMinimums({
+          at: exec.at, minBuyAmount: o.minBuyAmount, solverTake: plan.solverTake, fromOthers: exec.total.minus(exec.poolOut).toFixed(), buyDivisibility: this.divisibility(o.buy),
+        }) : undefined,
       }),
       children,
       {

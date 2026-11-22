@@ -1,6 +1,7 @@
 import {
   type Depth, type Gateway, type LedgerSwap, type Market, type Pool, type Quote, type Token,
-  Quoter, buildMarkets, filterAllowedPools, listDefiPlaza, listOciswap, mergeDepth, tokensFromLedger, defaultJsonFetch, Decimal } from '@radix-dex/core';
+  Quoter, buildMarkets, filterAllowedPools, listDefiPlaza, listOciswap, mergeDepth, tokensFromLedger, defaultJsonFetch, Decimal,
+  OWNER_POOL_PACKAGES, ownerPoolAsPool, readOwnerPools } from '@radix-dex/core';
 import { readFileSync } from 'node:fs';
 import type { Config } from './config.ts';
 
@@ -20,6 +21,9 @@ export const isResolution = (r: string): boolean => Object.hasOwn(RESOLUTIONS, r
 export function normaliseCandle(c: Candle): Candle {
   return { ...c, high: Math.max(c.open, c.high, c.close), low: Math.min(c.open, c.low, c.close) };
 }
+
+/** The three deepest pools other than OwnerPools (which callers add on their own). */
+const topPools = (pools: Pool[]): Pool[] => pools.filter((p) => p.venue !== 'ownerpool').sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 3);
 
 class TtlCache<V> {
   private readonly map = new Map<string, { at: number; value: Promise<V> }>();
@@ -64,10 +68,15 @@ export class MarketData {
   async refresh(): Promise<void> {
     if (this.config.network.name !== 'mainnet') {
       // No venue APIs off mainnet: markets come from a local file of tokens and pools.
-      if (this.config.marketsFile) {
-        const j = JSON.parse(readFileSync(this.config.marketsFile, 'utf8'));
+      if (this.config.marketsFile || this.config.ownerPools.length) {
+        const j = this.config.marketsFile ? JSON.parse(readFileSync(this.config.marketsFile, 'utf8')) : { tokens: [], pools: [] };
         this.tokens = new Map((j.tokens as Token[]).map((t) => [t.address, t]));
-        this.pools = j.pools as Pool[];
+        const filePools = (j.pools ?? []) as Pool[];
+        const owner = await this.ownerPools(filePools.filter((p) => p.venue === 'ownerpool'));
+        this.pools = [...filePools.filter((p) => p.venue !== 'ownerpool'), ...owner.pools];
+        const missing = [...new Set(owner.pools.flatMap((p) => p.tokens))].filter((a) => !this.tokens.has(a));
+        if (missing.length) for (const t of await tokensFromLedger(this.gateway, missing).catch(() => [])) this.tokens.set(t.address, t);
+        this.lastError = owner.errors.length ? owner.errors.join('; ') : undefined;
         this.markets = buildMarkets(this.pools, this.tokens, [...(j.quotePriority ?? []), ...this.config.quotePriority]);
         for (const [base, quote] of (j.markets ?? []) as [string, string][]) {
           const id = `${base}/${quote}`;
@@ -91,7 +100,10 @@ export class MarketData {
     }
     this.lastError = errors.length ? errors.join('; ') : undefined;
     if (listed.length === 0) return;
-    const pools = await filterAllowedPools(this.gateway, listed);
+    const owner = await this.ownerPools([]);
+    errors.push(...owner.errors);
+    this.lastError = errors.length ? errors.join('; ') : undefined;
+    const pools = [...await filterAllowedPools(this.gateway, listed), ...owner.pools];
     const missing = [...new Set(pools.flatMap((p) => p.tokens))].filter((a) => !tokens.has(a));
     if (missing.length) for (const t of await tokensFromLedger(this.gateway, missing)) tokens.set(t.address, t);
     this.pools = pools;
@@ -99,6 +111,30 @@ export class MarketData {
     this.markets = buildMarkets(pools, tokens, this.config.quotePriority);
     this.refreshedAt = Date.now();
     void this.loadDivisibilities();
+  }
+
+  /**
+   * The OwnerPools to list: those named in the markets file (`fromFile`) and in `DEX_OWNER_POOLS`,
+   * each read from the ledger, which must show an `OwnerPool` of an allow-listed package. Its tokens
+   * come from the ledger; a file entry naming other tokens is refused. A pool that cannot be read
+   * or is refused is left out and reported, and the rest are kept.
+   */
+  private async ownerPools(fromFile: Pool[]): Promise<{ pools: Pool[]; errors: string[] }> {
+    const addresses = [...new Set([...fromFile.map((p) => p.address), ...this.config.ownerPools])];
+    const allowed = OWNER_POOL_PACKAGES[this.config.network.name] ?? [];
+    const pools: Pool[] = [], errors: string[] = [];
+    await Promise.all(addresses.map(async (address) => {
+      try {
+        const [state] = await readOwnerPools(this.gateway, [address], allowed);
+        const listed = fromFile.find((p) => p.address === address);
+        if (listed && [...listed.tokens].sort().join() !== [state!.resourceA, state!.resourceB].sort().join()) throw new Error('markets file names other tokens than the ledger');
+        pools.push(ownerPoolAsPool(state!, listed));
+      } catch (e) {
+        errors.push(`OwnerPool ${address} left out: ${String((e as Error)?.message ?? e).slice(0, 300)}`);
+      }
+    }));
+    pools.sort((a, b) => a.address.localeCompare(b.address));
+    return { pools, errors };
   }
 
   market(id: string): Market | undefined {
@@ -195,7 +231,8 @@ export class MarketData {
     return this.depthCache.get(market.id, async () => {
       // Probe the three deepest pools. Two was too few: a slightly smaller low-fee pool is where small
       // orders really trade, and without it the book showed a spread nobody pays. More would multiply Gateway load.
-      const pools = [...market.pools].sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 3);
+      // OwnerPools are always included: they are priced from their state, no previews, and their display TVL says little.
+      const pools = [...topPools(market.pools), ...market.pools.filter((p) => p.venue === 'ownerpool')];
       const parts = await Promise.all(pools.map((p) => this.quoter.poolDepth(market, p).catch(() => ({ bids: [], asks: [] }))));
       return mergeDepth(market.id, parts);
     });
@@ -207,7 +244,7 @@ export class MarketData {
    */
   venueTrades(market: Market): Promise<(LedgerSwap & { venue: string })[]> {
     return this.tradesCache.get(market.id, async () => {
-      const pools = [...market.pools].sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 3);
+      const pools = [...topPools(market.pools), ...market.pools.filter((p) => p.venue === 'ownerpool')];
       // Only the pool's own holdings count as its side of a trade: its component, or the native pool that holds its funds.
       const lists = await Promise.all(pools.map((p) => this.gateway.swapsAt(p.address, market.base.address, market.quote.address, 30, [p.address, ...(p.holders ?? [])]).catch(() => [] as LedgerSwap[])));
       const seen = new Set<string>(), out: (LedgerSwap & { venue: string })[] = [];

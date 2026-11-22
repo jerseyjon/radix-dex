@@ -60,18 +60,19 @@ function fakeGateway(o: { previews?: Preview[]; statuses?: (Status | Error)[]; b
  * A pool with a spread: selling TUSD pays 10 XRD each, selling XRD pays 0.08 TUSD each.
  * `listed` says which pairs the site lists.
  */
-function fakeData(opts: { listed?: boolean } = {}) {
+function fakeData(opts: { listed?: boolean; pool?: Pool } = {}) {
+  const route = opts.pool ?? pool;
   const quoter = {
     errors: 0, lastFailure: undefined as string | undefined, bestCalls: 0,
     best: async (_pools: Pool[], sell: string, _buy: string, amount: string) => {
       quoter.bestCalls++;
       const out = new Decimal(amount).mul(sell === TUSD ? 10 : 0.08);
-      return { sell, buy: sell === TUSD ? XRD : TUSD, sellAmount: amount, buyAmount: out.toFixed(), price: '0', route: [pool], networkFeeXrd: '0.5' };
+      return { sell, buy: sell === TUSD ? XRD : TUSD, sellAmount: amount, buyAmount: out.toFixed(), price: '0', route: [route], networkFeeXrd: '0.5' };
     },
     divisibility: async () => 18,
   };
   return {
-    quoter, pools: [pool], tokens: new Map(),
+    quoter, pools: [route], tokens: new Map(),
     xrdValueIn: async (resource: string, x: string | number | Decimal) => new Decimal(x).mul(resource === XRD ? 1 : 0.1).toFixed(),
     isListedPair: () => opts.listed ?? true,
   };
@@ -321,4 +322,25 @@ test('nothing is sent while the solver holds too little XRD for the fee lock', a
   assert.equal(gateway.calls.previewV2, 0);
   assert.equal(store.get(bob.id)!.failures, 0);
   assert.equal(solver.health().xrd, 'low');
+});
+
+test('a fill through an OwnerPool calls swap_with_minimum with the floor the taker\'s own minimum implies', async () => {
+  const ownerPool: Pool = { ...pool, venue: 'ownerpool', kind: 'owner' };
+  const { store, solver } = await setup({ data: fakeData({ pool: ownerPool }) });
+  const sent: string[] = [];
+  const s = solver as unknown as { send: (m: string, ...rest: unknown[]) => Promise<unknown> };
+  const send = s.send.bind(solver);
+  s.send = (m: string, ...rest: unknown[]) => { sent.push(m); return send(m, ...rest); };
+  // Bob sells 10 TUSD for at least 90 XRD; the pool pays 100. Charges from the proceeds: network fee
+  // 1.0 (0.5 measured for the swap, 0.5 for the fill) and 0.10% of 100 = 1.1 XRD, so the pool must bring 90 + 1.1.
+  const bob = await bobsOrder(store);
+  assert.equal((await solver.tick()).poolFilled, 1);
+  assert.equal(store.get(bob.id)!.status, 'filled');
+  assert.match(sent[0]!, new RegExp(`CALL_METHOD Address\\("${POOL_ADDRESS}"\\) "swap_with_minimum" Bucket\\("in0"\\) Decimal\\("91.1"\\);`));
+  assert.doesNotMatch(sent[0]!, /"swap" Bucket/);
+  // Alice sells 50 XRD for at least 3.9 TUSD; charges set aside from the XRD first, and she gets all the pool pays: its floor is her minimum.
+  const alice = await addOrder(store, { sell: XRD, sellAmount: '50', buy: TUSD, minBuyAmount: '3.9', kind: 'market' });
+  assert.equal((await solver.tick()).poolFilled, 1);
+  assert.equal(store.get(alice.id)!.status, 'filled');
+  assert.match(sent[1]!, /"swap_with_minimum" Bucket\("in0"\) Decimal\("3.9"\);/);
 });

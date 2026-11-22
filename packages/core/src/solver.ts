@@ -212,3 +212,26 @@ export function pickMakers(taker: OpenOrder, resting: OpenOrder[], feeBps: numbe
   }
   return out;
 }
+
+/**
+ * Least output each pool swap of a fill must produce (`takeFillManifest`'s `routeMins`): the floor
+ * below which the taker's own signed minimum could no longer be met anyway, so the assertion on the
+ * swap never fails a fill the taker's minimum would have allowed. It exists for OwnerPools, whose
+ * owner can change the fee or move the price at any moment: their swaps always carry a minimum.
+ *
+ * - `proceeds` (taker buys XRD): the solver keeps `solverTake` of the XRD and the taker everything
+ *   else, so the pool must bring at least `minBuyAmount + solverTake − fromOthers`.
+ * - `input` (taker sells XRD): the taker gets everything bought, so `minBuyAmount − fromOthers`.
+ * - `hop`: the first swap must bring at least the XRD the solver takes between the swaps (the
+ *   transaction would fail without it anyway); the second at least `minBuyAmount`. The first swap
+ *   is further bounded through the second, which pays more the more XRD it is given.
+ * Each figure is rounded up to its token's places (`buyDivisibility`; XRD 18) and is at least one unit.
+ */
+export function routeMinimums(o: { at: ChargeAt; minBuyAmount: string; solverTake: string; fromOthers?: string; buyDivisibility: number }): string[] {
+  const unit = (d: number) => new Decimal(10).pow(-d);
+  const atLeastUnit = (v: Decimal, d: number) => Decimal.max(unit(d), ceilTo(v, d)).toFixed();
+  const others = new Decimal(o.fromOthers ?? 0);
+  if (o.at === 'hop') return [atLeastUnit(new Decimal(o.solverTake), 18), atLeastUnit(new Decimal(o.minBuyAmount), o.buyDivisibility)];
+  const need = new Decimal(o.minBuyAmount).plus(o.at === 'proceeds' ? o.solverTake : 0).minus(others);
+  return [atLeastUnit(need, o.buyDivisibility)];
+}

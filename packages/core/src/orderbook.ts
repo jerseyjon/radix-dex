@@ -83,7 +83,7 @@ export function bookArbManifest(o: { solver: SolverIdentity; feeLockXrd: string;
     `CALL_METHOD ${addr(o.solver.account)} "withdraw" ${addr(o.payResource)} ${dec(o.pay)};`,
     ...bookFillInstructions(o.book, o.id, o.payResource, o.pay, 'pay'),
     `TAKE_ALL_FROM_WORKTOP ${addr(o.boughtResource)} ${bucket('in0')};`,
-    ...routeInstructions(o.route, o.boughtResource),
+    ...routeInstructions(o.route, o.boughtResource, 'in', o.minBack),
     `ASSERT_WORKTOP_CONTAINS ${addr(o.payResource)} ${dec(o.minBack)};`,
     onlyXrdLeft(o.xrd),
     `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
@@ -335,14 +335,14 @@ export function planBookCross(first: BookOrder, second: BookOrder, float: string
  * Not used by the solver since 22 Nov 2026: the order book hands back rounding change in the token
  * paid, which would leave the solver holding a token other than XRD (the final assertion then fails).
  */
-export function bookArbPoolFirstManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; id: number; startResource: string; sellIn: string; payResource: string; route: Pool[]; minBack: string; xrd: string }): string {
+export function bookArbPoolFirstManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; id: number; startResource: string; sellIn: string; payResource: string; route: Pool[]; minBack: string; xrd: string; routeMin?: string }): string {
   const path = routePath(o.route, o.startResource);
   if (path[path.length - 1] !== o.payResource) throw new Error('route does not reach the payment token');
   return [
     `CALL_METHOD ${addr(o.solver.account)} "lock_fee" ${dec(o.feeLockXrd)};`,
     `CALL_METHOD ${addr(o.solver.account)} "withdraw" ${addr(o.startResource)} ${dec(o.sellIn)};`,
     `TAKE_ALL_FROM_WORKTOP ${addr(o.startResource)} ${bucket('in0')};`,
-    ...routeInstructions(o.route, o.startResource),
+    ...routeInstructions(o.route, o.startResource, 'in', o.routeMin),
     `TAKE_ALL_FROM_WORKTOP ${addr(o.payResource)} ${bucket('pay')};`,
     `CALL_METHOD ${addr(o.book)} "fill" ${u64(o.id)} ${bucket('pay')};`,
     `ASSERT_WORKTOP_CONTAINS ${addr(o.startResource)} ${dec(o.minBack)};`,
