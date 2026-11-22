@@ -291,7 +291,7 @@ export function OrderForm(props: {
           <div><dt>Price impact</dt><dd className={impact !== undefined && impact > 3 ? 'warn' : ''}>{impact === undefined ? '—' : `${Math.max(0, impact).toFixed(2)}%`}</dd></div>
           {marketFees?.swappedXrd && <div><dt>Swapped</dt><dd>{fmtAmount(marketFees.swappedXrd.toNumber())} XRD</dd></div>}
           {marketFees
-            ? <div><dt>Fees ({feeWhere})</dt><dd>{feeText(marketFees)}, network fee + {pct(config.feeBps)}</dd></div>
+            ? <div title={`Network fee estimate + ${pct(config.feeBps)}, in XRD`}><dt>Fees ({feeWhere})</dt><dd>{feeText(marketFees)}</dd></div>
             : <div><dt>Route</dt><dd>{quote ? quote.route.map((p) => p.venue).join(' → ') : '—'}</dd></div>}
           {viaSolver && !solverFills && <div><dt>Note</dt><dd className="warn">{NOT_FILLED}</dd></div>}
           <div><dt>Max slippage</dt><dd className="seg mini" role="group" aria-label="Maximum slippage">{SLIPPAGES.map((s) => <button key={s} className={s === slippage ? 'on' : ''} aria-pressed={s === slippage} onClick={() => setSlippage(s)}>{s}%</button>)}</dd></div>
@@ -315,7 +315,7 @@ export function OrderForm(props: {
           <div><dt>You pay</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           {limitFees?.swappedXrd && <div><dt>Swapped</dt><dd>{fmtAmount(limitFees.swappedXrd.toNumber())} XRD</dd></div>}
           <div><dt>At your price you get</dt><dd>{limitGross ? `${fmtAmount(limitGross)} ${buyTok.symbol}` : '—'}</dd></div>
-          <div><dt>Fees ({feeWhere})</dt><dd>{limitFees ? `${feeText(limitFees)}, network fee allowance + ${pct(config.feeBps)}` : '—'}</dd></div>
+          <div title={`Network fee allowance + ${pct(config.feeBps)}, in XRD`}><dt>Fees ({feeWhere})</dt><dd>{limitFees ? feeText(limitFees) : '—'}</dd></div>
           {!solverFills && <div><dt>Note</dt><dd className="warn">{NOT_FILLED}</dd></div>}
           <div><dt>If another trader takes it</dt><dd>{(config.makerFeeBps ?? 0) > 0 ? `Fee ${pct(config.makerFeeBps ?? 0)}, no network fee` : 'No fee: you get your full price'}</dd></div>
           <div><dt>You receive at least</dt><dd>{limitMinBuy ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
