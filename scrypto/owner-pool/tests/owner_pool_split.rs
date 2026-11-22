@@ -716,10 +716,14 @@ fn revoke_and_replace_operator() {
     w.rebalance(pool, dec!(1), dec!(1)).expect_commit_failure();
     w.as_operator(pool, "operator_set_fee", manifest_args!(0u16)).expect_commit_failure();
     w.as_operator(pool, "set_operator_paused", manifest_args!(true)).expect_commit_failure();
+    // A revoke turns the owner's pause on (split audit 2, Low-1); appointing does not lift it.
+    assert!(w.read::<bool>(pool, "is_paused"));
 
     // Replace with a new badge held by a new account: new works, old doesn't.
     let op2 = w.ledger.create_fungible_resource(dec!(1), 0, other.account);
     w.appoint(pool, other, op2).expect_commit_success();
+    assert!(w.read::<bool>(pool, "is_paused"));
+    w.as_owner(pool, "set_paused", manifest_args!(false)).expect_commit_success();
     let m = ManifestBuilder::new().lock_fee_from_faucet()
         .create_proof_from_account_of_amount(other.account, op2, dec!(1))
         .call_method(pool, "operator_set_fee", manifest_args!(50u16)).build();
@@ -766,6 +770,8 @@ fn owner_path_works_with_operator_key_lost() {
 
     // Key lost: from here the bot never signs again. The owner revokes without its badge.
     w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>, NO_GUARD)).expect_commit_success();
+    // The revoke turned the owner's pause on; everything below works while paused.
+    assert!(w.read::<bool>(pool, "is_paused"));
     // Owner moves inventory without limits (budget, caps and empty sides do not apply to him).
     w.as_owner(pool, "owner_rebalance", manifest_args!(dec!(10_000), dec!(-5_000), NO_GUARD)).expect_commit_success();
     let (ra, rb) = w.reserves(pool);

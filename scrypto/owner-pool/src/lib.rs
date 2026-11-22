@@ -43,7 +43,8 @@
 //!   which anyone, a thief included, can set with his own capital (split audit M-1). Whenever the
 //!   owner states an anchor the operator's allowance drops to zero and refills from there.
 //! * The owner's pause (`set_paused`) is a full stop for the hot key: no swaps, no `rebalance`, no
-//!   `operator_set_fee`.
+//!   `operator_set_fee`. Revoking the operator turns it on, as does any `set_operator` made while
+//!   the operator's pause was on: the owner reopens swaps himself once the curve is right.
 //!
 //! Operating rules (not enforced on ledger; check on the Gateway before instantiating):
 //! * The owner badge is total and permanent control (`OwnerRole::Fixed`): it can never be rotated.
@@ -139,7 +140,7 @@ pub struct OwnerPoolRebalanceEvent {
     pub inventory_b: Decimal,
     /// Budget this move cost (zero for the owner, who has no budget).
     pub cost: Decimal,
-    /// Operator budget left after the move.
+    /// Operator budget available after the move, refill included (what `operator_status` reports).
     pub allowance: Decimal,
     pub by_owner: bool,
 }
@@ -558,6 +559,12 @@ mod owner_pool {
         /// revoking. Every call clears the operator's pause flag and sets its allowance to zero (a
         /// new operator starts with nothing and refills over a window; a replacement does not inherit
         /// what the old key left).
+        /// No call reopens swaps. A REVOKE (`None`) turns the OWNER's pause on, and so does any call
+        /// made while the operator's pause was on (e.g. replacing a key whose thief had paused):
+        /// behind a pause the curve may have been mispriced over several windows, so swaps stay
+        /// closed until the owner has checked or restored the curve (`owner_rebalance`, `set_anchor`)
+        /// and calls `set_paused(false)` (split audit 2, Low-1). Appointing or replacing while the
+        /// operator's pause is off leaves the owner's pause as it was.
         pub fn set_operator(&mut self, badge: Option<ResourceAddress>, anchor: Option<(Decimal, Decimal)>) {
             let rule = match badge {
                 Some(b) => {
@@ -575,6 +582,9 @@ mod owner_pool {
             }
             Runtime::global_component().set_role("operator", rule);
             self.operator = badge;
+            if badge.is_none() || self.operator_paused {
+                self.paused = true;
+            }
             self.operator_paused = false;
             self.zero_allowance();
             if let Some((a, b)) = anchor {
@@ -720,7 +730,9 @@ mod owner_pool {
                 inventory_a,
                 inventory_b,
                 cost,
-                allowance: self.allowance,
+                // The allowance available now, as `operator_status` reports it (refill included; a
+                // free move or an owner move does not store the refill, split audit 2 Low-2).
+                allowance: self.allowance_now(),
                 by_owner,
             });
         }

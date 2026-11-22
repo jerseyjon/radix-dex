@@ -524,7 +524,8 @@ fn l1_dust_shrink_is_refused_by_the_floor() {
 // ============================================================================ informational
 
 /// All FIXED:
-/// I-a: revoking the operator clears its pause flag (swaps resume without a second owner call).
+/// I-a: revoking the operator clears its pause flag. Since split audit 2 (Low-1) the revoke also
+///      turns the OWNER's pause on, so swaps stay closed until the owner reopens them.
 /// I-b: the default operator fee range gives no fee power, so an operator on default limits cannot
 ///      undo the owner's `set_fee`.
 /// I-c: the owner's pause is a full stop for the hot key: `rebalance` and `operator_set_fee` refused.
@@ -564,8 +565,10 @@ fn informational_revoke_pause_fee_range_inheritance() {
     w.as_operator(pool, "set_operator_paused", manifest_args!(true)).expect_commit_success();
     let r = w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>, None::<(Decimal, Decimal)>));
     let ev: Vec<ConfigEv> = w.events(&r, "OwnerPoolConfigEvent");
-    assert_eq!(ev, vec![ConfigEv { fee_bps: 100, paused: false, operator_paused: false }]);
-    assert!(!w.read::<bool>(pool, "is_paused"));
+    assert_eq!(ev, vec![ConfigEv { fee_bps: 100, paused: true, operator_paused: false }]);
+    assert!(w.read::<bool>(pool, "is_paused"));
+    w.swap(other, pool, a, dec!(1)).expect_commit_failure_containing_error("Swaps are paused");
+    w.as_owner(pool, "set_paused", manifest_args!(false)).expect_commit_success();
     w.swap(other, pool, a, dec!(1)).expect_commit_success();
     // I-d: new operator: allowance zero, anchor as stated now; refills normally.
     let op2 = w.ledger.create_fungible_resource(dec!(1), 0, other.account);

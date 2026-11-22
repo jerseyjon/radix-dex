@@ -2,7 +2,8 @@
 
 Branch `pool-split` (from `pool-audit` at c8c2be0). Blueprint `scrypto/owner-pool/src/lib.rs`,
 tests `scrypto/owner-pool/tests/owner_pool_split.rs`, `owner_pool_split_audit.rs` (the independent
-audit's tests, inverted after the fixes) plus the two earlier files (adapted).
+audit's tests, inverted after the fixes), `owner_pool_split_audit2.rs` (the second audit's attack
+measurements; its two Low findings fixed and their tests inverted) plus the two earlier files (adapted).
 Engine: Scrypto / scrypto-test / radix-engine 1.4.0. Simulator only; nothing published, nothing pushed.
 
 The owner's decision: before any mainnet publish, a market-making bot's key (HOT) must be able to
@@ -54,7 +55,7 @@ reprice the pool but must not be able to take funds out; taking funds out needs 
 | `owner_rebalance(to_reserve_a, to_reserve_b, expected)` | yes | no | no | inventory <-> reserves, no limits, works while paused; does not move the anchor |
 | `set_fee(bps)` | yes | no | no | cap 500 bps, fixed in code |
 | `set_paused(bool)` | yes | no | no | the owner's pause: stops swaps, `rebalance` and `operator_set_fee`; the operator cannot clear it |
-| `set_operator(Option<badge>, Option<(anchor_a, anchor_b)>)` | yes | no | no | appoint, replace, revoke; needs a proof of the new badge; **anchor required when appointing**; clears the operator pause; allowance to zero |
+| `set_operator(Option<badge>, Option<(anchor_a, anchor_b)>)` | yes | no | no | appoint, replace, revoke; needs a proof of the new badge; **anchor required when appointing**; clears the operator pause; allowance to zero; **a revoke turns the owner's pause on**, as does any call made while the operator pause was on |
 | `set_anchor(anchor_a, anchor_b, expected)` | yes | no | no | **new**: states the anchor price; allowance to zero |
 | `set_operator_limits(budget_bps, window_epochs, cap_a, cap_b, floor_a, floor_b, min_fee, max_fee)` | yes | no | no | **two new arguments** (floors) |
 | `rebalance(to_reserve_a, to_reserve_b, expected)` | **no** | yes | no | inventory <-> reserves, within limits; refused while owner-paused |
@@ -91,12 +92,32 @@ and refused; every operator method was tried with the owner's badge and by a str
   budget * T / window over T epochs" true from the moment of appointment. The cost is that the bot
   waits: at 300 bps per 72 epochs it has 0.42% of budget after 10 epochs, enough for small repricings.
 - `set_operator(None, anchor)` sets the role to `deny_all`; the anchor is optional there.
+- **A revoke turns the OWNER's pause on** (second split audit, Low-1). A thief holding the operator
+  key can switch the operator pause on (so nobody trades the mispricing back), push the price over
+  several windows, and wait: before this fix, revoking cleared the operator pause and so reopened
+  swaps on the mispriced curve, and the thief took the mispricing in the next transaction (measured:
+  15.05 after a two-window push at the defaults). Now `set_operator(None, …)` sets the owner's pause
+  (and still clears the operator's flag, so a thief's pause never lingers); swaps stay closed until
+  the owner has checked the curve and calls `set_paused(false)`. The config event
+  (`OwnerPoolConfigEvent`, the same one `set_paused` emits) shows `paused: true`. Everything the owner
+  needs works while paused: `owner_rebalance`, `deposit`, `withdraw`, `withdraw_all`, `set_anchor`,
+  `set_operator`.
+- **Replacing a key while the operator pause is on is the same hole**, so it gets the same rule: if
+  the operator pause was on when `set_operator(Some(new), anchor)` is called, the owner's pause is
+  turned on too (one call would otherwise clear the thief's pause and reopen swaps on the curve he
+  mispriced behind it; stating a fresh anchor does not reprice the curve). Appointing or replacing
+  while the operator pause is off leaves the owner's pause as it was: no surprise pause on a routine
+  key rotation, and with swaps open the mispricing was already exposed to arbitrage. Tests
+  `a2_revoke_alone_keeps_swaps_closed`, `a2_revoke_then_restore_then_reopen_leaves_thief_nothing`,
+  `a2_appoint_and_replace_pause_rules`.
 - Practical set-up with the Radix wallet: create the operator badge into the OWNER's account, call
   `set_operator` proving both badges in one wallet transaction, then send the operator badge to the
-  bot's account. Replacing after a theft: create a new badge, same steps.
+  bot's account. Replacing after a theft: revoke first, then create a new badge, same steps, then
+  `set_paused(false)` (see the emergency procedure under Q7).
 - The operator is optional. A new pool has none and no anchor (`instantiate` and
   `instantiate_with_liquidity` are unchanged: same four arguments), so the pool runs owner-only until
-  `set_operator`; `set_operator(None, None)` returns it to owner-only at any time. With the key lost,
+  `set_operator`; `set_operator(None, None)` returns it to owner-only at any time (paused, until the
+  owner calls `set_paused(false)`). With the key lost,
   the owner keeps everything (`owner_path_works_with_operator_key_lost`).
 - Operator badge custody rules are those of the owner badge (audit I-2): non-fungible, or 0-dp supply
   1, no minter, not recallable/freezable, updaters locked. A divisible operator badge's dust is full
@@ -287,7 +308,9 @@ What the split does **not** protect:
 - **The owner's pause is a full stop for the hot key**: swaps, `rebalance` and `operator_set_fee` are
   refused while it is on. `set_operator_paused` stays allowed (it changes nothing that trades while
   the owner's pause is on). The owner's own calls, `owner_rebalance` included, work while paused.
-- **Revoking clears the operator's pause** (audit I-a), as does appointing or replacing.
+- **Every `set_operator` clears the operator's pause** (audit I-a), **and none reopens swaps**: a
+  revoke, or any call made while the operator pause was on, turns the owner's pause on (second split
+  audit, Low-1). The owner reopens with `set_paused(false)` once the curve is right.
 - **Fee range of one value = no operator fee power** (audit I-b); default [0, 0]. With a real range
   [min, max] the operator can still set any fee inside it, including undoing an owner `set_fee`
   inside the range: that is what the range grants.
@@ -320,12 +343,23 @@ What the split does **not** protect:
   may not change the fee", "State the anchor price", "Bad anchor", "Negative floor", "Floor above cap".
 - The bot: after an owner `set_anchor` or a replacement its allowance is zero; its `rebalance` fails
   "Operator price-move limit" until it refills. Read `operator_status` before moving.
+- **Revoke pauses (second split audit, Low-1).** After `set_operator(None, …)`, and after a
+  replacement made while the operator pause was on, `is_paused()` is true, the owner's flag is set
+  (`OwnerPoolConfigEvent { paused: true, operator_paused: false }`), swaps and `quote` fail "Swaps are
+  paused", and a new operator's `rebalance` / `operator_set_fee` fail "Paused by the owner" until the
+  owner calls `set_paused(false)`. Owner tooling must offer that step after a revoke; the
+  exchange's UI should show the pool as paused. No signature changed.
+- **`OwnerPoolRebalanceEvent.allowance`** (second split audit, Low-2) is now the allowance available
+  right after the move, refill included, i.e. what `operator_status` returns at that point. It used
+  to be the stored value, which on a free proportional decrease or an owner move read too low (0
+  while the operator held the full budget). Event shape unchanged; only the value's meaning.
 
 ## Costs
 
 - **Swap gas:** steady-state swap on a 10k/10k pool, same manifest: 8,067,789 execution cost units
   on c8c2be0; 8,681,560 on the split before these fixes; **8,725,205** now (+43,645, +0.5%; +8.1% vs
-  c8c2be0). The swap code is unchanged apart from the extra state read (two more Decimals in the
+  c8c2be0); **8,724,242** after the second audit's fixes (release run; the swap path is untouched,
+  `set_operator` and the rebalance event changed). The swap code is unchanged apart from the extra state read (two more Decimals in the
   limits); the increase is the larger component state and wasm read on every call.
 - One-sided adds cost the bot 1.5x budget (see above).
 
@@ -348,9 +382,29 @@ What the split does **not** protect:
    bot does not need it. A floor above 0 keeps every taker, the thief included, paying something.
 6. **Operator pause.** Kept (the bot can stop trading in a crash; the owner can always clear it).
 7. **Monitoring (off ledger, strongly recommended).** Alert on every `OwnerPoolRebalanceEvent`
-   whose `cost` is unusual, on `allowance` near zero, on any `OwnerPoolAnchorEvent` you did not send,
-   and on the curve's price or the anchor leaving the market by more than the bot's dead-band; revoke
-   with `set_operator(None, None)` from the wallet. The bound is small only if revocation is quick.
+   whose `cost` is unusual, on `allowance` near zero (the event's `allowance` is now the allowance
+   available after the move, refill included), on any `OwnerPoolAnchorEvent` you did not send,
+   and on the curve's price or the anchor leaving the market by more than the bot's dead-band. The
+   bound is small only if revocation is quick.
+
+   **The worst attack does not look like an attack** (second split audit). The largest multi-window
+   gains need no pause: each window the thief takes the curve to the anchor with his own capital,
+   spends the window's budget pushing it further, and buys back to the market. On ledger that is an
+   operator `rebalance` followed by what looks like ordinary arbitrage. So the alerts must key on
+   operator `OwnerPoolRebalanceEvent`s that spend MOST of the allowance (a legitimate bot with a
+   dead-band spends small slices), and on the ANCHOR drifting away from the market window after
+   window (`operator_status` / the reserves after each operator move); a pause, or a big swap, is not
+   a reliable signal. The audit's measured gains were 20-50% of the proven bound: one window 3.6, and
+   24 h about 91-96 (with and without the pause) on an 18k/18k pool at the suggested defaults.
+
+   **Emergency procedure (key stolen or bot misbehaving):**
+   1. **Revoke first**: `set_operator(None, None)` from the wallet. The pool is then closed (the
+      revoke turns the owner's pause on); the old key can do nothing.
+   2. Check the curve against the MARKET price. If it is off, restore it with `owner_rebalance`
+      (guarded with `expected` = the reserves you saw), or `deposit` / `withdraw`.
+   3. If re-appointing (a NEW badge), state the anchor from the market:
+      `set_operator(Some(new_badge), Some(anchor))`.
+   4. Reopen: `set_paused(false)`. Steps 2-4 may share one transaction.
 8. **Oracle.** A real price band needs a trusted on-ledger price; none is used. Not recommended now.
 9. **Owner role.** Still one fixed badge. A multi-signature owner (`OwnerRole::Fixed(any access
    rule)`) is possible but not done.
@@ -366,6 +420,13 @@ What the split does **not** protect:
 default limits, the floors, `set_anchor` in the role tables, owner deposits not moving the anchor,
 and appointment without an anchor.
 
+`scrypto/owner-pool/tests/owner_pool_split_audit2.rs`, the second audit's file: attack measurements at
+the suggested defaults, plus its two Low findings inverted after the fixes
+(`a2_revoke_alone_keeps_swaps_closed`, `a2_rebalance_event_allowance_is_current`) and two new tests
+(`a2_revoke_then_restore_then_reopen_leaves_thief_nothing`, `a2_appoint_and_replace_pause_rules`).
+`revoke_and_replace_operator`, `owner_path_works_with_operator_key_lost` and
+`informational_revoke_pause_fee_range_inheritance` now expect the owner's pause after a revoke.
+
 `scrypto/owner-pool/tests/owner_pool_split_audit.rs` (7), the independent audit's file, inverted:
 `m1_attack_owner_call_resets_anchor_to_thief_price_is_refused`,
 `m1_attack_repeats_every_window_after_one_owner_call_is_refused`,
@@ -376,7 +437,12 @@ and appointment without an anchor.
 Earlier suites: `owner_pool_proposal.rs` (15) and `owner_pool_audit2.rs` (17), unchanged by these
 fixes.
 
-Run: `CRATE=owner-pool TARGET_VOLUME=radix-dex-target-pool-split scrypto/run.sh test`.
+After the second audit's fixes (release run:
+`CRATE=owner-pool TARGET_VOLUME=radix-dex-target-audit3 scrypto/run.sh test --release -- --nocapture`):
+`owner_pool_audit2` **17 passed**, `owner_pool_proposal` **15 passed**, `owner_pool_split` **8 passed**,
+`owner_pool_split_audit` **7 passed**, `owner_pool_split_audit2` **11 passed**. Total 58 passed, 0 failed.
+
+Earlier run (before the second audit): `CRATE=owner-pool TARGET_VOLUME=radix-dex-target-pool-split scrypto/run.sh test`.
 Result (one full run, about 15 min wall): `owner_pool_audit2` **17 passed** (688 s), `owner_pool_proposal`
 **15 passed** (163 s), `owner_pool_split` **8 passed** (72 s), `owner_pool_split_audit` **7 passed**
 (10 s). Total 47 passed, 0 failed.

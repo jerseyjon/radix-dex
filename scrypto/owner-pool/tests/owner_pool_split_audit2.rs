@@ -485,48 +485,83 @@ fn a2_anchor_drift_never_exceeds_spend() {
 
 // ============================================================================ events
 
-/// The rebalance event's `allowance` is the stored value, not the allowance now: on a free proportional
-/// decrease (and on every owner move) the refill is not applied first, so the event reports a stale
-/// number (here 0 while the operator actually has the full 0.03). Monitoring that alerts on "allowance
-/// near zero" from the event would fire falsely; the event also never shows an anchor.
+/// FIXED (was `a2_rebalance_event_allowance_is_stale`): the rebalance event's `allowance` used to be
+/// the stored value, so on a free proportional decrease and on every owner move it reported 0 while
+/// the operator had the full 0.03. It now reports the allowance available now, equal to what
+/// `operator_status` returns after the move, on free, owner and priced moves alike; and reporting it
+/// does not change the budget accounting (a free move still leaves the full refill available).
 #[test]
-fn a2_rebalance_event_allowance_is_stale() {
+fn a2_rebalance_event_allowance_is_current() {
     let mut w = W::new();
     let pool = defaults(&mut w);
     let now = w.status(pool).2;
+    assert_eq!(now, dec!("0.03"));
+    // free proportional decrease
     let r = w.rebalance(pool, dec!(-100), dec!(-100));
     let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-    println!("A2 event: operator_status allowance {now}, event allowance {} (cost {})", ev[0].allowance, ev[0].cost);
+    let after = w.status(pool).2;
+    println!("A2 event: operator_status allowance {after}, event allowance {} (cost {})", ev[0].allowance, ev[0].cost);
     assert_eq!(ev[0].cost, dec!(0));
-    assert_eq!(now, dec!("0.03"));
-    assert_eq!(ev[0].allowance, dec!(0), "event reports the stale stored allowance");
+    assert_eq!(ev[0].allowance, after);
+    assert_eq!(after, dec!("0.03"), "a free move spends nothing");
+    // owner move
     let r = w.as_owner(pool, "owner_rebalance", manifest_args!(dec!(1), dec!(1), NO_GUARD));
     let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-    assert_eq!(ev[0].allowance, dec!(0));
+    assert_eq!(ev[0].allowance, w.status(pool).2);
+    assert_eq!(ev[0].allowance, dec!("0.03"));
+    // priced operator move, part-way through a refill
+    let r = w.rebalance(pool, dec!(0), dec!(-50));
+    let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
+    assert!(ev[0].cost > dec!(0));
+    assert_eq!(ev[0].allowance, w.status(pool).2);
+    assert_eq!(ev[0].allowance, dec!("0.03") - ev[0].cost);
+    let left = ev[0].allowance;
+    w.advance(1);
+    let r = w.as_owner(pool, "owner_rebalance", manifest_args!(dec!(1), dec!(0), NO_GUARD));
+    let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
+    let status = w.status(pool).2;
+    assert_eq!(ev[0].allowance, status);
+    assert!(status > left, "the event includes the refill since the last priced move");
 }
 
 // ============================================================================ revoke ordering
 
-/// The thief pauses swaps and pushes over 2 windows (the mispricing is still inside the pool: nobody,
-/// the thief included, can trade it). Measured two ways the owner can react:
-///   (a) revoke alone, `set_operator(None, None)`: revoking CLEARS the operator pause, so swaps reopen
-///       on the mispriced curve and the thief (or anyone) takes the mispricing in the next transaction;
+#[derive(ScryptoSbor, Debug, Clone, PartialEq)]
+struct ConfigEv {
+    fee_bps: u16,
+    paused: bool,
+    operator_paused: bool,
+}
+
+/// The thief's set-up for the revoke tests: fee to the bottom of his range, operator pause on (nobody,
+/// the thief included, can trade the mispricing), then pushes over 2 windows. Returns the reserves
+/// before the attack.
+fn paused_two_window_push(w: &mut W, pool: ComponentAddress) -> (Decimal, Decimal) {
+    let r0 = w.reserves(pool);
+    w.as_operator(pool, "operator_set_fee", manifest_args!(10u16)).expect_commit_success();
+    w.as_operator(pool, "set_operator_paused", manifest_args!(true)).expect_commit_success();
+    push_down_k_neutral(w, pool, 0.995);
+    w.advance(72);
+    push_down_k_neutral(w, pool, 0.995);
+    r0
+}
+
+/// FIXED (was `a2_revoke_alone_reopens_swaps_on_the_mispriced_curve`, measured thief gain 15.05).
+/// The thief pauses swaps and pushes over 2 windows. Two ways the owner can react:
+///   (a) revoke alone, `set_operator(None, None)`: the revoke clears the operator pause AND turns the
+///       owner's pause on, so swaps stay closed ("Swaps are paused", owner flag set, operator flag
+///       clear, config event says so) and the thief gains nothing while the curve is mispriced;
 ///   (b) one owner transaction: `set_paused(true)`, revoke, `owner_rebalance` reversing the thief's
-///       moves, `set_paused(false)`: nothing is lost.
+///       moves, `set_paused(false)`: still works, nothing is lost.
 #[test]
-fn a2_revoke_alone_reopens_swaps_on_the_mispriced_curve() {
+fn a2_revoke_alone_keeps_swaps_closed() {
     for careful in [false, true] {
         let mut w = W::new();
         let pool = defaults(&mut w);
         let bot = w.bot;
         let t0 = value(&mut w, bot, 1.0);
         let o0 = pool_value(&mut w, pool, 1.0);
-        let r0 = w.reserves(pool);
-        w.as_operator(pool, "operator_set_fee", manifest_args!(10u16)).expect_commit_success();
-        w.as_operator(pool, "set_operator_paused", manifest_args!(true)).expect_commit_success();
-        push_down_k_neutral(&mut w, pool, 0.995);
-        w.advance(72);
-        push_down_k_neutral(&mut w, pool, 0.995);
+        let r0 = paused_two_window_push(&mut w, pool);
         if careful {
             let (ra, rb) = w.reserves(pool);
             let (o, badge) = (w.owner, w.badge);
@@ -538,19 +573,124 @@ fn a2_revoke_alone_reopens_swaps_on_the_mispriced_curve() {
                 .call_method(pool, "set_paused", manifest_args!(false))
                 .build();
             w.run(&[o], m).expect_commit_success();
+            assert!(!w.read::<bool>(pool, "is_paused"));
+            swap_to(&mut w, bot, pool, 1.0);
         } else {
-            w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>, None::<(Decimal, Decimal)>)).expect_commit_success();
+            let r = w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>, None::<(Decimal, Decimal)>));
+            let ev: Vec<ConfigEv> = w.events(&r, "OwnerPoolConfigEvent");
+            assert_eq!(ev, vec![ConfigEv { fee_bps: 10, paused: true, operator_paused: false }]);
+            assert!(w.read::<bool>(pool, "is_paused"));
+            assert!(!w.status(pool).3, "the thief's pause flag is cleared; the pause is the owner's");
+            // the thief (or anyone) tries to take the mispricing: refused
+            let (ra, rb) = w.reserves(pool);
+            let (a, b) = (w.a, w.b);
+            assert!(f(rb) / f(ra) < 0.97, "the curve is mispriced");
+            w.swap(bot, pool, b, dec!(100)).expect_commit_failure_containing_error("Swaps are paused");
+            w.swap(bot, pool, a, dec!(1)).expect_commit_failure_containing_error("Swaps are paused");
+            // and the bot's badge no longer works for anything
+            w.as_operator(pool, "set_operator_paused", manifest_args!(false)).expect_commit_failure();
+            assert!(w.read::<bool>(pool, "is_paused"));
         }
-        assert!(!w.read::<bool>(pool, "is_paused"));
-        swap_to(&mut w, bot, pool, 1.0);
         let gain = value(&mut w, bot, 1.0) - t0;
         let loss = o0 - pool_value(&mut w, pool, 1.0);
         println!("A2 revoke (careful={careful}): thief gain {gain:.4}, owner loss {loss:.4}");
-        if careful { assert!(gain <= 0.0); } else { assert!(gain > 5.0); }
-        // the owner can always take everything out afterwards
+        assert!(gain <= 0.0);
+        // the owner can always take everything out afterwards, paused or not
         w.as_owner(pool, "withdraw_all", manifest_args!()).expect_commit_success();
         assert_eq!(w.total(pool), (dec!(0), dec!(0)));
     }
+}
+
+/// After a bare revoke the owner restores the curve in his own time, in separate transactions:
+/// `owner_rebalance` back to the market (guarded by the reserves he saw), then `set_paused(false)`.
+/// The thief, trading as soon as swaps reopen, gains nothing and the owner loses nothing. Also: the
+/// owner's whole toolkit works while the revoke's pause is on (`deposit`, `withdraw`, `set_anchor`,
+/// `set_operator`), and re-appointing does not reopen swaps by itself.
+#[test]
+fn a2_revoke_then_restore_then_reopen_leaves_thief_nothing() {
+    let mut w = W::new();
+    let pool = defaults(&mut w);
+    let (bot, a, b) = (w.bot, w.a, w.b);
+    let t0 = value(&mut w, bot, 1.0);
+    let o0 = pool_value(&mut w, pool, 1.0);
+    let r0 = paused_two_window_push(&mut w, pool);
+    w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>, None::<(Decimal, Decimal)>)).expect_commit_success();
+    assert!(w.read::<bool>(pool, "is_paused"));
+    // the owner's calls while paused
+    let (o, badge) = (w.owner, w.badge);
+    let m = ManifestBuilder::new().lock_fee_from_faucet()
+        .create_proof_from_account_of_amount(o.account, badge, dec!(1))
+        .withdraw_from_account(o.account, a, dec!(1)).take_all_from_worktop(a, "a")
+        .call_method_with_name_lookup(pool, "deposit", |l| (Some(l.bucket("a")), None::<ManifestBucket>, NO_GUARD))
+        .build();
+    w.run(&[o], m).expect_commit_success();
+    w.as_owner(pool, "withdraw", manifest_args!(dec!(1), dec!(0), NO_GUARD)).expect_commit_success();
+    w.as_owner(pool, "set_anchor", manifest_args!(dec!(1), dec!(1), NO_GUARD)).expect_commit_success();
+    let (ra, rb) = w.reserves(pool);
+    w.as_owner(pool, "owner_rebalance", manifest_args!(r0.0 - ra, r0.1 - rb, Some((ra, rb)))).expect_commit_success();
+    assert_eq!(w.reserves(pool), r0);
+    // re-appointing (here the same badge, anchor stated) leaves the owner's pause on
+    w.appoint(pool, (dec!(1), dec!(1))).expect_commit_success();
+    assert!(w.read::<bool>(pool, "is_paused"));
+    w.swap(bot, pool, a, dec!(1)).expect_commit_failure_containing_error("Swaps are paused");
+    let r = w.as_owner(pool, "set_paused", manifest_args!(false));
+    let ev: Vec<ConfigEv> = w.events(&r, "OwnerPoolConfigEvent");
+    assert_eq!(ev, vec![ConfigEv { fee_bps: 10, paused: false, operator_paused: false }]);
+    assert!(!swap_to(&mut w, bot, pool, 1.0), "the curve is back at the market: nothing to take");
+    let loss = o0 - pool_value(&mut w, pool, 1.0);
+    assert!(loss <= 0.0);
+    // a trade at the restored price only costs the thief
+    w.swap(bot, pool, b, dec!(100)).expect_commit_success();
+    let gain = value(&mut w, bot, 1.0) - t0;
+    let loss = o0 - pool_value(&mut w, pool, 1.0);
+    println!("A2 revoke, restore, reopen: thief gain {gain:.4}, owner loss {loss:.4}");
+    assert!(gain <= 0.0);
+    assert!(loss <= 0.0);
+}
+
+/// Appointing or replacing an operator while the operator's pause is OFF does not pause the pool.
+/// Replacing a key whose holder had the operator pause ON is the same hole as a bare revoke (one
+/// call would clear the thief's pause and reopen swaps on the curve he mispriced behind it), so it
+/// turns the owner's pause on too.
+#[test]
+fn a2_appoint_and_replace_pause_rules() {
+    let mut w = W::new();
+    // ordinary appoint on a fresh pool: not paused, swaps work
+    let pool = w.pool(dec!(18_000), dec!(18_000), 30);
+    let r = w.appoint(pool, (dec!(1), dec!(1)));
+    let ev: Vec<ConfigEv> = w.events(&r, "OwnerPoolConfigEvent");
+    assert_eq!(ev, vec![ConfigEv { fee_bps: 30, paused: false, operator_paused: false }]);
+    assert!(!w.read::<bool>(pool, "is_paused"));
+    let (other, a, b) = (w.other, w.a, w.b);
+    w.swap(other, pool, a, dec!(1)).expect_commit_success();
+
+    // replacement (new badge, proved by the owner) while the operator's pause is off: not paused
+    let (o, badge) = (w.owner, w.badge);
+    let replace = |w: &mut W, pool: ComponentAddress, new: ResourceAddress| {
+        let m = ManifestBuilder::new().lock_fee_from_faucet()
+            .create_proof_from_account_of_amount(o.account, badge, dec!(1))
+            .create_proof_from_account_of_amount(o.account, new, dec!(1))
+            .call_method(pool, "set_operator", manifest_args!(Some(new), Some((dec!(1), dec!(1)))))
+            .build();
+        w.run(&[o], m)
+    };
+    let op2 = w.ledger.create_fungible_resource(dec!(1), 0, o.account);
+    replace(&mut w, pool, op2).expect_commit_success();
+    assert!(!w.read::<bool>(pool, "is_paused"));
+    w.swap(other, pool, b, dec!(1)).expect_commit_success();
+
+    // the thief's case: the bot's key, pause on, pushes, then the owner replaces it in one call
+    let pool = defaults(&mut w);
+    let bot = w.bot;
+    let t0 = value(&mut w, bot, 1.0);
+    paused_two_window_push(&mut w, pool);
+    let op3 = w.ledger.create_fungible_resource(dec!(1), 0, o.account);
+    let r = replace(&mut w, pool, op3);
+    let ev: Vec<ConfigEv> = w.events(&r, "OwnerPoolConfigEvent");
+    assert_eq!(ev, vec![ConfigEv { fee_bps: 10, paused: true, operator_paused: false }]);
+    assert_eq!(w.status(pool).0, Some(op3));
+    w.swap(bot, pool, a, dec!(100)).expect_commit_failure_containing_error("Swaps are paused");
+    assert!(value(&mut w, bot, 1.0) - t0 <= 0.0);
 }
 
 // ============================================================================ access
