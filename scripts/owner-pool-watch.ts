@@ -72,6 +72,8 @@ interface State {
   ownerAnchor?: OwnerAnchorStatement;
   calibration?: { reference: number; scale: number; anchor: [string, string]; at: string };
   alertLast?: Record<string, number>;
+  /** Drift rules currently firing: logged when they start and when they clear, not on every tick. */
+  drifting?: string[];
 }
 const state: State = existsSync(cfg.statePath) && !cfg.replay && cfg.from === undefined
   ? { watch: { spends: [] }, ...JSON.parse(readFileSync(cfg.statePath, 'utf8')) }
@@ -161,7 +163,20 @@ async function tick(): Promise<void> {
     }
   }
   const mapped = ref.ok && scale ? ref.price * scale : undefined;
-  if (mapped) for (const f of driftFindings({ reference: mapped, poolPrice: price, ownerAnchor: state.ownerAnchor?.anchor, maxAnchorDrift: cfg.maxAnchorDrift, maxPoolDrift: cfg.maxPoolDrift })) await report(f, live);
+  if (mapped) {
+    const drift = driftFindings({ reference: mapped, poolPrice: price, ownerAnchor: state.ownerAnchor?.anchor, maxAnchorDrift: cfg.maxAnchorDrift, maxPoolDrift: cfg.maxPoolDrift });
+    const before = new Set(state.drifting ?? []);
+    for (const f of drift) {
+      if (!before.has(f.rule)) await report(f, live);
+      else if (live && alerts.limiter.allow(f.rule, Date.now())) {
+        // Still drifting: re-alert once per interval, and log only that.
+        alerts.limiter.clear(f.rule);
+        await report(f, live);
+      }
+    }
+    for (const r of before) if (!drift.some((f) => f.rule === r)) { log({ event: 'finding', rule: r, severity: 'info', text: `${r} cleared` }); alerts.limiter.clear(r); }
+    state.drifting = drift.map((f) => f.rule);
+  }
   log({
     event: 'tick', transactions: r.txs.length, complete: r.complete, next: state.next, findings: findings.length,
     pool: { price, feeBps: pool.feeBps, ownerPaused: s.ownerPaused, operatorPaused: s.operatorPaused, operator: s.operator, allowanceStored: s.allowance },
