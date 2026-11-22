@@ -4,7 +4,7 @@ import {
   OWNER_POOL_PACKAGES, OWNER_POOL_SWAP_FEE_XRD, OwnerPoolQuoteError, ownerPoolQuote, ownerPoolSwapInstruction, readOwnerPools, type OwnerPoolState,
 } from './ownerpool.ts';
 import type { Depth, DepthLevel, Market, Pool, Quote } from './types.ts';
-import { isBestEffort, poolsToProbe, swapInstruction } from './venues.ts';
+import { chargedSwapFeeXrd, isBestEffort, poolsToProbe, swapInstruction } from './venues.ts';
 
 const other = (pool: Pool, token: string): string | undefined =>
   pool.tokens[0] === token ? pool.tokens[1] : pool.tokens[1] === token ? pool.tokens[0] : undefined;
@@ -63,16 +63,20 @@ export function routeInstructions(route: Pool[], sell: string, prefix = 'in', mi
 
 /**
  * The score `Quoter.best` ranks routes by, for every venue alike: what the trader is left with after
- * the route's own network fee, in the bought token. The fee is the MEASURED one (`networkFeeXrd`, no
- * venue margin: see `chargedSwapFeeXrd`), valued in the bought token at `buyPerXrd` when given (best
- * passes one rate for all of a quote's routes). Without it: buying XRD the fee comes straight off;
- * selling XRD it is valued at the quote's own rate; otherwise the fee cannot be valued and only the
- * amount counts.
+ * the route's own network fee, in the bought token. The fee is the one a fill is CHARGED for the route
+ * (`chargedSwapFeeXrd`: the measured `networkFeeXrd` plus each pool's `VENUE_GAS_MARGIN_XRD`, so every
+ * hop of a multi-hop route counts), the same amount the solver passes to `fillGasXrd`; the rest of a
+ * fill's cost is the same for every route and does not change the order. A best-effort venue therefore
+ * wins only if its better price covers its margin too. The fee is valued in the bought token at
+ * `buyPerXrd` when given (best passes one rate for all of a quote's routes). Without it: buying XRD the
+ * fee comes straight off; selling XRD it is valued at the quote's own rate; otherwise the fee cannot be
+ * valued and only the amount counts. An unreadable measured fee counts as zero.
  */
 export function netOfGas(q: Quote, xrd: string, buyPerXrd?: Decimal): Decimal {
   const out = new Decimal(q.buyAmount);
-  const n = Number(q.networkFeeXrd);
-  const gas = new Decimal(Number.isFinite(n) && n > 0 ? q.networkFeeXrd : 0);
+  const charged = chargedSwapFeeXrd(q);
+  const n = Number(charged);
+  const gas = new Decimal(Number.isFinite(n) && n > 0 ? charged : 0);
   if (q.buy === xrd) return out.minus(gas);
   if (buyPerXrd) return out.minus(gas.mul(buyPerXrd));
   if (q.sell === xrd && new Decimal(q.sellAmount).gt(0)) return out.minus(gas.mul(out).div(q.sellAmount));
@@ -209,8 +213,8 @@ export class Quoter {
       // A pool short of liquidity can hand part of the input back, so measure what was really sold.
       const sold = net(sell).neg();
       if (!received.gt(0) || !sold.gt(0)) return undefined;
-      // The fee as measured. A venue's safety margin (VENUE_GAS_MARGIN_XRD) is added only to what a fill
-      // is charged (chargedSwapFeeXrd), never here, so that it does not count against the venue in ranking.
+      // The fee as measured. A venue's safety margin (VENUE_GAS_MARGIN_XRD) is not added here: it is added
+      // by chargedSwapFeeXrd, both to what a fill is charged and to the fee routes are ranked by (netOfGas).
       return {
         sell, buy,
         sellAmount: sold.toFixed(),
@@ -248,9 +252,11 @@ export class Quoter {
    * pool short of liquidity on one side), whatever their fees: received amounts are only comparable
    * for the same amount sold. Among routes alike in that, the most received NET OF THE ROUTE'S OWN
    * NETWORK FEE wins (`netOfGas`; `hub` is XRD), for every venue, so a cheaper route wins a near tie
-   * on a small trade and the better price wins on a large one. The fee is the measured one, without
-   * any venue's charging margin. Fees differ by venue: on mainnet an Ociswap basic pool swap previews
-   * at ~0.5 XRD, a precision pool ~0.9, CaviarNine 0.9 to 1.5; on Stokenet an OwnerPool 0.46.
+   * on a small trade and the better price wins on a large one. The fee is the one a fill is charged
+   * (`chargedSwapFeeXrd`: measured plus each pool's venue margin, e.g. 0.3 XRD per CaviarNine hop), so a
+   * route never wins a near tie only to cost the taker more. Fees differ by venue: on mainnet an Ociswap
+   * basic pool swap previews at ~0.5 XRD, a precision pool ~0.9, CaviarNine 0.9 to 1.5 (charged 1.2 to
+   * 1.8); on Stokenet an OwnerPool 0.46.
    *
    * All routes' fees are valued in the bought token at one rate: 1 when buying XRD, the best quote's
    * own price when selling XRD, and otherwise `xrdRate` (one cached preview per token, only for pairs

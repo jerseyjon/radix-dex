@@ -41,8 +41,8 @@ export const VENUE_GAS_MARGIN_XRD: Partial<Record<Pool['venue'], string>> = { ca
 /**
  * The pool-swap network fee a fill is CHARGED for a quote: the measured fee (`networkFeeXrd`, what
  * the preview cost) plus `VENUE_GAS_MARGIN_XRD` for each pool of the route. This is what goes into
- * `fillGasXrd` and the like. Route ranking (`Quoter.best`) uses the measured fee alone, so the
- * margin, a safety buffer on what is charged, never counts against a venue when choosing a route.
+ * `fillGasXrd` and the like, and what route ranking (`netOfGas`, `Quoter.best`) deducts, so a venue
+ * whose fills carry a margin must beat the others by more than it to be chosen.
  */
 export function chargedSwapFeeXrd(q: { networkFeeXrd: string; route: Pool[] }): string {
   const margin = q.route.reduce((a, p) => a.plus(VENUE_GAS_MARGIN_XRD[p.venue] ?? 0), new Decimal(0));
