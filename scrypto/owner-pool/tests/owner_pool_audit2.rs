@@ -2,6 +2,8 @@
 //! docs/review-2026-11-21/owner-pool-audit.md. Against 054bd6f the finding tests asserted the
 //! weakness. After the fixes (section "Fixes applied" of the report) the M-1, L-1 and L-2 tests
 //! are inverted to prove each fix; the I-1, I-2 and I-3 tests still document accepted behaviour.
+//! Cold/hot split: only the vault helper changed (it picks the funded reserve vault, since the
+//! component now also holds an inventory vault per token).
 
 use scrypto_test::prelude::*;
 

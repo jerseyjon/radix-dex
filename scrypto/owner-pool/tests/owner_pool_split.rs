@@ -33,7 +33,7 @@ struct RebalanceEv {
     reserve_b: Decimal,
     inventory_a: Decimal,
     inventory_b: Decimal,
-    price_move: Decimal,
+    cost: Decimal,
     allowance: Decimal,
     by_owner: bool,
 }
@@ -59,7 +59,7 @@ struct ConfigEv {
     operator_paused: bool,
 }
 
-type Status = (Option<ResourceAddress>, Limits, Decimal, bool);
+type Status = (Option<ResourceAddress>, Limits, Decimal, bool, (Decimal, Decimal));
 
 struct W {
     ledger: DefaultLedgerSimulator,
@@ -278,12 +278,6 @@ fn dec_floor(x: f64, places: usize) -> Decimal {
     Decimal::from_str(&s).unwrap().checked_round(places as u8, RoundingMode::ToZero).unwrap()
 }
 
-/// Worst-case fraction of the curve's market value a thief can extract with a cumulative operator
-/// log-price path X (fee 0, no other trades): 2 sinh^2(X / 4). See the design document.
-fn g(x: f64) -> f64 {
-    2.0 * (x / 4.0).sinh().powi(2)
-}
-
 // =================================================================================== role table
 
 /// Every method x {owner, operator, stranger}. Expected:
@@ -431,9 +425,9 @@ fn operator_cannot_extract_funds_by_any_method() {
         w.run(&[bot], m).expect_commit_failure();
     }
     // Everything the operator CAN do, at its widest limits: moves stay inside the component.
-    w.rebalance(pool, dec!(10_000), dec!(10_000)).expect_commit_success();
-    w.rebalance(pool, dec!(-15_000), dec!(-15_000)).expect_commit_success();
-    w.rebalance(pool, dec!(5_000), dec!(0)).expect_commit_success();
+    w.rebalance(pool, dec!(5_000), dec!(5_000)).expect_commit_success(); // depth: (2.25 - 1) / 2 = 0.625
+    w.rebalance(pool, dec!(-12_000), dec!(-12_000)).expect_commit_success(); // free
+    w.rebalance(pool, dec!(300), dec!(0)).expect_commit_success(); // 0.1 + 0.05
     w.as_operator(pool, "operator_set_fee", manifest_args!(0u16)).expect_commit_success();
     w.as_operator(pool, "set_operator_paused", manifest_args!(true)).expect_commit_success();
     w.as_operator(pool, "set_operator_paused", manifest_args!(false)).expect_commit_success();
@@ -449,7 +443,8 @@ fn operator_cannot_extract_funds_by_any_method() {
 fn operator_limits_within_and_across_windows() {
     let mut w = W::new();
     let pool = w.managed_pool(30);
-    let (_, limits0, allowance0, _) = w.status(pool);
+    let (_, limits0, allowance0, _, anchor0) = w.status(pool);
+    assert_eq!(anchor0, (dec!(10_000), dec!(10_000)));
     // Defaults: the operator can move nothing that costs budget or raises a reserve.
     assert_eq!(limits0, Limits { move_budget_bps: 0, window_epochs: 1, max_reserve_a: dec!(0), max_reserve_b: dec!(0), min_fee_bps: 30, max_fee_bps: 30 });
     assert_eq!(allowance0, dec!(0));
@@ -495,27 +490,38 @@ fn operator_limits_within_and_across_windows() {
     // Guard.
     w.as_operator(pool, "rebalance", manifest_args!(dec!(1), dec!(1), Some((dec!(1), dec!(1))))).expect_commit_failure_containing_error("Reserves moved");
     let (ra, rb) = w.reserves(pool);
-    w.as_operator(pool, "rebalance", manifest_args!(dec!(1), dec!(1), Some((ra, rb)))).expect_commit_success();
-    w.rebalance(pool, dec!(-1), dec!(-1)).expect_commit_success();
+    // A proportional raise does not move the price but grows the depth: (10001^2/10000^2 - 1) / 2.
+    let r = w.as_operator(pool, "rebalance", manifest_args!(dec!(1), dec!(1), Some((ra, rb))));
+    let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
+    let depth_cost = dec!("0.000100005");
+    assert_eq!(ev[0].cost, depth_cost);
+    // A proportional decrease is free and leaves the anchor where it was.
+    let r = w.rebalance(pool, dec!(-1), dec!(-1));
+    let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
+    assert_eq!(ev[0].cost, dec!(0));
+    assert_eq!(w.status(pool).4, (dec!(10_001), dec!(10_001)));
 
-    // The exact cost of one move: reserves (10000, 10000) -> (10000, 10500): r = 1.05, cost 0.05.
+    // The exact cost of a one-sided add: (10000, 10000) -> (10000, 10500): price 1.05 -> 0.05, plus
+    // depth (1.05 - 1) / 2 = 0.025.
     let (ra, rb) = w.reserves(pool);
     assert_eq!((ra, rb), (dec!(10_000), dec!(10_000)));
     let r = w.rebalance(pool, dec!(0), dec!(500));
     let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-    assert_eq!(ev[0].price_move, dec!("0.05"));
-    assert_eq!(ev[0].allowance, dec!("0.05"));
+    assert_eq!(ev[0].cost, dec!("0.075"));
+    let left = dec!("0.1") - depth_cost - dec!("0.075");
+    assert_eq!(ev[0].allowance, left);
     assert!(!ev[0].by_owner);
+    assert_eq!(w.status(pool).4, (dec!(10_000), dec!(10_500)));
     // Moving both sides in opposite directions costs the product: (10000,10500) -> (9500, 10600):
-    // r = (10600/9500) / (10500/10000) = 1.06265664..., more than the 0.05 left: refused.
+    // r = (10600/9500) / (10500/10000) = 1.06265664..., more than is left: refused.
     w.rebalance(pool, dec!(-500), dec!(100)).expect_commit_failure_containing_error("Operator price-move limit");
     // A move back down costs budget too (budget is path length, not distance from a reference).
+    // One-sided removal: no depth growth.
     let r = w.rebalance(pool, dec!(0), dec!(-250));
     let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-    assert_eq!(ev[0].price_move, dec!("0.024390243902439025")); // 10500/10250 - 1, rounded up
+    assert_eq!(ev[0].cost, dec!("0.024390243902439025")); // 10500/10250 - 1, rounded up
     // Not refilled within the same epoch.
-    let left = w.status(pool).2;
-    assert_eq!(left, dec!("0.05") - dec!("0.024390243902439025"));
+    assert_eq!(w.status(pool).2, left - dec!("0.024390243902439025"));
 
     // Caps: raising a side above its cap is refused; so is raising one side while the OTHER is over
     // its cap; lowering is allowed whatever the caps.
@@ -535,6 +541,24 @@ fn operator_limits_within_and_across_windows() {
     let (ia, _) = w.inventory(pool);
     w.rebalance(pool, ia + dec!(1), dec!(0)).expect_commit_failure();
 
+    // The anchor: a stranger's swap moves the curve's price; an operator move at that price (even a
+    // price-neutral regrow) pays the distance from the anchor, the price the operator last set.
+    w.advance(10);
+    w.owner_restore(pool);
+    assert_eq!(w.status(pool).4, (dec!(10_000), dec!(10_000)));
+    let (other, a) = (w.other, w.a);
+    w.swap(other, pool, a, dec!(200)).expect_commit_success(); // fee is 5% now: price ~0.9621
+    let (ra, rb) = w.reserves(pool);
+    let from_anchor = f(ra) / f(rb) - 1.0;
+    let r = w.rebalance(pool, (ra / dec!(100)).checked_round(6, RoundingMode::ToZero).unwrap(), (rb / dec!(100)).checked_round(6, RoundingMode::ToZero).unwrap());
+    let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
+    println!("regrow by 1% at a swapped price {from_anchor:.6} from the anchor cost {}", ev[0].cost);
+    assert!(f(ev[0].cost) >= from_anchor && f(ev[0].cost) < from_anchor + 0.011);
+    // A move refused for budget leaves everything as it was.
+    let r0 = w.reserves(pool);
+    w.rebalance(pool, dec!(0), dec!(-2_000)).expect_commit_failure_containing_error("Operator price-move limit");
+    assert_eq!(w.reserves(pool), r0);
+
     // Many small one-sided moves within one full budget: the price can move by at most e^0.1.
     w.advance(10);
     let (ra0, rb0) = w.reserves(pool);
@@ -550,7 +574,7 @@ fn operator_limits_within_and_across_windows() {
             break;
         }
         let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-        spent += ev[0].price_move;
+        spent += ev[0].cost;
         calls += 1;
     }
     let (ra1, rb1) = w.reserves(pool);
@@ -574,7 +598,7 @@ fn operator_limits_within_and_across_windows() {
                 break;
             }
             let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-            spent += ev[0].price_move;
+            spent += ev[0].cost;
             up = !up; // oscillate so neither the caps nor an empty side stop it
         }
     }
@@ -747,7 +771,7 @@ fn inventory_is_not_traded_and_fees_stay_in_reserves() {
     let (other, a) = (w.other, w.a);
     let pool = w.pool(dec!(10_000), dec!(10_000), 30);
     assert_eq!(w.inventory(pool), (dec!(0), dec!(0)));
-    let (op, limits, allowance, op_paused) = w.status(pool);
+    let (op, limits, allowance, op_paused, _) = w.status(pool);
     assert_eq!((op, allowance, op_paused), (None, dec!(0), false));
     assert_eq!(limits.move_budget_bps, 0);
     let q0: Decimal = {
@@ -774,21 +798,22 @@ fn inventory_is_not_traded_and_fees_stay_in_reserves() {
 /// Thief pushes A's price (B per A) up with operator moves only: adds B from inventory while B is
 /// under its cap, otherwise takes A into inventory. Steps start at `step` of the reserve and halve
 /// when refused, so nearly the whole budget is used. Stops after `max_spend` (or the budget) is spent.
-/// Returns the budget spent (sum of `price_move`).
+/// Returns the budget spent (sum of `cost`).
 fn push_up(w: &mut W, pool: ComponentAddress, cap_b: Decimal, max_spend: Decimal) -> Decimal {
     let mut spent = Decimal::ZERO;
     let mut frac = dec!("0.005");
     while spent < max_spend && frac >= dec!("0.00001") {
         let (ra, rb) = w.reserves(pool);
-        let (da, db) = if rb < cap_b {
-            (Decimal::ZERO, (rb * frac).min(cap_b - rb).checked_round(6, RoundingMode::ToZero).unwrap())
+        let add_b = (rb * frac).min(cap_b - rb).checked_round(6, RoundingMode::ToZero).unwrap();
+        let (da, db) = if add_b > Decimal::ZERO {
+            (Decimal::ZERO, add_b)
         } else {
             (-(ra * frac).checked_round(6, RoundingMode::ToZero).unwrap(), Decimal::ZERO)
         };
         let r = w.rebalance(pool, da, db);
         if r.is_commit_success() {
             let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-            spent += ev[0].price_move;
+            spent += ev[0].cost;
         } else {
             r.expect_commit_failure_containing_error("Operator price-move limit");
             frac = frac / dec!(2);
@@ -819,73 +844,78 @@ fn thief_value(w: &mut W, p_star: f64) -> f64 {
     f(w.bal(bot, a)) * p_star + f(w.bal(bot, b))
 }
 
-/// What a stolen operator key can extract within its limits. Market price 1 B per A, fee 0 (the
-/// worst case: the operator's fee range includes 0), reserves 10k/10k, inventory 10k/10k, caps 20k
-/// each (curve market value at most V = 40,000), budget 10% per 100-epoch window. The bound from the
-/// design document is V * 2 sinh^2(X / 4) for a cumulative log-price path X <= budget used.
+/// psi(D) = phi(D) + sinh(D / 2), phi(D) = 2 (cosh(D / 2) - 1) = 4 sinh^2(D / 4).
+fn psi(d: f64) -> f64 {
+    2.0 * ((d / 2.0).cosh() - 1.0) + (d / 2.0).sinh()
+}
+
+/// The design document's bound on what a thief gains from operator moves costing `c` in total,
+/// starting with the anchor `d0` (log) away from the market: L_max * sqrt(P*) * C * psi(d0 + 2C),
+/// with L_max = sqrt(cap_a * cap_b) = 20,000 here.
+fn bound(c: Decimal, d0: f64, p_star: f64) -> f64 {
+    let c = f(c);
+    20_000.0 * p_star.sqrt() * c * psi(d0 + 2.0 * c)
+}
+
+/// What a stolen operator key can extract within its limits. Market price 1 B per A (until D), fee
+/// 0 (the worst case: the operator's fee range includes 0), the owner's curve 18k/18k, inventory
+/// 10k/10k, caps 20k each, budget 10% per 100-epoch window. Every strategy's gain is checked
+/// against the design document's bound; the thief's gain equals the owner's loss (fee 0).
 #[test]
 fn stolen_operator_key_attack_is_bounded() {
     let cap = dec!(20_000);
-    let v_cap = 40_000.0;
     let setup = |w: &mut W| -> ComponentAddress {
-        let pool = w.managed_pool(0);
+        let pool = w.pool(dec!(18_000), dec!(18_000), 0);
+        w.fund_inventory(pool, dec!(10_000), dec!(10_000)).expect_commit_success();
+        let (bot, op) = (w.bot, w.op);
+        w.appoint(pool, bot, op).expect_commit_success();
         w.set_limits(pool, 1_000, 100, cap, cap, 0, 100).expect_commit_success();
         w.advance(100); // full budget
         pool
     };
 
-    // A. One window, one extraction: grow the curve to 90% of the caps at no budget cost
-    // (proportional), push the price with the whole budget, sell A back to the market price.
+    // A. One window, one extraction: push the price with the whole budget, sell A back to market.
     let mut w = W::new();
     let pool = setup(&mut w);
     let owner_total0 = w.total(pool);
     let v0 = thief_value(&mut w, 1.0);
-    w.rebalance(pool, dec!(8_000), dec!(8_000)).expect_commit_success();
     let x_a = push_up(&mut w, pool, cap, dec!(1));
     arb_to(&mut w, pool, 1.0);
     let gain_a = thief_value(&mut w, 1.0) - v0;
     let (ta, tb) = w.total(pool);
     let owner_loss = f(owner_total0.0) + f(owner_total0.1) - f(ta) - f(tb);
-    println!("A: budget spent {x_a}, thief gain {gain_a:.6}, owner loss {owner_loss:.6}, bound {:.6}", v_cap * g(f(x_a)));
+    println!("A: budget spent {x_a}, thief gain {gain_a:.6}, owner loss {owner_loss:.6}, bound {:.6}", bound(x_a, 0.0, 1.0));
     assert!((gain_a - owner_loss).abs() < 1e-4, "zero-sum at fee 0");
-    assert!(gain_a > 0.0 && gain_a <= v_cap * g(f(x_a)));
+    assert!(gain_a > 0.0 && gain_a <= bound(x_a, 0.0, 1.0));
     assert!(x_a <= dec!("0.1"));
 
-    // B. Many cycles within one window (push 1%, sell back, repeat): no better than A's bound.
+    // B. Many cycles within one window (push ~1%, sell back to market, push again from the market
+    // price): every push back is charged, so no better than A.
     let mut w = W::new();
     let pool = setup(&mut w);
     let v0 = thief_value(&mut w, 1.0);
-    w.rebalance(pool, dec!(8_000), dec!(8_000)).expect_commit_success();
     let mut x_b = Decimal::ZERO;
     let mut cycles = 0;
     loop {
         let s = push_up(&mut w, pool, cap, dec!("0.01"));
-        if s < dec!("0.001") { break; }
         x_b += s;
+        if s < dec!("0.001") { break; }
         arb_to(&mut w, pool, 1.0);
         cycles += 1;
-        // after selling back, take the extra A out of the curve again (price-neutral) so the caps
-        // don't stop the next push
-        let (ra, rb) = w.reserves(pool);
-        if ra > cap * dec!("0.95") || rb > cap * dec!("0.95") {
-            let cut = (ra.min(rb) / dec!(10)).checked_round(6, RoundingMode::ToZero).unwrap();
-            let _ = w.rebalance(pool, -cut, -(cut * rb / ra).checked_round(6, RoundingMode::ToZero).unwrap());
-        }
     }
     let gain_b = thief_value(&mut w, 1.0) - v0;
-    println!("B: {cycles} cycles, budget spent {x_b}, thief gain {gain_b:.6}, single-extraction bound {:.6}", v_cap * g(0.1));
+    println!("B: {cycles} cycles, budget spent {x_b}, thief gain {gain_b:.6}, bound {:.6}", bound(x_b, 0.0, 1.0));
     assert!(cycles >= 5);
-    assert!(gain_b <= v_cap * g(f(x_b)));
-    assert!(gain_b < gain_a, "splitting into cycles is worse for the thief than one extraction");
+    assert!(gain_b <= bound(x_b, 0.0, 1.0));
+    assert!(gain_b < gain_a, "cycles are worse for the thief than one extraction");
 
-    // C. Several windows with the operator's pause on (so nobody else can trade the mispricing back):
-    // push with each window's budget, then unpause and sell back once. X <= 0.1 * (1 + K).
+    // C. Several windows with the operator's pause on (so nobody else can trade the mispricing
+    // back): push with each window's budget, then unpause and sell back once. C <= 0.1 * (1 + K).
     let k = 4u64;
     let mut w = W::new();
     let pool = setup(&mut w);
     let v0 = thief_value(&mut w, 1.0);
     w.as_operator(pool, "set_operator_paused", manifest_args!(true)).expect_commit_success();
-    w.rebalance(pool, dec!(8_000), dec!(8_000)).expect_commit_success();
     let mut x_c = Decimal::ZERO;
     for i in 0..=k {
         x_c += push_up(&mut w, pool, cap, dec!(1));
@@ -895,15 +925,14 @@ fn stolen_operator_key_attack_is_bounded() {
     arb_to(&mut w, pool, 1.0);
     let gain_c = thief_value(&mut w, 1.0) - v0;
     let x_max = 0.1 * (1 + k) as f64;
-    println!("C: {} windows, budget spent {x_c} (max {x_max}), thief gain {gain_c:.6}, bound {:.6}", k + 1, v_cap * g(f(x_c)));
+    println!("C: {} windows, budget spent {x_c} (max {x_max}), thief gain {gain_c:.6}, bound {:.6}", k + 1, bound(x_c, 0.0, 1.0));
     assert!(f(x_c) <= x_max + 1e-12);
-    assert!(gain_c <= v_cap * g(f(x_c)));
+    assert!(gain_c <= bound(x_c, 0.0, 1.0));
     assert!(gain_c > gain_a);
 
-    // D. The residual the budget cannot see: the market moves (here A from 1 to 1.2 B) while the
-    // curve sits at the old price (operator paused, or simply nobody trading it back). The thief
-    // grows the curve to its caps at no budget cost, pushes further with the budget, and trades it
-    // back to the market. Compared with an ordinary arbitrageur on the un-grown curve.
+    // D. The market moves (A from 1 to 1.2 B) while the curve sits at the old price and anchor
+    // (bot stopped, nobody arbitraging). An ordinary arbitrageur would take the drift anyway; the
+    // thief's EXTRA gain from operator moves (push further with the budget) is what the key adds.
     let p_star = 1.2;
     let mut w = W::new();
     let pool = setup(&mut w);
@@ -913,15 +942,35 @@ fn stolen_operator_key_attack_is_bounded() {
     let mut w = W::new();
     let pool = setup(&mut w);
     let v0 = thief_value(&mut w, p_star);
-    w.rebalance(pool, dec!(10_000), dec!(10_000)).expect_commit_success(); // to the caps, zero budget
     let x_d = push_down(&mut w, pool, dec!(1));
     arb_to_buy_a(&mut w, pool, p_star);
     let gain_d = thief_value(&mut w, p_star) - v0;
-    let v_cap_star = 20_000.0 * p_star + 20_000.0;
-    let bound_d = v_cap_star * g(p_star.ln() + f(x_d));
-    println!("D: market +20%: ordinary arb on the 10k/10k curve gains {gain_plain:.6}; thief with caps 20k and budget {x_d} gains {gain_d:.6} (bound {bound_d:.6})");
-    assert!(gain_d > gain_plain);
-    assert!(gain_d <= bound_d);
+    let extra = gain_d - gain_plain;
+    let bound_d = bound(x_d, p_star.ln(), p_star);
+    println!("D: market +20%: ordinary arb gains {gain_plain:.6}; thief with budget {x_d} gains {gain_d:.6}, extra {extra:.6} (bound {bound_d:.6})");
+    assert!(extra > 0.0 && extra <= bound_d);
+
+    // E. Own capital: the operator shrinks the curve (free), the thief sells A to move its price
+    // ~44% away, then the operator tries to add A, regrow, or lower B at that price (moves that paid
+    // off on the first cut). Measured from the anchor, each costs more than the whole budget and is
+    // refused; selling back, the thief cannot gain.
+    let mut w = W::new();
+    let pool = setup(&mut w);
+    let v0 = thief_value(&mut w, 1.0);
+    let (bot, a) = (w.bot, w.a);
+    w.rebalance(pool, dec!(-9_000), dec!(-9_000)).expect_commit_success();
+    w.swap(bot, pool, a, dec!(3_000)).expect_commit_success();
+    let (ra, rb) = w.reserves(pool);
+    println!("E: curve price after the thief's own swap {:.4}", f(rb) / f(ra));
+    w.rebalance(pool, dec!(10), dec!(0)).expect_commit_failure_containing_error("Operator price-move limit");
+    w.rebalance(pool, (ra / dec!(1000)).checked_round(6, RoundingMode::ToZero).unwrap(), (rb / dec!(1000)).checked_round(6, RoundingMode::ToZero).unwrap())
+        .expect_commit_failure_containing_error("Operator price-move limit");
+    w.rebalance(pool, dec!(0), -(rb / dec!(1000)).checked_round(6, RoundingMode::ToZero).unwrap())
+        .expect_commit_failure_containing_error("Operator price-move limit");
+    arb_to_buy_a(&mut w, pool, 1.0);
+    let gain_e = thief_value(&mut w, 1.0) - v0;
+    println!("E: thief ends {gain_e:.6}");
+    assert!(gain_e <= 0.0);
 }
 
 /// Thief pushes A's price DOWN with operator moves: adds A while under its cap, else takes B out.
@@ -931,15 +980,16 @@ fn push_down(w: &mut W, pool: ComponentAddress, max_spend: Decimal) -> Decimal {
     let mut frac = dec!("0.005");
     while spent < max_spend && frac >= dec!("0.00001") {
         let (ra, rb) = w.reserves(pool);
-        let (da, db) = if ra < cap_a {
-            ((ra * frac).min(cap_a - ra).checked_round(6, RoundingMode::ToZero).unwrap(), Decimal::ZERO)
+        let add_a = (ra * frac).min(cap_a - ra).checked_round(6, RoundingMode::ToZero).unwrap();
+        let (da, db) = if add_a > Decimal::ZERO {
+            (add_a, Decimal::ZERO)
         } else {
             (Decimal::ZERO, -(rb * frac).checked_round(6, RoundingMode::ToZero).unwrap())
         };
         let r = w.rebalance(pool, da, db);
         if r.is_commit_success() {
             let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-            spent += ev[0].price_move;
+            spent += ev[0].cost;
         } else {
             r.expect_commit_failure_containing_error("Operator price-move limit");
             frac = frac / dec!(2);
@@ -956,4 +1006,44 @@ fn arb_to_buy_a(w: &mut W, pool: ComponentAddress, p_star: f64) {
     let y = dec_floor((fa * fb * p_star).sqrt() - fb, 6);
     let (bot, b) = (w.bot, w.b);
     w.swap(bot, pool, b, y).expect_commit_success();
+}
+
+// =================================================================================== bypasses
+
+/// The shrink / swap / regrow bypass found while analysing the first cut (bd574a4), where only the
+/// operator's own price change was charged: the operator shrinks the curve proportionally (free),
+/// the thief moves the price far with a small swap of his own (cheap on a small curve), the operator
+/// regrows the curve proportionally at that price (free: "price unchanged"), and the thief trades
+/// it back to market. Repeatable with no budget at all. On the first cut this test prints the gain
+/// and fails; with the anchor + depth charge the regrow is refused.
+#[test]
+fn shrink_swap_regrow_bypass_is_refused() {
+    let mut w = W::new();
+    let pool = w.pool(dec!(18_000), dec!(18_000), 0);
+    w.fund_inventory(pool, dec!(10_000), dec!(10_000)).expect_commit_success();
+    let (bot, op, a, b) = (w.bot, w.op, w.a, w.b);
+    w.appoint(pool, bot, op).expect_commit_success();
+    w.set_limits(pool, 1_000, 100, dec!(20_000), dec!(20_000), 0, 100).expect_commit_success();
+    w.advance(100);
+    let v0 = thief_value(&mut w, 1.0);
+    // 1. shrink to 1,000 / 1,000 (proportional decrease: free in both versions)
+    w.rebalance(pool, dec!(-17_000), dec!(-17_000)).expect_commit_success();
+    // 2. thief sells 1,000 A: curve (2,000, 500), A now at 0.25 B
+    w.swap(bot, pool, a, dec!(1_000)).expect_commit_success();
+    let (ra, rb) = w.reserves(pool);
+    // 3. regrow proportionally so A reaches its cap: (20,000, 5,000)
+    let m = dec!(20_000) / ra;
+    let regrow = w.rebalance(pool, dec!(20_000) - ra, (rb * m).checked_round(18, RoundingMode::ToZero).unwrap() - rb);
+    if regrow.is_commit_success() {
+        arb_to_buy_a(&mut w, pool, 1.0);
+        let gain = thief_value(&mut w, 1.0) - v0;
+        println!("BYPASS: regrow accepted; one cycle gains the thief {gain:.6} with budget left {}", w.status(pool).2);
+    }
+    regrow.expect_commit_failure_containing_error("Operator price-move limit");
+    // The thief's best is to take back his own trade: he is left with less than he started with.
+    let _ = b;
+    arb_to(&mut w, pool, 1.0);
+    let gain = thief_value(&mut w, 1.0) - v0;
+    println!("shrink/swap/regrow: regrow refused; thief ends {gain:.6}");
+    assert!(gain <= 0.0);
 }

@@ -31,9 +31,12 @@
 //! * Inventory is not part of the trading curve. Swaps and `quote` see only the reserves; swap fees
 //!   stay in the reserves, as before.
 //! * A stolen operator key can still misprice the curve and trade against it. That is bounded on
-//!   ledger by owner-set limits: a price-move budget per window of epochs (refilled continuously, so
-//!   splitting a move into many small calls does not help), and caps on the reserves the operator
-//!   may raise either side to. The design document quantifies the worst case.
+//!   ledger by owner-set limits: a budget per window of epochs (refilled continuously, so splitting
+//!   a move into many small calls does not help) that every operator move spends from, and caps on
+//!   the reserves the operator may raise either side to. A move costs its price change measured
+//!   from BOTH the current price and the ANCHOR (the price the operator or owner last set; swaps do
+//!   not move it), plus the growth of the curve's depth. The design document derives the bound and
+//!   shows why each part is needed (without them, shrink / swap / regrow drains the pool for free).
 //!
 //! Operating rules (not enforced on ledger; check on the Gateway before instantiating):
 //! * The owner badge is total and permanent control (`OwnerRole::Fixed`): it can never be rotated.
@@ -62,9 +65,13 @@ pub const OWNER_POOL_MAX_MOVE_BUDGET_BPS: u16 = 10_000;
 /// so a new operator can do nothing that moves the price or raises a reserve until the owner says so.
 #[derive(ScryptoSbor, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OperatorLimits {
-    /// Price-move budget per window, in basis points of "cost". One `rebalance` that changes the
-    /// curve's price (B per A) from P to P' costs max(P'/P, P/P') - 1, rounded up; this is never
-    /// less than |ln(P'/P)|, so the budget bounds the operator's cumulative log-price path.
+    /// Budget per window, in basis points of "cost". A `rebalance` from reserves (Ra, Rb), price
+    /// P = Rb/Ra, to (Ra', Rb'), price P', with anchor price A, costs (each term rounded up)
+    ///   max(d(P, P'), d(A, P')) + max(0, Ra'Rb' / (Ra Rb) - 1) / 2,   d(x, y) = max(x/y, y/x) - 1
+    /// i.e. the price change from where the curve is and from where the operator last left it, plus
+    /// the growth of its depth. Each term is at least the matching log change, so the budget bounds
+    /// the operator's cumulative log path in price and in depth. An exactly proportional decrease
+    /// (no raise, price unchanged) is free and leaves the anchor where it was.
     pub move_budget_bps: u16,
     /// The budget refills linearly over this many epochs (and never above one full budget).
     pub window_epochs: u64,
@@ -118,7 +125,7 @@ pub struct OwnerPoolRebalanceEvent {
     pub inventory_a: Decimal,
     pub inventory_b: Decimal,
     /// Budget this move cost (zero for the owner, who has no budget).
-    pub price_move: Decimal,
+    pub cost: Decimal,
     /// Operator budget left after the move.
     pub allowance: Decimal,
     pub by_owner: bool,
@@ -160,14 +167,28 @@ fn fungible_divisibility(resource: ResourceAddress) -> u8 {
     }
 }
 
-/// Cost of moving the curve from (ra, rb) to (na, nb), all > 0, in attos of a Decimal, rounded UP:
+const ATTO: u64 = 1_000_000_000_000_000_000;
+
+/// max(hi/lo) - 1 for two positive integers, in attos, rounded UP.
+fn ratio_excess_attos(x: I512, y: I512) -> I512 {
+    let (hi, lo) = if x >= y { (x, y) } else { (y, x) };
+    ((hi - lo) * I512::from(ATTO) + lo - I512::from(1)) / lo
+}
+
+/// d(P, P') for the price of reserves (ra, rb) versus (na, nb), all > 0, in attos, rounded up:
 /// max(r, 1/r) - 1 where r = (nb / na) / (rb / ra). Exact integer arithmetic (I512 on attos).
-fn move_cost_attos(ra: Decimal, rb: Decimal, na: Decimal, nb: Decimal) -> I512 {
-    let num = I512::from(nb.attos()) * I512::from(ra.attos());
-    let den = I512::from(rb.attos()) * I512::from(na.attos());
-    let (hi, lo) = if num >= den { (num, den) } else { (den, num) };
-    let one = I512::from(1_000_000_000_000_000_000u64);
-    ((hi - lo) * one + lo - I512::from(1)) / lo
+fn price_distance_attos(ra: Decimal, rb: Decimal, na: Decimal, nb: Decimal) -> I512 {
+    ratio_excess_attos(I512::from(nb.attos()) * I512::from(ra.attos()), I512::from(rb.attos()) * I512::from(na.attos()))
+}
+
+/// max(0, k'/k - 1) / 2 for k = ra * rb, k' = na * nb, in attos, rounded up (>= ln of depth growth).
+fn depth_growth_attos(ra: Decimal, rb: Decimal, na: Decimal, nb: Decimal) -> I512 {
+    let k = I512::from(ra.attos()) * I512::from(rb.attos());
+    let k2 = I512::from(na.attos()) * I512::from(nb.attos());
+    if k2 <= k {
+        return I512::from(0);
+    }
+    ((k2 - k) * I512::from(ATTO) + I512::from(2) * k - I512::from(1)) / (I512::from(2) * k)
 }
 
 /// A Decimal from an attos amount known to fit (callers pass at most one budget, <= 1.0).
@@ -234,9 +255,12 @@ mod owner_pool {
         owner_badge: ResourceAddress,
         operator: Option<ResourceAddress>,
         limits: OperatorLimits,
-        /// Operator price-move budget left, as of `allowance_epoch`.
+        /// Operator budget left, as of `allowance_epoch`.
         allowance: Decimal,
         allowance_epoch: u64,
+        /// Reserves (A, B) when the operator or the owner last set the curve; their ratio is the
+        /// anchor price. Swaps do not move it. (0, 0) until the curve has both tokens.
+        anchor: (Decimal, Decimal),
     }
 
     impl OwnerPool {
@@ -265,6 +289,7 @@ mod owner_pool {
                 vault_a.put(a);
                 vault_b.put(b);
             }
+            let anchor = (vault_a.amount(), vault_b.amount());
             Self {
                 resource_a,
                 resource_b,
@@ -289,6 +314,7 @@ mod owner_pool {
                 },
                 allowance: Decimal::ZERO,
                 allowance_epoch: Runtime::current_epoch().number(),
+                anchor,
             }
             .instantiate()
             .prepare_to_globalize(OwnerRole::Fixed(rule!(require(owner_badge))))
@@ -326,9 +352,9 @@ mod owner_pool {
             self.paused || self.operator_paused
         }
 
-        /// (operator badge, its limits, budget available now, operator pause flag).
-        pub fn operator_status(&self) -> (Option<ResourceAddress>, OperatorLimits, Decimal, bool) {
-            (self.operator, self.limits, self.allowance_now(), self.operator_paused)
+        /// (operator badge, its limits, budget available now, operator pause flag, anchor reserves).
+        pub fn operator_status(&self) -> (Option<ResourceAddress>, OperatorLimits, Decimal, bool, (Decimal, Decimal)) {
+            (self.operator, self.limits, self.allowance_now(), self.operator_paused, self.anchor)
         }
 
         // ------------------------------------------------------------------ public trading
@@ -411,6 +437,7 @@ mod owner_pool {
                 db = b.amount();
                 self.vault_b.put(b);
             }
+            self.set_anchor();
             self.liquidity_event(da, db);
         }
 
@@ -424,6 +451,7 @@ mod owner_pool {
                 Self::take(&mut self.vault_a, self.resource_a, amount_a),
                 Self::take(&mut self.vault_b, self.resource_b, amount_b),
             );
+            self.set_anchor();
             self.liquidity_event(-amount_a, -amount_b);
             out
         }
@@ -536,8 +564,9 @@ mod owner_pool {
         /// Operator: move funds between inventory and reserves, inside the component. Positive
         /// amounts go from inventory to reserves, negative from reserves to inventory. Nothing is
         /// returned. Limits (owner-set): both reserves must be non-zero before and after; if either
-        /// reserve is raised, both must end at or below their caps; the price change costs budget
-        /// (see `OperatorLimits::move_budget_bps`) and fails "Operator price-move limit" beyond it.
+        /// reserve is raised, both must end at or below their caps; the move costs budget (see
+        /// `OperatorLimits::move_budget_bps`) and fails "Operator price-move limit" beyond it.
+        /// Sets the anchor to the new price (unless it was a free proportional decrease).
         /// `expected`: as for `deposit`.
         pub fn rebalance(&mut self, to_reserve_a: Decimal, to_reserve_b: Decimal, expected: Option<(Decimal, Decimal)>) {
             self.move_inventory(to_reserve_a, to_reserve_b, expected, false);
@@ -573,24 +602,40 @@ mod owner_pool {
 
         fn move_inventory(&mut self, da: Decimal, db: Decimal, expected: Option<(Decimal, Decimal)>, by_owner: bool) {
             self.check_reserves(expected);
-            let mut price_move = Decimal::ZERO;
+            let mut cost = Decimal::ZERO;
+            let mut move_anchor = true;
             if !by_owner {
                 let (ra, rb) = self.reserves();
                 assert!(ra > Decimal::ZERO && rb > Decimal::ZERO, "Pool is empty");
                 let (na, nb) = (ra.checked_add(da).expect("Overflow"), rb.checked_add(db).expect("Overflow"));
                 assert!(na > Decimal::ZERO && nb > Decimal::ZERO, "Operator cannot empty a side");
-                if da > Decimal::ZERO || db > Decimal::ZERO {
+                let raises = da > Decimal::ZERO || db > Decimal::ZERO;
+                if raises {
                     assert!(na <= self.limits.max_reserve_a && nb <= self.limits.max_reserve_b, "Above the operator's reserve cap");
                 }
-                self.refill();
-                let cost = move_cost_attos(ra, rb, na, nb);
-                let have = I512::from(self.allowance.attos());
-                assert!(cost <= have, "Operator price-move limit");
-                price_move = attos_to_decimal(cost);
-                self.allowance = attos_to_decimal(have - cost);
+                let from_current = price_distance_attos(ra, rb, na, nb);
+                if !raises && from_current == I512::from(0) {
+                    // Exactly proportional decrease: shrinks the curve at its price. Free; the
+                    // anchor stays, so a later regrow is still measured from it.
+                    move_anchor = false;
+                } else {
+                    let (aa, ab) = self.anchor;
+                    assert!(aa > Decimal::ZERO && ab > Decimal::ZERO, "No anchor price");
+                    let from_anchor = price_distance_attos(aa, ab, na, nb);
+                    let price = if from_current >= from_anchor { from_current } else { from_anchor };
+                    let total = price + depth_growth_attos(ra, rb, na, nb);
+                    self.refill();
+                    let have = I512::from(self.allowance.attos());
+                    assert!(total <= have, "Operator price-move limit");
+                    cost = attos_to_decimal(total);
+                    self.allowance = attos_to_decimal(have - total);
+                }
             }
             Self::shift(&mut self.inventory_a, &mut self.vault_a, da);
             Self::shift(&mut self.inventory_b, &mut self.vault_b, db);
+            if move_anchor {
+                self.set_anchor();
+            }
             let (reserve_a, reserve_b) = self.reserves();
             let (inventory_a, inventory_b) = self.inventory();
             Runtime::emit_event(OwnerPoolRebalanceEvent {
@@ -600,7 +645,7 @@ mod owner_pool {
                 reserve_b,
                 inventory_a,
                 inventory_b,
-                price_move,
+                cost,
                 allowance: self.allowance,
                 by_owner,
             });
@@ -624,6 +669,15 @@ mod owner_pool {
         fn refill(&mut self) {
             self.allowance = self.allowance_now();
             self.allowance_epoch = Runtime::current_epoch().number();
+        }
+
+        /// The anchor follows every owner move and every operator move that costs budget, as long as
+        /// the curve holds both tokens.
+        fn set_anchor(&mut self) {
+            let (ra, rb) = self.reserves();
+            if ra > Decimal::ZERO && rb > Decimal::ZERO {
+                self.anchor = (ra, rb);
+            }
         }
 
         fn check_reserves(&self, expected: Option<(Decimal, Decimal)>) {

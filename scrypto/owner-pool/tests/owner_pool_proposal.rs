@@ -1,7 +1,9 @@
 //! Tests for the `OwnerPool` blueprint (proposed in the pool audit, 22 Nov 2026; approved by the
 //! owner with a 5% fee cap). Not published. Updated for the audit fixes (owner-pool-audit.md):
 //! instantiation presents the badge (L-1), deposit/withdraw take a reserves guard (M-1, passed as
-//! `None` here), and quote fails where swap would (L-2).
+//! `None` here), and quote fails where swap would (L-2). Adapted for the cold/hot split
+//! (owner-pool-split-design.md): the config event carries `operator_paused`, and the recall/freeze
+//! tests pick the funded (reserve) vault, since the component now also holds inventory vaults.
 
 use scrypto_test::prelude::*;
 

@@ -309,6 +309,9 @@ instantiation, `None` guard) and for `quote` failing on dust.
 Not changed, for the owner to decide: a cold/hot badge split; an on-ledger check of the badge's
 supply/divisibility or of the pooled tokens' roles.
 
+The cold/hot split was later designed and implemented on branch `pool-split`: see
+`owner-pool-split-design.md`.
+
 ## Not verified
 
 - Everything ran in the scrypto-test ledger simulator (engine 1.4.0, the simulator's default
