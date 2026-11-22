@@ -13,3 +13,4 @@
 pub mod order_registry;
 pub mod order_book;
 pub mod pool;
+pub mod owner_pool; // PROPOSAL from the pool audit; not in the published package
