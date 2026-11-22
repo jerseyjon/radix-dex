@@ -193,3 +193,21 @@ export function exceeds(a: string | undefined, b: string | undefined): boolean {
   const x = parsePlain(a ?? undefined), y = parsePlain(b ?? '0') ?? new Decimal(0);
   return Boolean(x && x.gt(y));
 }
+
+/**
+ * Is this "In parts" (order-book) order below the site's minimum? The order's value in XRD is its
+ * XRD side, valued as the solver values a book order: the XRD it sells, or for an order buying XRD,
+ * the XRD it asks for (`gross`, its price times size). A pair without XRD is not restricted: the
+ * exchange never takes such an order (its fees are XRD only), so its size costs the exchange nothing.
+ * No minimum, or a minimum of zero, restricts nothing. Returns the minimum and the value (exact
+ * decimal strings) when the order is too small, otherwise undefined.
+ */
+export function bookOrderBelowMinimum(o: { sell: string; buy: string; xrd: string; sellAmount: string | undefined; gross: string | undefined; minXrd: string | null | undefined }):
+  { minXrd: string; valueXrd: string } | undefined {
+  const min = parsePlain(o.minXrd ?? undefined);
+  if (!min || min.lte(0)) return undefined;
+  const xrdSide = o.sell === o.xrd ? o.sellAmount : o.buy === o.xrd ? o.gross : undefined;
+  const value = parsePlain(xrdSide);
+  if (!value) return undefined;
+  return value.lt(min) ? { minXrd: min.toFixed(), valueXrd: value.toFixed() } : undefined;
+}

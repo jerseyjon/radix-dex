@@ -20,8 +20,11 @@ export interface ServerConfig {
     gasXrd: string; gasAllowanceMargin?: number; marketOrderLifetimeSec: number };
   /** The solver's charges are taken in XRD (`token`). `feeTokens` could be converted to XRD for fees; not done yet. */
   fees?: { token: string; takenIn: 'XRD'; feeTokens: string[]; convertsFeeTokens: boolean };
-  /** The on-ledger order book, for resting orders that fill in part. The fee is read from the ledger. */
-  orderBook?: { component: string; receipts: string; makerFeeBps: number } | null;
+  /**
+   * The on-ledger order book, for resting orders that fill in part. The fee is read from the ledger.
+   * `minOrderXrd`: the smallest order, valued in XRD, the form lets a user place (absent from older servers).
+   */
+  orderBook?: { component: string; receipts: string; makerFeeBps: number; minOrderXrd?: string } | null;
   /** Set by the static preview build: data is a snapshot taken at this time and nothing can be traded. */
   snapshotAt?: number;
 }

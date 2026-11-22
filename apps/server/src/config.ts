@@ -42,7 +42,13 @@ export interface Config {
   /** Most resting signed orders, and most on-ledger book orders, the solver looks at in one pass (market orders are not limited). */
   maxRestingPerTick: number;
   maxBookPerTick: number;
-  /** Book orders worth less than this many XRD are not bought by the solver with its own funds (they cannot pay their network fee). */
+  /**
+   * Smallest "In parts" (order-book) order, in XRD, the site lets a user place, and below which the
+   * solver does not buy a book order with its own funds: taking a resting order costs the solver about
+   * 0.38 XRD of network fee, so a tiny one is never worth routing to. Published in /api/config as
+   * `orderBook.minOrderXrd`. Default per network (`DEFAULT_MIN_BOOK_ORDER_XRD`); `DEX_MIN_BOOK_ORDER_XRD`
+   * replaces it. The order-book contract itself has no minimum: someone calling it directly is not held to this.
+   */
   minBookOrderXrd: number;
   /** /api/health reports the solver as low on funds below this XRD balance. */
   lowXrd: number;
@@ -95,6 +101,13 @@ const DEFAULT_FEE_TOKENS: Record<string, string[]> = {
   ],
 };
 
+/**
+ * Default smallest book order, in XRD. Mainnet: 100 (the owner's figure, 22 Nov 2026). Stokenet: 5, the
+ * old default for every network, kept low because test XRD is not priced like the real thing (the test
+ * pool has had it at about 200x mainnet) and tests place small orders.
+ */
+export const DEFAULT_MIN_BOOK_ORDER_XRD: Record<string, number> = { mainnet: 100, stokenet: 5 };
+
 /** A comma-separated list of resource addresses on this network; a bad entry stops the server. */
 function resources(env: NodeJS.ProcessEnv, name: string, dflt: string[], hrp: string): string[] {
   const v = env[name];
@@ -137,7 +150,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     accountFailureLimit: int(env, 'DEX_ACCOUNT_FAILURE_LIMIT', 6, 1, 1_000_000),
     maxRestingPerTick: int(env, 'DEX_MAX_RESTING_PER_TICK', 20, 1, 10_000),
     maxBookPerTick: int(env, 'DEX_MAX_BOOK_PER_TICK', 20, 1, 10_000),
-    minBookOrderXrd: num(env, 'DEX_MIN_BOOK_ORDER_XRD', 5, 1e9),
+    minBookOrderXrd: num(env, 'DEX_MIN_BOOK_ORDER_XRD', DEFAULT_MIN_BOOK_ORDER_XRD[name] ?? 5, 1e9),
     lowXrd: num(env, 'DEX_LOW_XRD', 30, 1e9),
     feeTokens: resources(env, 'DEX_FEE_TOKENS', DEFAULT_FEE_TOKENS[name] ?? [], name === 'mainnet' ? 'rdx' : 'tdx_2_'),
   };

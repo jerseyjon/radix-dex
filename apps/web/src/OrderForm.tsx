@@ -4,7 +4,7 @@ import { type MarketSummary, type QuoteResult, type ServerConfig, STATIC, api } 
 import { estimate } from './book';
 import { cleanAmount, fmtAmount, fmtPrice } from './format';
 import {
-  type XrdCharges, bookContractPrice, chargeAtFor, exceeds, limitTerms, minAfterXrdCharges, normaliseInput, numberToPlain, parsePlain, placesFor, placesIn,
+  type XrdCharges, bookContractPrice, bookOrderBelowMinimum, chargeAtFor, exceeds, limitTerms, minAfterXrdCharges, normaliseInput, numberToPlain, parsePlain, placesFor, placesIn,
   positivePlain, shareOf, toPlain, withSlippage, xrdCharges,
 } from './money';
 import { Icon } from './ui';
@@ -141,6 +141,15 @@ export function OrderForm(props: {
 
   // The order-book contract's price for this order, or why it cannot be expressed.
   const bookPrice = useBook && price ? bookContractPrice(side, price) : undefined;
+  // The site's smallest book order, valued in XRD: taking a tiny one costs the exchange more in network fees than it is worth.
+  const bookTooSmall = useBook && book
+    ? bookOrderBelowMinimum({ sell: sellTok.address, buy: buyTok.address, xrd: config.xrd, sellAmount, gross: limitGross, minXrd: book.minOrderXrd })
+    : undefined;
+  // The value is shown rounded down, never up to the minimum itself (99.999 reads 99.999, not 100).
+  const tooSmallValue = bookTooSmall && (toPlain(bookTooSmall.valueXrd, 6) === '0' ? bookTooSmall.valueXrd : toPlain(bookTooSmall.valueXrd, 6));
+  const tooSmallText = bookTooSmall
+    ? `Orders “In parts” must be worth at least ${fmtAmount(bookTooSmall.minXrd)} XRD; this one is worth ${tooSmallValue} XRD.`
+    : undefined;
 
   const setPct = (share: number) => {
     setHint(undefined);
@@ -177,6 +186,7 @@ export function OrderForm(props: {
   else if (kind === 'limit' && !useBook && at === 'hop' && !quote?.xrdBase) blocker = 'Cannot work out the XRD fees for this pair now';
   else if (kind === 'limit' && !useBook && limitGross && !limitMinBuy) blocker = 'Too small to cover the network fee';
   else if (bookPrice && !bookPrice.ok) blocker = 'Price cannot be held exactly';
+  else if (bookTooSmall) blocker = `Below the ${fmtAmount(bookTooSmall.minXrd)} XRD minimum`;
 
   async function submit() {
     if (blocker || !wallet || !account || !sellAmount) return;
@@ -225,6 +235,7 @@ export function OrderForm(props: {
         // The contract's price is what the order is owed for each token it sells.
         const bp = bookContractPrice(side, price);
         if (!bp.ok) { setError(bp.reason); return; }
+        if (tooSmallText) { setError(tooSmallText); return; }
         await wallet.sendTransaction(
           bookPlaceManifest({ account, book: book.component, sell: sellTok.address, sellAmount, buy: buyTok.address, price: bp.price, expiresAt: Math.floor(Date.now() / 1000) + expiry }),
           `Limit ${side} ${base.symbol} @ ${price}`);
@@ -302,6 +313,9 @@ export function OrderForm(props: {
           <div><dt>Moves into the order book</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>You receive, as it fills</dt><dd>{limitGross ? `${fmtAmount(Number(limitGross) * (1 - book.makerFeeBps / 10_000))} ${buyTok.symbol}` : '—'}</dd></div>
           {bookPrice && !bookPrice.ok && <div><dt>Price</dt><dd className="warn">{bookPrice.reason}</dd></div>}
+          {bookTooSmall && (
+            <div><dt>Too small</dt><dd className="warn">{tooSmallText} Filling a smaller one would cost more in network fees than it is worth. Enter a larger amount{config.limitOrders.enabled ? ', or choose “Whole only”' : ''}.</dd></div>
+          )}
           {/* The exchange only spends and earns XRD, so it never buys from book orders in a pair without XRD. */}
           {at === 'hop' && <div><dt>Note</dt><dd className="warn">Neither token is XRD, so the exchange does not buy from this order itself or route market orders to it: it fills only when someone buys from the order book contract directly.</dd></div>}
           <div><dt>Fee</dt><dd>{book.makerFeeBps > 0 ? pct(book.makerFeeBps) : 'None'}, plus the network fee to place it (about 0.8 XRD)</dd></div>

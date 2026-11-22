@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Decimal } from '@radix-dex/core/browser';
 import {
-  bookContractPrice, chargeAtFor, exceeds, limitTerms, minAfterFees, minAfterXrdCharges, normaliseInput, numberToPlain, parsePlain, placesFor,
+  bookContractPrice, bookOrderBelowMinimum, chargeAtFor, exceeds, limitTerms, minAfterFees, minAfterXrdCharges, normaliseInput, numberToPlain, parsePlain, placesFor,
   shareOf, toPlain, withSlippage, xrdCharges,
 } from '../src/money.ts';
 
@@ -155,4 +155,26 @@ test('exceeds compares exactly', () => {
   assert.equal(exceeds('123456789.12345681', '123456789.123456789'), true);
   assert.equal(exceeds('0.999999999999999999', '0.999999999999999999'), false);
   assert.equal(exceeds('1', undefined), true);
+});
+
+test('a book order below the minimum is refused, valued by its XRD side', () => {
+  const TOK = 'resource_tok', OTHER = 'resource_other';
+  const at = (o: { sell: string; buy: string; sellAmount?: string; gross?: string; minXrd?: string | null }) =>
+    bookOrderBelowMinimum({ xrd: XRD, sellAmount: o.sellAmount, gross: o.gross, minXrd: o.minXrd === undefined ? '100' : o.minXrd, sell: o.sell, buy: o.buy });
+  // Selling XRD: the XRD sold.
+  assert.deepEqual(at({ sell: XRD, buy: TOK, sellAmount: '99.999999999999999999', gross: '5000' }), { minXrd: '100', valueXrd: '99.999999999999999999' });
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: '100', gross: '1' }), undefined);
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: '1000', gross: '1' }), undefined);
+  // Buying XRD: the XRD asked for (price times size), whatever the size of the token sold.
+  assert.deepEqual(at({ sell: TOK, buy: XRD, sellAmount: '1000000', gross: '42.5' }), { minXrd: '100', valueXrd: '42.5' });
+  assert.equal(at({ sell: TOK, buy: XRD, sellAmount: '1', gross: '100' }), undefined);
+  // No XRD on either side: not restricted (the exchange never takes such an order).
+  assert.equal(at({ sell: TOK, buy: OTHER, sellAmount: '0.001', gross: '0.001' }), undefined);
+  // No minimum (older server), a zero minimum, or nothing typed yet: nothing to refuse.
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: '1', gross: '1', minXrd: null }), undefined);
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: '1', gross: '1', minXrd: '0' }), undefined);
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: undefined, gross: undefined }), undefined);
+  assert.equal(at({ sell: TOK, buy: XRD, sellAmount: '5', gross: undefined }), undefined);
+  // A fractional minimum (Stokenet, or a setting such as 0.5).
+  assert.deepEqual(at({ sell: XRD, buy: TOK, sellAmount: '0.4', minXrd: '0.5' }), { minXrd: '0.5', valueXrd: '0.4' });
 });

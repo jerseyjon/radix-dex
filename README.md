@@ -71,7 +71,7 @@ depth and quotes but cannot trade.
 | `DEX_FAILED_FEE_LIMIT_XRD` | Loss limit: the solver stops sending when network fees paid on failed transactions in the last hour reach this | `3` |
 | `DEX_ACCOUNT_FAILURE_LIMIT` | Failed fills in 24 hours after which an account may not post orders and its orders are skipped | `6` |
 | `DEX_MAX_RESTING_PER_TICK`, `DEX_MAX_BOOK_PER_TICK` | Resting signed orders, and book orders, looked at per solver pass (market orders are not limited) | `20`, `20` |
-| `DEX_MIN_BOOK_ORDER_XRD` | Book orders worth less than this are not bought by the solver with its own funds | `5` |
+| `DEX_MIN_BOOK_ORDER_XRD` | Smallest “In parts” (order-book) order, valued in XRD, the order form lets a user place; book orders worth less are also not bought by the solver with its own funds. Value = the XRD sold, or for an order buying XRD the XRD asked for; pairs without XRD are not restricted. Enforced by the site only: the contract has no minimum. Published as `orderBook.minOrderXrd` in `/api/config` | `100` on mainnet, `5` on Stokenet |
 | `DEX_LOW_XRD` | `/api/health` reports the solver as low on funds below this XRD balance | `30` |
 
 Numbers are checked at start-up: a value that is not a number in range stops the server rather

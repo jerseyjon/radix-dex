@@ -156,8 +156,9 @@ export async function createApp(config: Config) {
     // token is XRD. `feeTokens` are the tokens that could be converted to XRD for pairs with no route
     // through XRD (not done yet); the solver never keeps them.
     fees: { token: config.network.xrd, takenIn: 'XRD', feeTokens: config.feeTokens, convertsFeeTokens: false },
-    // Resting orders with partial fills, held in the on-ledger order book. The fee is read from the ledger.
-    orderBook: book?.info ? { component: book.info.component, receipts: book.info.receipts, makerFeeBps: book.info.makerFeeBps } : null,
+    // Resting orders with partial fills, held in the on-ledger order book. The fee is read from the ledger;
+    // `minOrderXrd`: the smallest order, valued in XRD, the site lets a user place in the book (the contract has no minimum).
+    orderBook: book?.info ? { component: book.info.component, receipts: book.info.receipts, makerFeeBps: book.info.makerFeeBps, minOrderXrd: new Decimal(config.minBookOrderXrd).toFixed() } : null,
   }; });
 
   // For an uptime monitor. 503 when something needs the operator. Shows no balances, orders or keys.

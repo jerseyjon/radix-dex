@@ -187,13 +187,45 @@ the charges taken on either side (checked by reading `limitOrderManifest`, and b
 
 | Where | What |
 |---|---|
+| `DEX_MIN_BOOK_ORDER_XRD` | Default now per network: `100` mainnet (was `5`), `5` Stokenet. See "Smallest book order" below. |
 | `DEX_FEE_TOKENS` | Comma-separated resource addresses for 2(b). Default per network in `config.ts`. Bad address or wrong network: start-up error. |
+| `/api/config` | `orderBook.minOrderXrd` (decimal string, XRD): the smallest book order the form accepts |
 | `/api/config` | `fees: { token: <XRD>, takenIn: "XRD", feeTokens: [...], convertsFeeTokens: false }` |
 | `/api/quote` | `feeAt`: `"buy"` (from XRD bought), `"sell"` (from XRD sold), `"hop"` (between swaps through XRD) or `null` (solver will not fill); `feeToken` (XRD or null); `gasXrd` (network fee estimate, XRD); `gasAllowanceXrd` (×1.25, what a signed order allows); `xrdBase` (the XRD the service fee is charged on). For a pair without XRD the quote is now along the route through XRD. `gasInBuyToken` and `gasAllowanceInBuyToken` are kept, still the same fee valued in the bought token, for older pages; they are no longer what is charged. |
 | `/api/markets` | `solverFills` per market |
 | `/api/orders` | open orders' `outlook` may carry `reason` |
 | `/api/health` | `solver.otherTokens` (count) and the problem "solver holds N token(s) other than XRD" |
 | `POST /api/orders` | 400 "This pair cannot be filled by the exchange: its fees are taken in XRD, and neither token is XRD nor is there a route through XRD. Use an “In parts” order in the order book instead." |
+
+## Smallest book order (added 22 Nov 2026)
+
+Taking a resting order costs the solver about 0.38 XRD of network fee, so a very small "In parts"
+order is never worth routing a taker to. The owner set a minimum of **100 XRD on mainnet**.
+
+- **The contract has no minimum.** `OrderBook::place` (scrypto/dex-contracts/src/order_book.rs) only
+  asserts `sell_amount > 0`, a positive price, two different tokens and a non-negative expiry. Nothing
+  is set at instantiation, and the owner's only methods are `set_maker_fee_bps` and `collect_fees`. The
+  deployed component cannot gain one; a new package would be needed.
+- **So the minimum is the site's.** `DEX_MIN_BOOK_ORDER_XRD` (default per network: 100 mainnet, 5
+  Stokenet, where test XRD is not priced like the real thing) is published in `/api/config` as
+  `orderBook.minOrderXrd` (a decimal string). The order form refuses an "In parts" order worth less,
+  saying "Orders “In parts” must be worth at least 100 XRD; this one is worth 42.5 XRD." The rule is
+  `bookOrderBelowMinimum` in apps/web/src/money.ts, with tests.
+- **Value in XRD** is the order's XRD side, the same way the solver values a book order: the XRD it
+  sells, or for an order buying XRD the XRD it asks for (price × size). **Pairs without XRD are not
+  restricted**: the exchange never takes such an order (its charges are XRD only), so its size costs
+  the exchange nothing. The quote's `xrdBase` could value them, but there is no cost to protect.
+- **The same setting** still stops the solver buying (arbitrage) or crossing book orders worth less
+  with its own funds, so on mainnet that floor rises from 5 to 100 XRD. It does **not** stop the
+  solver taking small book orders as liquidity when it fills a market or signed order (`pickLiquidity`),
+  which is where the ~0.38 XRD per resting order is spent; orders already in the book, or placed by
+  calling the component directly, can still be taken that way. Not changed here.
+- **Bypass:** anyone can call `place` on the component with any amount; the site's check only covers
+  orders placed through the form.
+- **Changing it:** set `DEX_MIN_BOOK_ORDER_XRD` in the service's environment and restart the server;
+  the page reads the new value from `/api/config` on its next load. `0` turns the form's check off.
+- "Whole only" (signed) orders are unaffected: their network fee comes out of the order itself, and the
+  form already refuses one too small to cover it.
 
 ## Rule 2(b): the follow-up, if wanted
 
@@ -229,7 +261,8 @@ deploys the overnight fixes (see `README.md` in this folder for that procedure).
 3. In the checkout: merge `fee-side`, `npm ci`, `npm test`, `npm run typecheck`, `npm run build -w apps/web`,
    then restart `radix-dex-mainnet`.
 4. Check: `/api/config` has `fees.takenIn: "XRD"`; `/api/health` is `ok` with `solver.otherTokens: 0`;
-   a quote for an XRD → token pair says `feeAt: "sell"`.
+   a quote for an XRD → token pair says `feeAt: "sell"`; `orderBook.minOrderXrd` is `"100"`
+   (unless `DEX_MIN_BOOK_ORDER_XRD` is set in the service's environment: check it is not still `5`).
 5. No database change. No new setting is needed (`DEX_FEE_TOKENS` defaults per network).
 6. Roll back by checking out the previous commit, rebuilding and restarting; nothing on ledger or in
    the database depends on this branch.
