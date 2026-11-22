@@ -1,10 +1,11 @@
 import { readFileSync, statSync } from 'node:fs';
 import {
   type DecodedOrder, type Ed25519Key, type Gateway, type SolverIdentity, Decimal,
-  type BookOrder, type LiquidityItem, type Pool,
-  GAS_SHORTFALL_TOLERANCE, accountOf, bookArbManifest, bookArbPoolFirstManifest, bookCrossManifest, buildTransaction,
+  type BookOrder, type ChargeAt, type LiquidityItem, type Pool, type Quote,
+  GAS_SHORTFALL_TOLERANCE, accountOf, bookArbManifest, bookCrossManifest, buildTransaction, chargeAt,
   decodeSignedPartialTransaction, grossNeeded, keyFromHex, limitOf, orderKeyCancelled, payout,
-  POOL_FILL_BUFFER_BPS, pickLiquidity, planBookCross, planPoolFill, takeFillManifest,
+  POOL_FILL_BUFFER_BPS, pickLiquidity, planBookCrossExact, planPoolFill, planXrdLegFill, reducedXrdCharges, retryXrdTake, takeFillManifest,
+  xrdCharges, xrdLegNeeded,
 } from '@radix-dex/core';
 import type { BookWatcher } from './book.ts';
 import type { Config } from './config.ts';
@@ -21,6 +22,8 @@ export function loadSolverKey(path: string): Ed25519Key {
 export const errText = (e: unknown): string => String((e as Error)?.message ?? e).slice(0, 300);
 
 export const FEE_LOCK_XRD = '10';
+/** Why an order in a pair the solver cannot charge in XRD waits. Shown in the order list. */
+export const NO_XRD_ROUTE = 'Not filled by the exchange: its fees are taken in XRD, and this pair has no route through XRD. Cancel it, or use an “In parts” order in the order book.';
 /**
  * Network cost the site assumes for a fill when it has no route-specific figure (a fallback for
  * the order form only). Fills are charged what `fillGasXrd` estimates for their route, which on
@@ -76,10 +79,19 @@ interface Execution {
   /** Amount of the taker's sell token sent through pools, and the route it takes. */
   poolIn: string;
   route: Pool[];
-  /** Everything the taker's sale produces, before the network fee and our fee. */
+  /** Everything the taker's sale produces in the token it buys: before the charges for `proceeds`, after them for `input` and `hop`. */
   total: Decimal;
-  /** The network fee for this execution, in the token the taker buys. */
-  gasInBuyToken: string;
+  /** What the pool leg alone produces (part of `total`). */
+  poolOut: Decimal;
+  /** Where the solver's charges are taken. They are always XRD. */
+  at: ChargeAt;
+  /** The network fee for this execution, in XRD. */
+  gasXrd: Decimal;
+  /** The XRD the service fee is charged on, and (for `input` and `hop`) the charges taken before the last swap. */
+  xrdBase: Decimal;
+  take: Decimal;
+  /** What the taker would get, for comparing executions. */
+  net: Decimal;
 }
 
 /** What became of a transaction the solver tried to send. */
@@ -127,7 +139,9 @@ export class Solver {
   private stopped = false;
   private restingCursor = 0;
   /** Per open order: what the pools would pay it right now after the network fee, and what it needs. */
-  readonly outlook = new Map<string, { available: string; needed: string; at: number }>();
+  readonly outlook = new Map<string, { available: string; needed: string; at: number; reason?: string }>();
+  /** Tokens other than XRD and the solver badge found in the solver's account, and when it was last looked at. */
+  foreignHoldings: { at: number; tokens: string[] } | undefined;
 
   // For /api/health and the logs. A new solver counts as having just finished a pass.
   lastTickAt = Date.now();
@@ -357,52 +371,171 @@ export class Solver {
     return b.retryAt <= Date.now();
   }
 
-  /** The network fee, which the solver pays in XRD, valued in `resource`. Undefined if no pool prices that token. */
-  private gasIn(resource: string, gasXrd: Decimal): Promise<string | undefined> {
-    return this.data.xrdValueIn(resource, gasXrd);
+  /** A quote for `amount` of `sell` into `buy` through the listed pools. `error` when the Gateway, not the market, failed. */
+  private async poolQuote(sell: string, buy: string, amount: Decimal): Promise<{ quote?: Quote; error: boolean }> {
+    const errorsBefore = this.data.quoter.errors;
+    const quote = await this.data.quoter.best(this.data.pools, sell, buy, amount.toFixed(), this.config.network.xrd).catch(() => undefined);
+    if (!quote && this.data.quoter.errors > errorsBefore) return { error: true };
+    // A pool that would hand back part of the input (out of liquidity) is no route: the unswapped part would be lost to the user.
+    if (quote && new Decimal(quote.sellAmount).gte(amount)) return { quote, error: false };
+    return { error: false };
   }
 
   /**
    * Best execution for `taker`: with nothing taken from other traders (pools only), then with the
-   * cheapest one, two… of their orders, keeping whichever leaves the taker most after the network fee.
+   * cheapest one, two… of their orders, keeping whichever leaves the taker most after the charges.
    * Returns undefined if no plan can be made, or if a quote failed with an error (the Gateway, not
    * the market, is the problem: better to wait than to fill on a partial picture).
+   *
+   * The charges are XRD, taken where `chargeAt` says. When the taker buys XRD they come out of the
+   * proceeds; when it sells XRD they are set aside first and only the rest buys from others and the
+   * pools; with no XRD in the pair the order goes through pools by way of XRD (see `hopExecution`).
    */
   private async bestExecution(taker: StoredOrder, resting: StoredOrder[], book: BookOrder[], nowSec: number): Promise<Execution | undefined> {
     const xrd = this.config.network.xrd;
-    const candidates = pickLiquidity(taker, resting, book, this.config.makerFeeBps, this.divisibility, nowSec);
+    const at = chargeAt(taker.sell, taker.buy, xrd);
+    if (at === 'hop') return this.hopExecution(taker);
+    const S = new Decimal(taker.sellAmount);
+    const feeBps = this.config.feeBps;
+    // A maker fee is paid in the token the taker sells. The solver keeps XRD only, so there is none unless that is XRD.
+    const makerFee = at === 'input' ? this.config.makerFeeBps : 0;
+    // Selling XRD: the charges are set aside before anything is bought, so estimate them first from a
+    // quote of the whole order (its route's swap cost), then settle them on the route actually used.
+    let refSwapFee: string | undefined;
+    if (at === 'input') {
+      const r = await this.poolQuote(taker.sell, taker.buy, S);
+      if (r.error) return undefined;
+      refSwapFee = r.quote?.networkFeeXrd;
+    }
+    const pick = (sellAmount: Decimal) => (sellAmount.gt(0) ? pickLiquidity({ ...taker, sellAmount: sellAmount.toFixed() }, resting, book, makerFee, this.divisibility, nowSec) : []);
+    const maxItems = pick(S).length;
     let best: Execution | undefined;
-    for (let k = 0; k <= candidates.length; k++) {
-      let items = candidates.slice(0, k);
-      const fromOthers = items.reduce((sum, m) => sum.plus(m.gives), new Decimal(0));
-      const left = items.reduce((rest, m) => rest.minus(m.cost), new Decimal(taker.sellAmount));
-      let total = fromOthers, route: Pool[] = [], poolIn = '0', swapFee: string | undefined;
-      if (left.gt(0)) {
-        const errorsBefore = this.data.quoter.errors;
-        const quote = await this.data.quoter.best(this.data.pools, taker.sell, taker.buy, left.toFixed(), xrd).catch(() => undefined);
-        if (!quote && this.data.quoter.errors > errorsBefore) return undefined;
-        // A pool that would hand back part of the input (out of liquidity) is no route: the unswapped part would be lost to the user.
-        if (quote && new Decimal(quote.sellAmount).gte(left)) { total = total.plus(quote.buyAmount); route = quote.route; poolIn = left.toFixed(); swapFee = quote.networkFeeXrd; }
-        else {
-          // No pool for the remainder. A signed order can be given it as a better price;
-          // a book order cannot, and the taker cannot be handed it back, so that plan is out.
-          const i = items.findIndex((m) => m.kind === 'order');
-          const first = items[i];
-          if (!first || first.kind !== 'order') { if (left.gt(new Decimal(taker.sellAmount).mul('1e-9'))) continue; }
+    const sumOf = (items: LiquidityItem[], f: (m: LiquidityItem) => string) => items.reduce((sum, m) => sum.plus(f(m)), new Decimal(0));
+    // A leftover of the sold token with no pool to take it goes to the first signed order taken, as a better price.
+    const giveToFirstOrder = (items: LiquidityItem[], extra: Decimal): LiquidityItem[] | undefined => {
+      const i = items.findIndex((m) => m.kind === 'order');
+      const first = items[i];
+      if (!first || first.kind !== 'order') return undefined;
+      const cost = new Decimal(first.cost).plus(extra);
+      const pay = payout(cost, new Decimal(first.order.minBuyAmount), makerFee, this.divisibility(taker.sell))!;
+      return items.map((m, j) => (j === i ? { ...first, cost: cost.toFixed(), pay: pay.toFixed() } : m));
+    };
+    for (let k = 0; k <= maxItems; k++) {
+      let exec: Execution | undefined;
+      if (at === 'proceeds') {
+        let items = pick(S).slice(0, k);
+        if (items.length < k) break;
+        const left = S.minus(sumOf(items, (m) => m.cost));
+        let total = sumOf(items, (m) => m.gives), route: Pool[] = [], poolIn = '0', swapFee: string | undefined, poolOut = new Decimal(0);
+        if (left.gt(0)) {
+          const r = await this.poolQuote(taker.sell, taker.buy, left);
+          if (r.error) return undefined;
+          if (r.quote) { total = total.plus(r.quote.buyAmount); poolOut = new Decimal(r.quote.buyAmount); route = r.quote.route; poolIn = left.toFixed(); swapFee = r.quote.networkFeeXrd; }
           else {
-            const cost = new Decimal(first.cost).plus(left);
-            const pay = payout(cost, new Decimal(first.order.minBuyAmount), this.config.makerFeeBps, this.divisibility(taker.sell))!;
-            items = items.map((m, j) => (j === i ? { ...first, cost: cost.toFixed(), pay: pay.toFixed() } : m));
+            // No pool for the remainder: a signed order can take it as a better price; nothing else can, as the solver must not keep it.
+            const given = giveToFirstOrder(items, left);
+            if (!given) continue;
+            items = given;
           }
         }
+        // Change a book order hands back in the sold token needs a pool leg to go into; without one the solver would keep it.
+        if (!route.length && items.some((m) => m.kind === 'book' && new Decimal(m.change).gt(0))) continue;
+        const gasXrd = fillGasXrd(items.length, route.length > 0 ? swapFee ?? '0.5' : undefined);
+        exec = { items, poolIn, route, total, poolOut, at, gasXrd, xrdBase: total, take: new Decimal(0), net: total.minus(xrdCharges(total, gasXrd, feeBps)) };
+      } else {
+        // The taker sells XRD. Set the charges aside, assuming a pool leg, and see what the rest buys.
+        const kPool = xrdCharges(S, fillGasXrd(k, refSwapFee ?? '0.5'), feeBps);
+        let items = pick(S.minus(kPool)).slice(0, k);
+        if (items.length < k) break;
+        let left = S.minus(kPool).minus(sumOf(items, (m) => m.cost));
+        let planned: Execution | undefined;
+        if (left.gt(0)) {
+          const r = await this.poolQuote(taker.sell, taker.buy, left);
+          if (r.error) return undefined;
+          if (r.quote) {
+            const gasXrd = fillGasXrd(k, r.quote.networkFeeXrd);
+            // Charges by the route really used, never more than set aside; anything set aside beyond them also goes into the pool.
+            const take = Decimal.min(kPool, xrdCharges(S, gasXrd, feeBps));
+            const total = sumOf(items, (m) => m.gives).plus(r.quote.buyAmount);
+            planned = { items, poolIn: S.minus(take).minus(sumOf(items, (m) => m.cost)).toFixed(), route: r.quote.route, total, poolOut: new Decimal(r.quote.buyAmount), at, gasXrd, xrdBase: S, take, net: total };
+          }
+        }
+        if (!planned) {
+          // No pool leg: the network fee is smaller, so set aside less and let the orders taken have the rest.
+          const gasXrd = fillGasXrd(k);
+          const take = xrdCharges(S, gasXrd, feeBps);
+          items = pick(S.minus(take)).slice(0, k);
+          if (!items.length) continue;
+          left = S.minus(take).minus(sumOf(items, (m) => m.cost));
+          if (left.gt(0)) {
+            const given = giveToFirstOrder(items, left);
+            // XRD dust may stay with the solver; more than that must not.
+            if (given) items = given; else if (left.gt(S.mul('1e-9'))) continue;
+          }
+          const total = sumOf(items, (m) => m.gives);
+          planned = { items, poolIn: '0', route: [], total, poolOut: new Decimal(0), at, gasXrd, xrdBase: S, take, net: total };
+        }
+        exec = planned;
       }
-      // Each order taken adds to the network fee the taker pays, so compare what is left after it.
-      const gasXrd = fillGasXrd(items.length, route.length > 0 ? swapFee ?? '0.5' : undefined);
-      const gasInBuyToken = await this.gasIn(taker.buy, gasXrd);
-      if (gasInBuyToken === undefined) continue; // the fee cannot be charged in this token: do not fill for nothing
-      if (!best || total.minus(gasInBuyToken).gt(best.total.minus(best.gasInBuyToken))) best = { items, poolIn, route, total, gasInBuyToken };
+      if (!best || exec.net.gt(best.net)) best = exec;
     }
     return best;
+  }
+
+  /**
+   * Neither token is XRD: the order goes through a pool from its token to XRD and a pool from XRD to
+   * the token it buys, and the charges are taken in XRD between the two. Other traders' orders are not
+   * used. Undefined if there is no such route or a quote failed.
+   */
+  private async hopExecution(taker: StoredOrder): Promise<Execution | undefined> {
+    const xrd = this.config.network.xrd;
+    const route = this.data.quoter.candidateRoutes(this.data.pools, taker.sell, taker.buy, xrd).find((r) => r.length === 2);
+    if (!route) return undefined;
+    const S = new Decimal(taker.sellAmount);
+    const sim = async (r: Pool[], sell: string, amount: Decimal) => {
+      try { return await this.data.quoter.simulate(r, sell, amount); } catch { this.data.quoter.errors++; return null; }
+    };
+    // The whole route once, for the network cost of the two swaps; then each leg.
+    const whole = await sim(route, taker.sell, S);
+    const leg1 = await sim([route[0]!], taker.sell, S);
+    if (whole === null || leg1 === null) return undefined;
+    if (!whole || !leg1 || new Decimal(leg1.sellAmount).lt(S)) return undefined;
+    const x = new Decimal(leg1.buyAmount);
+    const gasXrd = fillGasXrd(0, whole.networkFeeXrd);
+    const take = xrdCharges(x, gasXrd, this.config.feeBps);
+    if (!take.lt(x)) return undefined;
+    const leg2 = await sim([route[1]!], xrd, x.minus(take));
+    if (!leg2 || new Decimal(leg2.sellAmount).lt(x.minus(take))) return undefined;
+    const total = new Decimal(leg2.buyAmount);
+    return { items: [], poolIn: S.toFixed(), route, total, poolOut: total, at: 'hop', gasXrd, xrdBase: x, take, net: total };
+  }
+
+  /**
+   * The charges did not fit (the signed allowance is short of the current estimate): try a smaller
+   * take, down to the network fee less the tolerated shortfall, by quoting the pool leg again with
+   * what that frees. Undefined if it still does not fit.
+   */
+  private async retrySmallerTake(o: StoredOrder, exec: Execution, need: Decimal): Promise<{ exec: Execution; plan: { solverTake: string; userReceives: string } } | undefined> {
+    if (!exec.route.length) return undefined;
+    const fromOthers = exec.total.minus(exec.poolOut);
+    const swapped = exec.at === 'hop' ? exec.xrdBase.minus(exec.take) : new Decimal(exec.poolIn);
+    const candidate = retryXrdTake({
+      xrdBase: swapped.plus(exec.take).toFixed(), takeFull: exec.take.toFixed(), takeMin: reducedXrdCharges(exec.gasXrd).toFixed(),
+      out: exec.poolOut.toFixed(), need: need.minus(fromOthers).toFixed(),
+    });
+    if (!candidate || !candidate.lt(exec.take)) return undefined;
+    const amount = swapped.plus(exec.take.minus(candidate));
+    const q = exec.at === 'hop'
+      ? await this.data.quoter.simulate([exec.route[1]!], this.config.network.xrd, amount).catch(() => undefined)
+      : await this.data.quoter.simulate(exec.route, o.sell, amount).catch(() => undefined);
+    if (!q || new Decimal(q.sellAmount).lt(amount)) return undefined;
+    const poolOut = new Decimal(q.buyAmount);
+    const next: Execution = {
+      ...exec, take: candidate, poolOut, total: fromOthers.plus(poolOut), net: fromOthers.plus(poolOut),
+      poolIn: exec.at === 'hop' ? exec.poolIn : amount.toFixed(),
+    };
+    const plan = planXrdLegFill({ xrdBase: next.xrdBase.toFixed(), take: candidate.toFixed(), out: next.total.toFixed(), minBuyAmount: o.minBuyAmount, limitBuyAmount: limitOf(o).toFixed(), bufferBps: exec.route.length ? undefined : 0, buyDivisibility: this.divisibility(o.buy) });
+    return plan ? { exec: next, plan } : undefined;
   }
 
   /**
@@ -415,13 +548,30 @@ export class Solver {
     const book = liveBook.filter((b) => !skip.book.has(b.id));
     // Orders can arrive during a pass: make sure every token in play is known (cached after the first time).
     await this.loadDivisibility([o, ...resting, ...book].flatMap((x) => [x.sell, x.buy]));
-    const exec = await this.bestExecution(o, resting, book, now);
+    let exec = await this.bestExecution(o, resting, book, now);
     if (!exec) { this.outlook.delete(o.id); return { kind: 'noPlan' }; }
-    const { gasInBuyToken } = exec;
+    const limit = limitOf(o).toFixed();
     // With no pool leg the outcome is exact, so no margin is needed.
-    const terms = { minBuyAmount: o.minBuyAmount, limitBuyAmount: limitOf(o).toFixed(), gasInBuyToken, bufferBps: exec.route.length ? undefined : 0, gasShortfall: GAS_SHORTFALL_TOLERANCE };
-    this.outlook.set(o.id, { available: exec.total.toFixed(), needed: grossNeeded(terms).toFixed(), at: Date.now() });
-    const plan = planPoolFill({ ...terms, quotedOut: exec.total.toFixed(), feeBps: this.config.feeBps, divisibility: this.divisibility(o.buy) });
+    const bufferBps = exec.route.length ? undefined : 0;
+    let plan: { solverTake: string; userReceives: string } | undefined;
+    if (exec.at === 'proceeds') {
+      const terms = { minBuyAmount: o.minBuyAmount, limitBuyAmount: limit, gasInBuyToken: exec.gasXrd.toFixed(), bufferBps, gasShortfall: GAS_SHORTFALL_TOLERANCE };
+      this.outlook.set(o.id, { available: exec.total.toFixed(), needed: grossNeeded(terms).toFixed(), at: Date.now() });
+      plan = planPoolFill({ ...terms, quotedOut: exec.total.toFixed(), feeBps: this.config.feeBps, divisibility: this.divisibility(o.buy) });
+    } else {
+      const terms = { xrdBase: exec.xrdBase.toFixed(), take: exec.take.toFixed(), minBuyAmount: o.minBuyAmount, limitBuyAmount: limit, bufferBps, buyDivisibility: this.divisibility(o.buy) };
+      const need = xrdLegNeeded(terms);
+      if (!need) { this.outlook.delete(o.id); return { kind: 'noPlan' }; }
+      // Shown in whole-order terms (as if no charges were taken first), so it compares with the order's own price.
+      const scale = exec.xrdBase.div(exec.xrdBase.minus(exec.take));
+      const floor = new Decimal(o.minBuyAmount).mul(10_000 + (bufferBps ?? POOL_FILL_BUFFER_BPS)).div(10_000);
+      this.outlook.set(o.id, { available: exec.total.mul(scale).toDecimalPlaces(18).toFixed(), needed: Decimal.max(limit, floor.mul(scale)).toDecimalPlaces(18).toFixed(), at: Date.now() });
+      plan = planXrdLegFill({ ...terms, out: exec.total.toFixed() });
+      if (!plan) {
+        const retry = await this.retrySmallerTake(o, exec, need);
+        if (retry) { exec = retry.exec; plan = retry.plan; }
+      }
+    }
     if (!plan) return { kind: 'noPlan' };
     const makerItems = exec.items.filter((m) => m.kind === 'order');
     const bookItems = exec.items.filter((m) => m.kind === 'book');
@@ -440,17 +590,20 @@ export class Solver {
     if (unfunded) return { kind: 'unfunded' };
     const children: Record<string, DecodedOrder> = { taker: await this.decode(o) };
     for (const [i, m] of makers.entries()) children[`maker_${i}`] = await this.decode(m);
+    // What the trade produced before the charges, for the trade's price: where they were taken before the last swap, scaled back up.
+    const gross = exec.at === 'proceeds' ? exec.total : exec.total.mul(exec.xrdBase).div(exec.xrdBase.minus(plan.solverTake)).toDecimalPlaces(18);
     const res = await this.send(
       takeFillManifest({
         solver: this.identity!, feeLockXrd: FEE_LOCK_XRD, sell: o.sell, buy: o.buy, makerPays: makerItems.map((m) => m.pay), poolIn: exec.poolIn, route: exec.route, solverTake: plan.solverTake,
+        xrd: this.config.network.xrd, chargeAt: exec.at,
         bookFills: bookItems.map((m) => ({ book: this.book!.component, id: m.order.id, pay: m.cost })),
         assertBought: bookItems.length ? exec.items.reduce((sum, m) => sum.plus(m.gives), new Decimal(0)).toFixed() : undefined,
       }),
       children,
       {
         kind: 'fill', bookIds: bookItems.map((m) => m.order.id),
-        // The taker's trade produced `total` before fees; a maker's produced its cost (its price, before the maker fee).
-        orders: [{ id: o.id, received: plan.userReceives, gross: exec.total.toFixed() }, ...makerItems.map((m) => ({ id: (m.order as StoredOrder).id, received: m.pay, gross: m.cost }))],
+        // A maker's trade produced its cost (its price, before the maker fee).
+        orders: [{ id: o.id, received: plan.userReceives, gross: gross.toFixed() }, ...makerItems.map((m) => ({ id: (m.order as StoredOrder).id, received: m.pay, gross: m.cost }))],
       });
     return { kind: 'sent', res, makers, bookIds: bookItems.map((m) => m.order.id), exec };
   }
@@ -518,6 +671,10 @@ export class Solver {
    */
   private async arbitrage(b: BookOrder): Promise<SendResult | undefined> {
     const xrd = this.config.network.xrd;
+    // The solver spends and earns XRD only: it buys from orders that want XRD, and sells what it
+    // bought back into XRD. An order that sells XRD would need paying in another token, and the book
+    // hands back rounding change in that token, so the solver leaves those to takers.
+    if (b.buy !== xrd) return undefined;
     const solver = this.identity!;
     const sellDiv = this.divisibility(b.sell), buyDiv = this.divisibility(b.buy);
     const record = { kind: 'book' as const, orders: [], bookIds: [b.id] };
@@ -527,9 +684,7 @@ export class Solver {
       const quote = await this.data.quoter.best(this.data.pools, b.sell, b.buy, q.toFixed(), xrd).catch(() => undefined);
       if (!quote || new Decimal(quote.sellAmount).lt(q)) return undefined;
       const cost = q.mul(b.price).toDecimalPlaces(buyDiv, Decimal.ROUND_UP);
-      const priced = mustCoverGas ? await this.gasIn(b.buy, arbGasXrd(quote.networkFeeXrd)) : '0';
-      if (priced === undefined) return undefined;
-      const gas = new Decimal(priced);
+      const gas = mustCoverGas ? arbGasXrd(quote.networkFeeXrd) : new Decimal(0);
       // The pool can move before the transaction runs, so it must also bring back the network fee or fail.
       const minBack = cost.plus(gas).toDecimalPlaces(buyDiv, Decimal.ROUND_UP);
       return new Decimal(quote.buyAmount).mul(10_000 - POOL_FILL_BUFFER_BPS).div(10_000).gt(minBack) ? { q, cost, minBack, route: quote.route } : undefined;
@@ -542,32 +697,9 @@ export class Solver {
       if (!plan || plan.cost.gt(float)) continue;
       const res = await this.send(bookArbManifest({
         solver, feeLockXrd: FEE_LOCK_XRD, book: this.book!.component, id: b.id, payResource: b.buy, pay: plan.cost.toFixed(),
-        boughtResource: b.sell, route: plan.route, minBack: plan.minBack.toFixed(),
+        boughtResource: b.sell, route: plan.route, minBack: plan.minBack.toFixed(), xrd,
       }), {}, record);
       if (res.kind === 'committed') console.log(`[solver] bought ${plan.q.toFixed()} ${this.symbol(b.sell)} from book order ${b.id} and sold it through ${plan.route.map((p) => p.venue).join('>')} in ${res.txid}`);
-      return res;
-    }
-
-    // Not enough of the token the order wants (a solver that holds only XRD, say). Do it the other
-    // way round with the token the order sells: sell some through the pool, pay the proceeds into
-    // the order, and end with more of that token than it started with.
-    const start = await this.spendable(b.sell);
-    for (const share of ARB_SHARES) {
-      const x = new Decimal(b.remaining).mul(share).toDecimalPlaces(sellDiv, Decimal.ROUND_DOWN);
-      if (!x.gt(0) || x.gt(start)) continue;
-      const quote = await this.data.quoter.best(this.data.pools, b.sell, b.buy, x.toFixed(), xrd).catch(() => undefined);
-      if (!quote || new Decimal(quote.sellAmount).lt(x)) continue;
-      // What the pool's proceeds buy from the order, by the component's own sum.
-      const back = Decimal.min(new Decimal(quote.buyAmount).div(b.price).toDecimalPlaces(sellDiv, Decimal.ROUND_DOWN), b.remaining);
-      const gasPriced = await this.gasIn(b.sell, arbGasXrd(quote.networkFeeXrd));
-      if (gasPriced === undefined) return undefined;
-      const minBack = x.plus(gasPriced).toDecimalPlaces(sellDiv, Decimal.ROUND_UP);
-      if (!back.mul(10_000 - POOL_FILL_BUFFER_BPS).div(10_000).gt(minBack)) continue;
-      const res = await this.send(bookArbPoolFirstManifest({
-        solver, feeLockXrd: FEE_LOCK_XRD, book: this.book!.component, id: b.id, startResource: b.sell, sellIn: x.toFixed(),
-        payResource: b.buy, route: quote.route, minBack: minBack.toFixed(),
-      }), {}, record);
-      if (res.kind === 'committed') console.log(`[solver] sold ${x.toFixed()} ${this.symbol(b.sell)} through ${quote.route.map((p) => p.venue).join('>')} and bought ${back.toFixed()} from book order ${b.id} in ${res.txid}`);
       return res;
     }
     return undefined;
@@ -630,7 +762,14 @@ export class Solver {
     for (const id of this.outlook.keys()) if (!openIds.has(id)) this.outlook.delete(id);
     const barred = new Map<string, boolean>();
     // Only orders between the tokens of a listed market, from accounts not failing too often, with nothing in flight.
-    const eligible = (o: StoredOrder) => o.pendingTx === null && this.data.isListedPair(o.sell, o.buy) && !this.accountBarred(o.account, now, barred);
+    // The solver takes its charges in XRD: a pair without XRD needs a route through XRD. Orders in a pair
+    // without one (stored before the rule, or the pools have since gone) stay open, with the reason shown.
+    const fillable = (o: StoredOrder) => {
+      if (this.data.solverCanFill?.(o.sell, o.buy) ?? true) return true;
+      if (o.kind !== 'market') this.outlook.set(o.id, { available: '0', needed: '0', at: Date.now(), reason: NO_XRD_ROUTE });
+      return false;
+    };
+    const eligible = (o: StoredOrder) => o.pendingTx === null && this.data.isListedPair(o.sell, o.buy) && !this.accountBarred(o.account, now, barred) && fillable(o);
     const usable = all.filter(eligible);
     await this.book?.refresh().catch((e) => console.warn('[solver] order book not read:', errText(e)));
     const pendingBook = new Set(this.store.pendingTransactions().flatMap((t) => t.bookIds));
@@ -639,6 +778,7 @@ export class Solver {
     const liveBook = () => (this.book?.live(now + 30) ?? [])
       .filter((b) => this.data.isListedPair(b.sell, b.buy) && !pendingBook.has(b.id) && this.mayTry(`book:${b.id}`, b.remaining));
     const markets = () => this.store.open().filter((o) => o.kind === 'market' && o.retryAt <= Math.floor(Date.now() / 1000) && eligible(o)).reverse();
+    await this.account().then(() => this.checkHoldings()).catch(() => undefined);
     if (!usable.length && !liveBook().length) return result;
     await this.account();
     if (!this.lastXrd || Date.now() - this.lastXrd.at > 60_000) await this.spendable(this.config.network.xrd).catch(() => undefined);
@@ -705,6 +845,7 @@ export class Solver {
    * sorted by price, so each pairing is found without comparing every order with every other.
    */
   private async crossBook(liveBook: () => BookOrder[], result: TickResult): Promise<void> {
+    const xrd = this.config.network.xrd;
     const groups = new Map<string, BookOrder[]>();
     for (const b of liveBook().filter((x) => this.bookWorthBuying(x))) {
       const k = `${b.sell}|${b.buy}`;
@@ -725,18 +866,19 @@ export class Solver {
           if (crossed.has(first.id) || crossed.has(second.id)) continue;
           // Prices that do not cross now will not cross for any dearer second order.
           if (!new Decimal(first.price).mul(second.price).lt(1)) break;
-          if (!planBookCross(first, second, '1e30', '0', this.divisibility)) continue;
+          // The solver fronts XRD and must end with XRD alone: `first` sells a token for XRD, `second` buys it with XRD,
+          // and the amounts must leave no change in that token (see planBookCrossExact).
+          if (first.buy !== xrd) break;
+          if (!planBookCrossExact(first, second, xrd, '1e30', '0', this.divisibility)) continue;
           const pairKey = `cross:${first.id}:${second.id}`;
           if (!this.mayTry(pairKey, `${first.remaining}|${second.remaining}`)) continue;
           try {
-            const float = await this.spendable(first.buy);
-            const gas = await this.gasIn(first.buy, new Decimal(CROSS_GAS_XRD));
-            if (gas === undefined) continue;
-            const plan = planBookCross(first, second, float.toFixed(), gas, this.divisibility);
+            const float = await this.spendable(xrd);
+            const plan = planBookCrossExact(first, second, xrd, float.toFixed(), CROSS_GAS_XRD, this.divisibility);
             if (!plan) continue;
             const res = await this.send(bookCrossManifest({
               solver: this.identity!, feeLockXrd: FEE_LOCK_XRD, book: this.book!.component, first: first.id, second: second.id,
-              payResource: first.buy, pay: plan.pay, middleResource: first.sell, minBack: plan.pay,
+              payResource: xrd, pay: plan.pay, middleResource: first.sell, minBack: new Decimal(plan.pay).plus(CROSS_GAS_XRD).toFixed(), xrd,
             }), {}, { kind: 'book', orders: [], bookIds: [first.id, second.id] });
             if (res.kind === 'blocked') return;
             crossed.add(first.id); crossed.add(second.id);
@@ -751,11 +893,28 @@ export class Solver {
     if (changed) await this.book?.refresh().catch(() => undefined);
   }
 
+  /**
+   * Look at what the solver's account holds, at most every five minutes. It should hold XRD and its
+   * badge and nothing else: anything more is reported by /api/health so the operator can look into it
+   * (tokens collected under the old fee rule, or sent to it by someone) and move it with
+   * `scripts/mainnet-withdraw.ts`.
+   */
+  async checkHoldings(force = false): Promise<void> {
+    if (!force && this.foreignHoldings && Date.now() - this.foreignHoldings.at < 300_000) return;
+    const balances = await this.gateway.fungibleBalances(await this.account());
+    const tokens = Object.entries(balances)
+      .filter(([r, v]) => r !== this.config.network.xrd && r !== this.badge && new Decimal(v).gt(0)).map(([r]) => r);
+    if (tokens.length && !this.foreignHoldings?.tokens.length) console.warn(`[solver] the solver account holds ${tokens.length} token(s) other than XRD: ${tokens.map((t) => this.symbol(t)).join(', ')}`);
+    this.foreignHoldings = { at: Date.now(), tokens };
+  }
+
   /** What /api/health may show: nothing that helps anyone but the operator beyond whether it works. */
-  health(): { lastTickAt: number; lastTickMs: number; xrd: 'ok' | 'low' | 'unknown'; lossLimit: { reached: boolean; failedFeesXrdLastHour: string; limitXrd: number }; pendingTransactions: number } {
+  health(): { lastTickAt: number; lastTickMs: number; xrd: 'ok' | 'low' | 'unknown'; otherTokens: number | null; lossLimit: { reached: boolean; failedFeesXrdLastHour: string; limitXrd: number }; pendingTransactions: number } {
     const xrd = !this.lastXrd ? 'unknown' : new Decimal(this.lastXrd.amount).gte(this.config.lowXrd) ? 'ok' : 'low';
     return {
       lastTickAt: this.lastTickAt, lastTickMs: this.lastTickMs, xrd,
+      // How many tokens other than XRD and the badge the solver account holds (null until first looked at). Should be 0.
+      otherTokens: this.foreignHoldings ? this.foreignHoldings.tokens.length : null,
       lossLimit: { reached: this.breaker.open, failedFeesXrdLastHour: this.breaker.failedFeesXrd, limitXrd: this.config.failedFeeLimitXrd },
       pendingTransactions: this.store.pendingTransactions().length,
     };

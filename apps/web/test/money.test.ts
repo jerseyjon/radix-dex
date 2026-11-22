@@ -4,8 +4,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Decimal } from '@radix-dex/core/browser';
 import {
-  bookContractPrice, exceeds, limitTerms, minAfterFees, networkFeeKnown, normaliseInput, numberToPlain, parsePlain, placesFor,
-  shareOf, solverFees, toPlain, withSlippage,
+  bookContractPrice, bookOrderBelowMinimum, chargeAtFor, exceeds, limitTerms, minAfterFees, minAfterXrdCharges, normaliseInput, numberToPlain, parsePlain, placesFor,
+  shareOf, toPlain, withSlippage, xrdCharges,
 } from '../src/money.ts';
 
 const XRD = 'resource_xrd';
@@ -80,27 +80,39 @@ test('a sell rounded to the token\'s places is priced on what is really sold', (
   assert.equal(limitTerms('sell', '2', '0.0000001', 6), undefined);
 });
 
-test('the fallback network allowance carries the margin; unpriced pairs are flagged', () => {
-  // No route figure, buying XRD: gasXrd 1.5 × 1.25 = 1.875.
-  const f = solverFees({ gross: '100', feeBps: 10, gasXrd: '1.5', margin: 1.25, buyIsXrd: true, sellIsXrd: false, sellAmount: '5' });
-  assert.equal(f.network.toFixed(), '1.875');
-  assert.equal(minAfterFees('100', f), '98.025');
-  // Selling XRD: converted at the order's own rate (2 per XRD).
-  assert.equal(solverFees({ gross: '100', feeBps: 0, gasXrd: '1.5', margin: 1.25, buyIsXrd: false, sellIsXrd: true, sellAmount: '50' }).network.toFixed(), '3.75');
-  assert.equal(networkFeeKnown({ gasInBuyToken: null, buyIsXrd: false, sellIsXrd: false }), false);
-  assert.equal(networkFeeKnown({ gasInBuyToken: '0.1', buyIsXrd: false, sellIsXrd: false }), true);
-  assert.equal(networkFeeKnown({ buyIsXrd: true, sellIsXrd: false }), true);
+test('XRD charges from the proceeds come straight off what is bought', () => {
+  const c = xrdCharges({ at: 'proceeds', gross: '100', sellAmount: '5', gasXrd: '1.875', feeBps: 10 })!;
+  assert.deepEqual([c.network.toFixed(), c.service.toFixed(), c.totalXrd.toFixed(), c.net.toFixed()], ['1.875', '0.1', '1.975', '98.025']);
+  assert.equal(minAfterXrdCharges(c), '98.025');
+  // Exact to the last place.
+  const gross = '1234.567890123456789012';
+  const e = xrdCharges({ at: 'proceeds', gross, sellAmount: '5', gasXrd: '0.587649000000000001', feeBps: 10 })!;
+  const expected = new Decimal(gross).minus(new Decimal('0.587649000000000001').plus(new Decimal(gross).times(10).div(10000)).toDecimalPlaces(18, Decimal.ROUND_DOWN));
+  assert.equal(minAfterXrdCharges(e), expected.toDecimalPlaces(18, Decimal.ROUND_DOWN).toFixed());
+  // Everything eaten: no order.
+  assert.equal(xrdCharges({ at: 'proceeds', gross: '1', sellAmount: '5', gasXrd: '1', feeBps: 10 }), undefined);
 });
 
-test('signed minimum is gross less fees, exactly', () => {
-  const gross = '1234.567890123456789012';
-  const fees = solverFees({ gross, feeBps: 10, gasInBuyToken: '0.587649000000000001', gasXrd: '1', buyIsXrd: true, sellIsXrd: false, sellAmount: '5' });
-  const expected = new Decimal(gross).minus('0.587649000000000001').minus(new Decimal(gross).times(10).div(10000));
-  assert.equal(minAfterFees(gross, fees), expected.toDecimalPlaces(18, Decimal.ROUND_DOWN).toFixed());
-  assert.equal(minAfterFees('100', solverFees({ gross: '100', feeBps: 10, gasXrd: '1', buyIsXrd: true, sellIsXrd: false, sellAmount: '5' })), '98.9');
-  // Selling XRD with no quote: the fee is converted at the order's own rate (100 bought for 50 XRD sold: 1 XRD = 2).
-  assert.equal(minAfterFees('100', solverFees({ gross: '100', feeBps: 0, gasXrd: '1', buyIsXrd: false, sellIsXrd: true, sellAmount: '50' })), '98');
-  assert.equal(minAfterFees('1', solverFees({ gross: '1', feeBps: 10, gasXrd: '1', buyIsXrd: true, sellIsXrd: false, sellAmount: '5' })), undefined);
+test('XRD charges set aside from the XRD sold: the user gets their price on what is swapped', () => {
+  // Spend 100 XRD at 2 tokens per XRD (gross 200); allowance 1.5, fee 0.1 XRD: 98.4 XRD swapped, 196.8 tokens.
+  const c = xrdCharges({ at: 'input', gross: '200', sellAmount: '100', gasXrd: '1.5', feeBps: 10 })!;
+  assert.deepEqual([c.totalXrd.toFixed(), c.swappedXrd!.toFixed(), c.net.toFixed(), c.inBuyToken.toFixed()], ['1.6', '98.4', '196.8', '3.2']);
+  // Rounded down to the bought token's places, never up.
+  assert.equal(minAfterXrdCharges(xrdCharges({ at: 'input', gross: '7', sellAmount: '3', gasXrd: '0.1', feeBps: 0 }), 0), '6');
+  assert.equal(minAfterXrdCharges(xrdCharges({ at: 'input', gross: '7', sellAmount: '3', gasXrd: '0.1', feeBps: 0 }), 6), '6.766666');
+});
+
+test('XRD charges between two swaps need the XRD figure from the quote', () => {
+  assert.equal(xrdCharges({ at: 'hop', gross: '50', sellAmount: '10', gasXrd: '1.5', feeBps: 10 }), undefined);
+  const c = xrdCharges({ at: 'hop', gross: '50', sellAmount: '10', xrdBase: '125', gasXrd: '1.5', feeBps: 10 })!;
+  assert.equal(c.totalXrd.toFixed(), '1.625');
+  assert.equal(c.net.toFixed(), '49.35');
+  assert.equal(chargeAtFor('a', 'x', 'x'), 'proceeds');
+  assert.equal(chargeAtFor('x', 'a', 'x'), 'input');
+  assert.equal(chargeAtFor('a', 'b', 'x'), 'hop');
+});
+
+test('two fees in one token come off exactly', () => {
   // 0.1 + 0.2 style sums stay exact.
   assert.equal(minAfterFees('0.3', { network: new Decimal('0.1'), service: new Decimal('0.1') }), '0.1');
 });
@@ -143,4 +155,26 @@ test('exceeds compares exactly', () => {
   assert.equal(exceeds('123456789.12345681', '123456789.123456789'), true);
   assert.equal(exceeds('0.999999999999999999', '0.999999999999999999'), false);
   assert.equal(exceeds('1', undefined), true);
+});
+
+test('a book order below the minimum is refused, valued by its XRD side', () => {
+  const TOK = 'resource_tok', OTHER = 'resource_other';
+  const at = (o: { sell: string; buy: string; sellAmount?: string; gross?: string; minXrd?: string | null }) =>
+    bookOrderBelowMinimum({ xrd: XRD, sellAmount: o.sellAmount, gross: o.gross, minXrd: o.minXrd === undefined ? '100' : o.minXrd, sell: o.sell, buy: o.buy });
+  // Selling XRD: the XRD sold.
+  assert.deepEqual(at({ sell: XRD, buy: TOK, sellAmount: '99.999999999999999999', gross: '5000' }), { minXrd: '100', valueXrd: '99.999999999999999999' });
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: '100', gross: '1' }), undefined);
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: '1000', gross: '1' }), undefined);
+  // Buying XRD: the XRD asked for (price times size), whatever the size of the token sold.
+  assert.deepEqual(at({ sell: TOK, buy: XRD, sellAmount: '1000000', gross: '42.5' }), { minXrd: '100', valueXrd: '42.5' });
+  assert.equal(at({ sell: TOK, buy: XRD, sellAmount: '1', gross: '100' }), undefined);
+  // No XRD on either side: not restricted (the exchange never takes such an order).
+  assert.equal(at({ sell: TOK, buy: OTHER, sellAmount: '0.001', gross: '0.001' }), undefined);
+  // No minimum (older server), a zero minimum, or nothing typed yet: nothing to refuse.
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: '1', gross: '1', minXrd: null }), undefined);
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: '1', gross: '1', minXrd: '0' }), undefined);
+  assert.equal(at({ sell: XRD, buy: TOK, sellAmount: undefined, gross: undefined }), undefined);
+  assert.equal(at({ sell: TOK, buy: XRD, sellAmount: '5', gross: undefined }), undefined);
+  // A fractional minimum (Stokenet, or a setting such as 0.5).
+  assert.deepEqual(at({ sell: XRD, buy: TOK, sellAmount: '0.4', minXrd: '0.5' }), { minXrd: '0.5', valueXrd: '0.4' });
 });

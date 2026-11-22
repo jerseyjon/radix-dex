@@ -1,7 +1,7 @@
 import { mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  type BookOrder, type Depth, type DepthLevel, type Market, Decimal, Gateway, GatewayError, OrderRejected, decodeSignedPartialTransaction, isAccount, isResource,
+  type BookOrder, type Depth, type DepthLevel, type Market, Decimal, chargeAt, Gateway, GatewayError, OrderRejected, decodeSignedPartialTransaction, isAccount, isResource,
   orderKeyCancelled, orderKeyFromSecret, validateLimitOrder,
 } from '@radix-dex/core';
 import { BookWatcher } from './book.ts';
@@ -151,8 +151,14 @@ export async function createApp(config: Config) {
         gasXrd: GAS_XRD, gasAllowanceMargin: GAS_ALLOWANCE_MARGIN, marketOrderLifetimeSec: MARKET_ORDER_LIFETIME_SEC,
       }
       : { enabled: false },
-    // Resting orders with partial fills, held in the on-ledger order book. The fee is read from the ledger.
-    orderBook: book?.info ? { component: book.info.component, receipts: book.info.receipts, makerFeeBps: book.info.makerFeeBps } : null,
+    // Added 22 Nov 2026: the solver's charges (network fee and service fee) are always taken in XRD:
+    // from the XRD an order sells, from the XRD it buys, or between two swaps through XRD when neither
+    // token is XRD. `feeTokens` are the tokens that could be converted to XRD for pairs with no route
+    // through XRD (not done yet); the solver never keeps them.
+    fees: { token: config.network.xrd, takenIn: 'XRD', feeTokens: config.feeTokens, convertsFeeTokens: false },
+    // Resting orders with partial fills, held in the on-ledger order book. The fee is read from the ledger;
+    // `minOrderXrd`: the smallest order, valued in XRD, the site lets a user place in the book (the contract has no minimum).
+    orderBook: book?.info ? { component: book.info.component, receipts: book.info.receipts, makerFeeBps: book.info.makerFeeBps, minOrderXrd: new Decimal(config.minBookOrderXrd).toFixed() } : null,
   }; });
 
   // For an uptime monitor. 503 when something needs the operator. Shows no balances, orders or keys.
@@ -165,6 +171,7 @@ export async function createApp(config: Config) {
       if (now - s.lastTickAt > 120_000) problems.push('solver pass overdue');
       if (s.lossLimit.reached) problems.push('loss limit reached: solver not sending');
       if (s.xrd === 'low') problems.push('solver XRD low');
+      if (s.otherTokens) problems.push(`solver holds ${s.otherTokens} token(s) other than XRD`);
     }
     const body = {
       ok: problems.length === 0, problems, network: config.network.name, now,
@@ -185,6 +192,8 @@ export async function createApp(config: Config) {
   api.on('GET', '/api/markets', () => data.markets.map((m) => ({
     id: m.id, base: withDivisibility(m.base), quote: withDivisibility(m.quote), tvlUsd: m.tvlUsd, volume24hUsd: m.volume24hUsd,
     venues: [...new Set(m.pools.map((p) => p.venue))], pools: m.pools.map((p) => p.address),
+    // Added 22 Nov 2026: whether the solver fills signed orders here (XRD on one side, or a route through XRD).
+    solverFills: data.solverCanFill(m.base.address, m.quote.address),
   })));
 
   api.on('GET', '/api/depth', async ({ url }): Promise<Depth> => {
@@ -209,12 +218,27 @@ export async function createApp(config: Config) {
     const amount = need(url.searchParams.get('amount'), 'amount');
     if (!isResource(sell) || !isResource(buy) || sell === buy) throw new HttpError(400, 'Bad token addresses');
     if (!PLAIN_AMOUNT.test(amount) || !new Decimal(amount).gt(0)) throw new HttpError(400, 'Bad amount');
-    const q = await data.quote(sell, buy, new Decimal(amount).toFixed());
+    const xrd = config.network.xrd;
+    const at = chargeAt(sell, buy, xrd);
+    // A pair without XRD is quoted along the route through XRD the solver uses, if there is one.
+    const hop = at === 'hop' ? await data.hopQuote(sell, buy, new Decimal(amount).toFixed()).catch(() => undefined) : undefined;
+    const q = hop ?? await data.quote(sell, buy, new Decimal(amount).toFixed());
     if (!q) throw new HttpError(404, 'No route with enough liquidity');
+    const gasXrd = fillGasXrd(0, q.networkFeeXrd);
+    const allowanceXrd = gasXrd.mul(GAS_ALLOWANCE_MARGIN).toDecimalPlaces(18, Decimal.ROUND_UP);
     // The network fee of a fill through this route, in the token being bought, so the site can show it before an order is signed.
-    // gasInBuyToken is the solver's estimate; gasAllowanceInBuyToken adds a margin and is what an order's signed allowance should be.
-    const gas = (await data.xrdValueIn(buy, fillGasXrd(0, q.networkFeeXrd)).catch(() => undefined)) ?? null;
-    return { ...q, gasInBuyToken: gas, gasAllowanceInBuyToken: gas === null ? null : new Decimal(gas).mul(GAS_ALLOWANCE_MARGIN).toDecimalPlaces(18, Decimal.ROUND_UP).toFixed() };
+    // gasInBuyToken is the solver's estimate; gasAllowanceInBuyToken adds a margin. Kept for older pages: the charge itself is in XRD (below).
+    const gas = (await data.xrdValueIn(buy, gasXrd).catch(() => undefined)) ?? null;
+    // Added 22 Nov 2026: what is really charged, in XRD, and where.
+    // feeAt: 'buy' (out of the XRD bought), 'sell' (out of the XRD sold, before the swap), 'hop' (between the two swaps through XRD),
+    // or null when the solver cannot fill this pair. xrdBase is the XRD the service fee is charged on for this quote:
+    // the XRD bought, the XRD sold, or what the first swap produces.
+    const feeAt = at === 'proceeds' ? 'buy' : at === 'input' ? 'sell' : hop ? 'hop' : null;
+    const xrdBase = at === 'proceeds' ? q.buyAmount : at === 'input' ? q.sellAmount : hop?.xrdBase ?? null;
+    return {
+      ...q, gasInBuyToken: gas, gasAllowanceInBuyToken: gas === null ? null : new Decimal(gas).mul(GAS_ALLOWANCE_MARGIN).toDecimalPlaces(18, Decimal.ROUND_UP).toFixed(),
+      feeAt, feeToken: feeAt ? xrd : null, gasXrd: gasXrd.toFixed(), gasAllowanceXrd: allowanceXrd.toFixed(), xrdBase,
+    };
   }, 4); // each distinct amount costs up to four Gateway previews, so it counts as four requests
 
   api.on('GET', '/api/balances', async ({ url }) => {
@@ -324,6 +348,8 @@ export async function createApp(config: Config) {
     // Only the tokens of a market the site lists: the solver will not touch anything else.
     if (!data.markets.length) throw new HttpError(503, 'Markets are not loaded yet; try again shortly');
     if (!data.isListedPair(p.sell, p.buy)) throw new HttpError(400, 'These two tokens do not form a market listed here');
+    // The solver takes its charges in XRD: a pair without XRD needs a route through XRD.
+    if (!data.solverCanFill(p.sell, p.buy)) throw new HttpError(400, 'This pair cannot be filled by the exchange: its fees are taken in XRD, and neither token is XRD nor is there a route through XRD. Use an “In parts” order in the order book instead.');
     // A withdrawal with more decimal places than the token allows fails on ledger.
     let div: number;
     try { div = await data.quoter.divisibility(p.sell); } catch { throw new HttpError(503, 'Could not read the token from the ledger; try again shortly'); }

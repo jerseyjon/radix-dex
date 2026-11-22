@@ -81,7 +81,7 @@ test('a taker picks resting orders best price first, whole orders only, within w
 
 test('the combined fill pays makers first, swaps the rest, and gives the taker everything bought less the take', () => {
   const R = (n: string) => 'resource_tdx_2_1t' + n.repeat(53);
-  const text = takeFillManifest({ solver: { account: 'account_tdx_2_1' + 'a'.repeat(54), badge: R('b') }, feeLockXrd: '10', sell: R('y'), buy: R('x'), makerPays: ['4.77'], poolIn: '0', route: [], solverTake: '1.05' });
+  const text = takeFillManifest({ solver: { account: 'account_tdx_2_1' + 'a'.repeat(54), badge: R('b') }, feeLockXrd: '10', sell: R('y'), buy: R('x'), makerPays: ['4.77'], poolIn: '0', route: [], solverTake: '1.05', xrd: R('x') });
   const lines = text.split('\n');
   const at = (needle: string) => lines.findIndex((l) => l.includes(needle));
   assert.ok(at('YIELD_TO_CHILD NamedIntent("taker");') < at('YIELD_TO_CHILD NamedIntent("maker_0");'));
@@ -117,7 +117,7 @@ test('a taker takes book orders in part and signed orders whole, cheapest first'
 test('the combined fill buys from the book before the pool leg and checks what was delivered', () => {
   const R = (n: string) => 'resource_tdx_2_1t' + n.repeat(53), C = 'component_tdx_2_1c' + 'q'.repeat(53);
   const text = takeFillManifest({
-    solver: { account: 'account_tdx_2_1' + 'a'.repeat(54), badge: R('b') }, feeLockXrd: '10', sell: R('y'), buy: R('x'), makerPays: [], poolIn: '0', route: [], solverTake: '1',
+    solver: { account: 'account_tdx_2_1' + 'a'.repeat(54), badge: R('b') }, feeLockXrd: '10', sell: R('y'), buy: R('x'), makerPays: [], poolIn: '0', route: [], solverTake: '1', xrd: R('x'),
     bookFills: [{ book: C, id: 7, pay: '1.8' }], assertBought: '20',
   });
   const lines = text.split('\n');

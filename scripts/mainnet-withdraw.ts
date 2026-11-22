@@ -5,7 +5,9 @@
 //   tsx scripts/mainnet-withdraw.ts --send          send it
 //
 // The solver keeps `--keep` XRD as its float for network fees and for buying book orders. Everything
-// above that, and every other token it has collected as fees, goes to the owner. The solver badge never moves.
+// above that, and every other token it holds, goes to the owner. The solver badge never moves. Since 22 Nov 2026 the
+// solver takes its fees in XRD only, so other tokens are what it collected under the old rule, or what someone sent it;
+// /api/health reports them until they are moved.
 import { readFileSync } from 'node:fs';
 // Core's Decimal (60 digits, rounding down), never decimal.js's defaults, which could round a balance up.
 import { Decimal, Gateway, NETWORKS, accountOf, addr, buildTransaction, dec, isAccount, keyFromHex, submitAndWait } from '../packages/core/src/index.ts';

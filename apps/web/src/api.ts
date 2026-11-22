@@ -5,7 +5,9 @@ import { retryAfterSec } from './live';
 export type MarketToken = Token & { divisibility?: number };
 export interface MarketSummary { id: string; base: MarketToken; quote: MarketToken; tvlUsd: number; volume24hUsd: number; venues: string[];
   /** The market's pool components (newer servers). */
-  pools?: string[] }
+  pools?: string[];
+  /** Whether the solver fills signed orders here: XRD on one side, or a route through XRD (servers since 22 Nov 2026). */
+  solverFills?: boolean }
 export interface Candle { time: number; open: number; high: number; low: number; close: number; volume: number }
 export interface ServerConfig {
   network: 'mainnet' | 'stokenet'; networkId: number; xrd: string;
@@ -16,8 +18,13 @@ export interface ServerConfig {
   limitOrders: { enabled: false } | { enabled: true; solverBadge: string; registry: string | null; maxLifetimeSec: number; filling: boolean;
     /** Fallback network fee in XRD when a quote gives no route figure, and the margin to add to it for a signed allowance. */
     gasXrd: string; gasAllowanceMargin?: number; marketOrderLifetimeSec: number };
-  /** The on-ledger order book, for resting orders that fill in part. The fee is read from the ledger. */
-  orderBook?: { component: string; receipts: string; makerFeeBps: number } | null;
+  /** The solver's charges are taken in XRD (`token`). `feeTokens` could be converted to XRD for fees; not done yet. */
+  fees?: { token: string; takenIn: 'XRD'; feeTokens: string[]; convertsFeeTokens: boolean };
+  /**
+   * The on-ledger order book, for resting orders that fill in part. The fee is read from the ledger.
+   * `minOrderXrd`: the smallest order, valued in XRD, the form lets a user place (absent from older servers).
+   */
+  orderBook?: { component: string; receipts: string; makerFeeBps: number; minOrderXrd?: string } | null;
   /** Set by the static preview build: data is a snapshot taken at this time and nothing can be traded. */
   snapshotAt?: number;
 }
@@ -25,7 +32,16 @@ export interface QuoteResult { sell: string; buy: string; sellAmount: string; bu
   /** The network fee of a plain fill, valued in the token being bought; null if no pool prices that token. */
   gasInBuyToken?: string | null;
   /** The allowance to sign for that fee: the solver's estimate plus 25%. The solver fills an order whose allowance covers 75% of its estimate. */
-  gasAllowanceInBuyToken?: string | null }
+  gasAllowanceInBuyToken?: string | null;
+  /**
+   * Where the solver's charges are taken, always in XRD: 'buy' from the XRD bought, 'sell' from the XRD
+   * sold before the swap, 'hop' between two swaps through XRD; null when the solver cannot fill this pair.
+   */
+  feeAt?: 'buy' | 'sell' | 'hop' | null; feeToken?: string | null;
+  /** The network fee estimate in XRD, and the allowance to sign for it (the estimate plus 25%). */
+  gasXrd?: string; gasAllowanceXrd?: string;
+  /** The XRD the service fee is charged on for this quote: XRD bought, XRD sold, or what the first swap produces. */
+  xrdBase?: string | null }
 export interface OrderView {
   id: string; account: string; sell: string; sellAmount: string; buy: string; minBuyAmount: string;
   /** Gross amount at which the order fills (price times size); the signed minimum is this less the fee allowance. */
@@ -42,7 +58,9 @@ export interface OrderView {
   /** Open signed orders: whether the order checks the server's registry, so a cancel recorded there stops it. */
   registry?: boolean;
   /** Open orders: what the market would pay for the whole order now, before fees, against what it needs to fill. */
-  outlook?: { available: string; needed: string; at: number } | null;
+  outlook?: { available: string; needed: string; at: number;
+    /** Set when the exchange will not fill the order as things stand, with why. */
+    reason?: string } | null;
 }
 
 /** One trade in a market; `side` is the base token's taker side, `venue` is "here" or the pool's venue. */

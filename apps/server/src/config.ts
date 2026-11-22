@@ -42,10 +42,23 @@ export interface Config {
   /** Most resting signed orders, and most on-ledger book orders, the solver looks at in one pass (market orders are not limited). */
   maxRestingPerTick: number;
   maxBookPerTick: number;
-  /** Book orders worth less than this many XRD are not bought by the solver with its own funds (they cannot pay their network fee). */
+  /**
+   * Smallest "In parts" (order-book) order, in XRD, the site lets a user place, and below which the
+   * solver does not buy a book order with its own funds: taking a resting order costs the solver about
+   * 0.38 XRD of network fee, so a tiny one is never worth routing to. Published in /api/config as
+   * `orderBook.minOrderXrd`. Default per network (`DEFAULT_MIN_BOOK_ORDER_XRD`); `DEX_MIN_BOOK_ORDER_XRD`
+   * replaces it. The order-book contract itself has no minimum: someone calling it directly is not held to this.
+   */
   minBookOrderXrd: number;
   /** /api/health reports the solver as low on funds below this XRD balance. */
   lowXrd: number;
+  /**
+   * Tokens, by resource address, that may be converted to XRD inside a fill to pay the solver's
+   * charges, for pairs with no route through XRD (rule 2(b), not built yet: see
+   * docs/review-2026-11-21/fee-side.md). Published in /api/config; the solver itself only ever
+   * keeps XRD. `DEX_FEE_TOKENS`, comma-separated, replaces the per-network default.
+   */
+  feeTokens: string[];
 }
 
 /** A whole number from the environment, or the default; anything else is a start-up error rather than a silent NaN. */
@@ -72,6 +85,37 @@ const MAINNET_STABLES = [
   'resource_rdx1thxj9m87sn5cc9ehgp9qxp6vzeqxtce90xm5cp33373tclyp4et4gv', // hUSDC
   'resource_rdx1th4v03gezwgzkuma6p38lnum8ww8t4ds9nvcrkr2p9ft6kxx3kxvhe', // hUSDT
 ];
+
+/**
+ * Default fee-conversion tokens, by resource address, checked against the ledger on 22 Nov 2026
+ * (evidence in docs/review-2026-11-21/fee-side.md). Left out on purpose: xUSDC and xUSDT (Instabridge;
+ * thin DefiPlaza pools, about 16% lost on a round trip), hUSDT (0.04 in existence).
+ */
+const DEFAULT_FEE_TOKENS: Record<string, string[]> = {
+  mainnet: [
+    'resource_rdx1thxj9m87sn5cc9ehgp9qxp6vzeqxtce90xm5cp33373tclyp4et4gv', // hUSDC (Hyperlane)
+    'resource_rdx1t5ywq4c6nd2lxkemkv4uzt8v7x7smjcguzq5sgafwtasa6luq7fclq', // DFP2 (DefiPlaza's own token, not a dollar token)
+  ],
+  stokenet: [
+    'resource_tdx_2_1th7w39rfv8dux3egj68femh6e5kp20xruxv8u5ll4j0xnh6enw4kfx', // TUSD, the test dollar token
+  ],
+};
+
+/**
+ * Default smallest book order, in XRD. Mainnet: 100 (the owner's figure, 22 Nov 2026). Stokenet: 5, the
+ * old default for every network, kept low because test XRD is not priced like the real thing (the test
+ * pool has had it at about 200x mainnet) and tests place small orders.
+ */
+export const DEFAULT_MIN_BOOK_ORDER_XRD: Record<string, number> = { mainnet: 100, stokenet: 5 };
+
+/** A comma-separated list of resource addresses on this network; a bad entry stops the server. */
+function resources(env: NodeJS.ProcessEnv, name: string, dflt: string[], hrp: string): string[] {
+  const v = env[name];
+  if (v === undefined) return dflt;
+  const list = v.split(',').map((x) => x.trim()).filter(Boolean);
+  for (const r of list) if (!new RegExp(`^resource_${hrp}1[02-9ac-hj-np-z]{50,70}$`).test(r)) throw new Error(`${name}: "${r}" is not a resource address on this network`);
+  return [...new Set(list)];
+}
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const name = (env.DEX_NETWORK ?? 'mainnet') as NetworkName;
@@ -106,7 +150,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     accountFailureLimit: int(env, 'DEX_ACCOUNT_FAILURE_LIMIT', 6, 1, 1_000_000),
     maxRestingPerTick: int(env, 'DEX_MAX_RESTING_PER_TICK', 20, 1, 10_000),
     maxBookPerTick: int(env, 'DEX_MAX_BOOK_PER_TICK', 20, 1, 10_000),
-    minBookOrderXrd: num(env, 'DEX_MIN_BOOK_ORDER_XRD', 5, 1e9),
+    minBookOrderXrd: num(env, 'DEX_MIN_BOOK_ORDER_XRD', DEFAULT_MIN_BOOK_ORDER_XRD[name] ?? 5, 1e9),
     lowXrd: num(env, 'DEX_LOW_XRD', 30, 1e9),
+    feeTokens: resources(env, 'DEX_FEE_TOKENS', DEFAULT_FEE_TOKENS[name] ?? [], name === 'mainnet' ? 'rdx' : 'tdx_2_'),
   };
 }

@@ -1,7 +1,7 @@
 /// <reference types="node" />
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { cleanAmount, fmtAmount, fmtAxisPrice, fmtPrice, pricePrecision } from '../src/format.ts';
+import { cleanAmount, fmtAmount, fmtAxisPrice, fmtPrice, pricePrecision, shownPrice } from '../src/format.ts';
 
 test('fmtAmount: no exponents, sensible units', () => {
   assert.equal(fmtAmount(9e-7), '0.0000009');
@@ -38,4 +38,16 @@ test('cleanAmount', () => {
   assert.equal(cleanAmount('1,000'), '1000');
   assert.equal(cleanAmount('0'), undefined);
   assert.equal(cleanAmount('1e5'), undefined);
+});
+
+test('shownPrice: the number fmtPrice displays, for picking', () => {
+  assert.equal(shownPrice(0.000951234567), 0.00095123);
+  assert.equal(shownPrice(1.234567), 1.2346);
+  assert.equal(shownPrice(1234.5678), 1234.6);
+  assert.equal(shownPrice(0.1 + 0.2), 0.3);
+  assert.equal(shownPrice(1.234567e-20), 1.2346e-20);
+  assert.equal(shownPrice(null), undefined);
+  assert.equal(shownPrice(0), undefined);
+  assert.equal(shownPrice(NaN), undefined);
+  for (const v of [0.000951234567, 1.234567, 1234.5678, 0.0421337]) assert.equal(fmtPrice(shownPrice(v)), fmtPrice(v));
 });

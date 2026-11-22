@@ -4,8 +4,8 @@ import { type MarketSummary, type QuoteResult, type ServerConfig, STATIC, api } 
 import { estimate } from './book';
 import { cleanAmount, fmtAmount, fmtPrice } from './format';
 import {
-  bookContractPrice, exceeds, limitTerms, minAfterFees, networkFeeKnown, normaliseInput, numberToPlain, parsePlain, placesFor, placesIn,
-  positivePlain, shareOf, solverFees, toPlain, withSlippage,
+  type XrdCharges, bookContractPrice, bookOrderBelowMinimum, chargeAtFor, exceeds, limitTerms, minAfterXrdCharges, normaliseInput, numberToPlain, parsePlain, placesFor, placesIn,
+  positivePlain, shareOf, toPlain, withSlippage, xrdCharges,
 } from './money';
 import { Icon } from './ui';
 import type { Wallet } from './wallet';
@@ -15,6 +15,7 @@ type Kind = 'limit' | 'market';
 const EXPIRIES: [string, number][] = [['1 hour', 3600], ['24 hours', 86400], ['7 days', 7 * 86400], ['30 days', 30 * 86400 - 3600]];
 const SLIPPAGES = [0.5, 1, 2, 5];
 const pct = (bps: number) => `${(bps / 100).toFixed(2)}%`;
+const NOT_FILLED = 'The exchange takes its fees in XRD, and this pair has no route through XRD, so it does not fill market or “Whole only” orders here. A Limit order “In parts” in the order book has no exchange fee and works.';
 
 /** Cancel secrets stay in this browser only; the server has just their hashes. */
 export const secrets = {
@@ -96,31 +97,34 @@ export function OrderForm(props: {
     : bookEstimate?.avgPrice;
   const impact = execPrice && depth?.mid ? ((side === 'buy' ? execPrice / depth.mid : depth.mid / execPrice) - 1) * 100 : undefined;
 
-  // Orders are filled for the user by the solver, which pays the network fee and takes it,
-  // with the service fee, out of what the order buys. All of this is exact decimal arithmetic.
+  // Orders are filled for the user by the solver, which pays the network fee and takes it, with the
+  // service fee, in XRD: from the XRD the order buys, from the XRD it sells (before the swap), or
+  // between two swaps through XRD when neither token is XRD. All of this is exact decimal arithmetic.
   const lo = config.limitOrders.enabled ? config.limitOrders : undefined;
   const viaSolver = Boolean(lo?.filling);
-  const buyIsXrd = buyTok.address === config.xrd, sellIsXrd = sellTok.address === config.xrd;
-  const feesOn = (gross: string | undefined, gasInBuyToken: string | null | undefined, margin: number) => {
-    if (gross === undefined || !lo || !sellAmount) return undefined;
-    return solverFees({ gross, feeBps: config.feeBps, gasInBuyToken, gasXrd: lo.gasXrd, margin, buyIsXrd, sellIsXrd, sellAmount });
-  };
+  const at = chargeAtFor(sellTok.address, buyTok.address, config.xrd);
+  const buyPlaces = placesFor(buyTok, config.xrd);
+  // The solver fills a pair only with XRD on one side or a route through XRD.
+  const solverFills = market.solverFills !== false && !(quote && quote.feeAt === null);
+  const solverOrder = (kind === 'market' && viaSolver) || (kind === 'limit' && !useBook);
+  const chargesOn = (gross: string | undefined, gasXrd: string | undefined) =>
+    (gross === undefined || gasXrd === undefined || !lo || !sellAmount ? undefined : xrdCharges({ at, gross, sellAmount, xrdBase: quote?.xrdBase, gasXrd, feeBps: config.feeBps }));
   // A signed limit order allows the route's estimate plus the server's margin (25%) for the network
   // fee: the solver fills it at its price while the allowance covers 75% of its estimate then. The
   // fee shown is the allowance, so the form's figures are exactly what is signed.
   const margin = lo?.gasAllowanceMargin ?? 1;
-  const limitAllowance = quote?.gasAllowanceInBuyToken
-    ?? (quote?.gasInBuyToken != null ? new Decimal(quote.gasInBuyToken).times(String(margin)).toDecimalPlaces(18, Decimal.ROUND_UP).toFixed() : null);
-  const limitFeeKnown = networkFeeKnown({ gasInBuyToken: limitAllowance, buyIsXrd, sellIsXrd });
-  const limitFees = feesOn(limitGross, limitAllowance, margin);
-  const limitMinBuy = limitGross && limitFees ? minAfterFees(limitGross, limitFees) : undefined;
+  const limitAllowance = quote?.gasAllowanceXrd ?? (lo ? new Decimal(lo.gasXrd).times(String(margin)).toFixed() : undefined);
+  const limitFees = kind === 'limit' && !useBook ? chargesOn(limitGross, limitAllowance) : undefined;
+  const limitMinBuy = minAfterXrdCharges(limitFees, buyPlaces);
   const fillsNow = kind === 'limit' && quote && limitGross ? new Decimal(quote.buyAmount).gte(limitGross) : undefined;
-  // A market order signs its expected proceeds less the estimated fee, less the slippage allowance.
-  const marketFees = kind === 'market' && viaSolver && quote ? feesOn(quote.buyAmount, quote.gasInBuyToken, 1) : undefined;
-  const marketNet = marketFees && quote ? minAfterFees(quote.buyAmount, marketFees) : undefined;
-  const marketMinBuy = kind === 'market' && viaSolver && marketNet ? withSlippage(marketNet, slippage) : undefined;
+  // A market order signs its expected proceeds less the estimated fees, less the slippage allowance.
+  const marketFees = kind === 'market' && viaSolver && quote ? chargesOn(quote.buyAmount, quote.gasXrd ?? lo?.gasXrd) : undefined;
+  const marketNet = minAfterXrdCharges(marketFees, buyPlaces);
+  const marketMinBuy = kind === 'market' && viaSolver && marketNet ? positivePlain(withSlippage(marketNet, slippage), buyPlaces) : undefined;
   const expectedOut = marketNet !== undefined ? Number(marketNet) : marketFees ? 0 : quote ? Number(quote.buyAmount) : bookEstimate?.received;
-  const feeTotal = (f: { network: InstanceType<typeof Decimal>; service: InstanceType<typeof Decimal> } | undefined) => (f ? f.network.plus(f.service).toNumber() : undefined);
+  const feeWhere = at === 'proceeds' ? 'taken from the XRD you receive' : at === 'input' ? 'taken from the XRD you spend' : 'taken in XRD, between the swaps through XRD';
+  // Always in XRD; where the fee is not taken from XRD the user receives, also its worth in the token bought, which is what it takes off the minimum.
+  const feeText = (c: XrdCharges) => `${fmtAmount(c.totalXrd.toNumber())} XRD${at === 'proceeds' ? '' : ` (≈ ${fmtAmount(c.inBuyToken.toNumber())} ${buyTok.symbol})`}`;
 
   // Without a solver the market order is an ordinary transaction along the server's route: the route
   // must start at the token sold and end at the token the user chose, or we refuse to sign it.
@@ -137,6 +141,15 @@ export function OrderForm(props: {
 
   // The order-book contract's price for this order, or why it cannot be expressed.
   const bookPrice = useBook && price ? bookContractPrice(side, price) : undefined;
+  // The site's smallest book order, valued in XRD: taking a tiny one costs the exchange more in network fees than it is worth.
+  const bookTooSmall = useBook && book
+    ? bookOrderBelowMinimum({ sell: sellTok.address, buy: buyTok.address, xrd: config.xrd, sellAmount, gross: limitGross, minXrd: book.minOrderXrd })
+    : undefined;
+  // The value is shown rounded down, never up to the minimum itself (99.999 reads 99.999, not 100).
+  const tooSmallValue = bookTooSmall && (toPlain(bookTooSmall.valueXrd, 6) === '0' ? bookTooSmall.valueXrd : toPlain(bookTooSmall.valueXrd, 6));
+  const tooSmallText = bookTooSmall
+    ? `Orders “In parts” must be worth at least ${fmtAmount(bookTooSmall.minXrd)} XRD; this one is worth ${tooSmallValue} XRD.`
+    : undefined;
 
   const setPct = (share: number) => {
     setHint(undefined);
@@ -162,6 +175,7 @@ export function OrderForm(props: {
   else if (kind === 'limit' && !parsePlain(price)?.gt(0)) blocker = 'Enter a price';
   else if (!sellAmount) blocker = 'Enter an amount';
   else if (exceeds(sellAmount, balanceStr)) blocker = `Not enough ${sellTok.symbol}`;
+  else if (solverOrder && !solverFills) blocker = book ? 'Not filled here: use Limit, In parts' : 'Not available for this pair';
   else if (kind === 'market' && !quote) blocker = quoteError ?? 'Getting a quote…';
   else if (kind === 'market' && marketFees && !marketNet) blocker = 'Too small to cover the network fee';
   else if (kind === 'market' && viaSolver && !marketMinBuy) blocker = 'Too small for the slippage limit';
@@ -169,9 +183,10 @@ export function OrderForm(props: {
   else if (kind === 'limit' && !useBook && !config.limitOrders.enabled) blocker = 'Only order-book orders are enabled';
   // A whole-only order signs the route's network allowance: wait for the quote that gives it.
   else if (kind === 'limit' && !useBook && !quote && !quoteError) blocker = 'Getting a quote…';
-  else if (kind === 'limit' && !useBook && !limitFeeKnown) blocker = 'Cannot price the network fee for this pair now';
+  else if (kind === 'limit' && !useBook && at === 'hop' && !quote?.xrdBase) blocker = 'Cannot work out the XRD fees for this pair now';
   else if (kind === 'limit' && !useBook && limitGross && !limitMinBuy) blocker = 'Too small to cover the network fee';
   else if (bookPrice && !bookPrice.ok) blocker = 'Price cannot be held exactly';
+  else if (bookTooSmall) blocker = `Below the ${fmtAmount(bookTooSmall.minXrd)} XRD minimum`;
 
   async function submit() {
     if (blocker || !wallet || !account || !sellAmount) return;
@@ -220,6 +235,7 @@ export function OrderForm(props: {
         // The contract's price is what the order is owed for each token it sells.
         const bp = bookContractPrice(side, price);
         if (!bp.ok) { setError(bp.reason); return; }
+        if (tooSmallText) { setError(tooSmallText); return; }
         await wallet.sendTransaction(
           bookPlaceManifest({ account, book: book.component, sell: sellTok.address, sellAmount, buy: buyTok.address, price: bp.price, expiresAt: Math.floor(Date.now() / 1000) + expiry }),
           `Limit ${side} ${base.symbol} @ ${price}`);
@@ -284,9 +300,11 @@ export function OrderForm(props: {
           {routeProblem && <div><dt>Route</dt><dd className="warn">{routeProblem}</dd></div>}
           <div><dt>Average price</dt><dd>{fmtPrice(execPrice)} {execPrice ? quoteTok.symbol : ''}</dd></div>
           <div><dt>Price impact</dt><dd className={impact !== undefined && impact > 3 ? 'warn' : ''}>{impact === undefined ? '—' : `${Math.max(0, impact).toFixed(2)}%`}</dd></div>
+          {marketFees?.swappedXrd && <div><dt>Swapped</dt><dd>{fmtAmount(marketFees.swappedXrd.toNumber())} XRD</dd></div>}
           {marketFees
-            ? <div><dt>Fees, already taken off</dt><dd>{fmtAmount(feeTotal(marketFees))} {buyTok.symbol} (network fee + {pct(config.feeBps)})</dd></div>
+            ? <div title={`Network fee estimate + ${pct(config.feeBps)}, in XRD`}><dt>Fees ({feeWhere})</dt><dd>{feeText(marketFees)}</dd></div>
             : <div><dt>Route</dt><dd>{quote ? quote.route.map((p) => p.venue).join(' → ') : '—'}</dd></div>}
+          {viaSolver && !solverFills && <div><dt>Note</dt><dd className="warn">{NOT_FILLED}</dd></div>}
           <div><dt>Max slippage</dt><dd className="seg mini" role="group" aria-label="Maximum slippage">{SLIPPAGES.map((s) => <button key={s} className={s === slippage ? 'on' : ''} aria-pressed={s === slippage} onClick={() => setSlippage(s)}>{s}%</button>)}</dd></div>
         </dl>
       ) : useBook && book ? (
@@ -295,6 +313,11 @@ export function OrderForm(props: {
           <div><dt>Moves into the order book</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>You receive, as it fills</dt><dd>{limitGross ? `${fmtAmount(Number(limitGross) * (1 - book.makerFeeBps / 10_000))} ${buyTok.symbol}` : '—'}</dd></div>
           {bookPrice && !bookPrice.ok && <div><dt>Price</dt><dd className="warn">{bookPrice.reason}</dd></div>}
+          {bookTooSmall && (
+            <div><dt>Too small</dt><dd className="warn">{tooSmallText} Filling a smaller one would cost more in network fees than it is worth. Enter a larger amount{config.limitOrders.enabled ? ', or choose “Whole only”' : ''}.</dd></div>
+          )}
+          {/* The exchange only spends and earns XRD, so it never buys from book orders in a pair without XRD. */}
+          {at === 'hop' && <div><dt>Note</dt><dd className="warn">Neither token is XRD, so the exchange does not buy from this order itself or route market orders to it: it fills only when someone buys from the order book contract directly.</dd></div>}
           <div><dt>Fee</dt><dd>{book.makerFeeBps > 0 ? pct(book.makerFeeBps) : 'None'}, plus the network fee to place it (about 0.8 XRD)</dd></div>
           <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away, at your price' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
           {fillsNow && quote && limitGross && (
@@ -306,8 +329,10 @@ export function OrderForm(props: {
         <dl className="summary">
           {book && <div><dt>Fills</dt><dd className="seg mini" role="group" aria-label="How the order fills"><button aria-pressed="false" onClick={() => setInBook(true)}>In parts</button><button className="on" aria-pressed="true">Whole only</button></dd></div>}
           <div><dt>You pay</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
+          {limitFees?.swappedXrd && <div><dt>Swapped</dt><dd>{fmtAmount(limitFees.swappedXrd.toNumber())} XRD</dd></div>}
           <div><dt>At your price you get</dt><dd>{limitGross ? `${fmtAmount(limitGross)} ${buyTok.symbol}` : '—'}</dd></div>
-          <div><dt>Fees, taken from that</dt><dd>{limitFees ? `${fmtAmount(feeTotal(limitFees))} ${buyTok.symbol} (network fee allowance + ${pct(config.feeBps)})` : '—'}</dd></div>
+          <div title={`Network fee allowance + ${pct(config.feeBps)}, in XRD`}><dt>Fees ({feeWhere})</dt><dd>{limitFees ? feeText(limitFees) : '—'}</dd></div>
+          {!solverFills && <div><dt>Note</dt><dd className="warn">{NOT_FILLED}</dd></div>}
           <div><dt>If another trader takes it</dt><dd>{(config.makerFeeBps ?? 0) > 0 ? `Fee ${pct(config.makerFeeBps ?? 0)}, no network fee` : 'No fee: you get your full price'}</dd></div>
           <div><dt>You receive at least</dt><dd>{limitMinBuy ? `${fmtAmount(limitMinBuy)} ${buyTok.symbol}` : '—'}</dd></div>
           {/* Without a quote the network allowance is the server's fallback (gasXrd × margin): say why. */}
@@ -328,7 +353,7 @@ export function OrderForm(props: {
         <p className="note"><Icon name="info" size={13} />Your tokens move into the order book contract, where the ledger enforces your price. Other traders can buy any part of the order, and each part is paid straight to your account at your price. You can cancel at any time and take back what has not sold. This contract has not been audited.</p>
       )}
       {kind === 'limit' && !useBook && (
-        <p className="note"><Icon name="info" size={13} />A limit order is a signed permission, not a transaction: placing it is free and your funds stay in your account until it fills. It fills in full or not at all, as soon as the market reaches your price. The fees come out of what you receive, and you never get less than the “at least” amount, which is what your wallet shows. Its cancel key is kept in this browser only: clearing site data loses the ability to cancel it before it expires.</p>
+        <p className="note"><Icon name="info" size={13} />A limit order is a signed permission, not a transaction: placing it is free and your funds stay in your account until it fills. It fills in full or not at all, as soon as the market reaches your price. The fees are taken in XRD, as shown above, and you never get less than the “at least” amount, which is what your wallet shows. Its cancel key is kept in this browser only: clearing site data loses the ability to cancel it before it expires.</p>
       )}
     </section>
   );

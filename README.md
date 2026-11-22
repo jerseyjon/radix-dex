@@ -14,8 +14,9 @@ code review and bug test were done on 21 November 2026 (`docs/review-2026-11-21/
   on-ledger `OrderBook` contract, which anyone can fill a part at a time at the order's price.
   **"Whole only"** orders are **subintents** (wallet "pre-authorizations"): free to place, funds
   stay in the user's account until the fill, and the network fee is paid by the solver. Either
-  fills when the market reaches its price; for subintents the fees come out of the proceeds, down
-  to a minimum enforced by the Radix Engine. A small backend holds the signed orders and fills them
+  fills when the market reaches its price; for subintents the fees are taken in XRD (from the XRD
+  the order buys or sells, or between two swaps through XRD), down to a minimum enforced by the
+  Radix Engine. A pair with no XRD and no route through XRD is not filled by the solver. A small backend holds the signed orders and fills them
   against pools, against each other and against the order book.
 - The order book shows pool depth and resting limit orders together.
 
@@ -52,7 +53,8 @@ depth and quotes but cannot trade.
 | `DEX_GATEWAY_URL` | Gateway to use (for example your own) | the public one |
 | `DEX_PORT`, `DEX_HOST` | Where to listen | `8787`, `127.0.0.1` |
 | `DEX_TAKER_FEE_BPS` | Fee on an order that takes liquidity, from a pool or a resting order (`DEX_FEE_BPS` also works) | `10` (0.10%) |
-| `DEX_MAKER_FEE_BPS` | Fee on a resting order when another order takes it | `0` |
+| `DEX_MAKER_FEE_BPS` | Fee on a resting order when another order takes it (only charged when it is paid in XRD) | `0` |
+| `DEX_FEE_TOKENS` | Comma-separated resource addresses that may later be converted to XRD for fees in pairs with no route through XRD (published in `/api/config`; not used for filling yet) | hUSDC, DFP2 on mainnet; TUSD on Stokenet |
 | `DEX_SOLVER_BADGE` | Fungible badge limit orders are pinned to; enables limit orders | unset |
 | `DEX_SOLVER_KEY_FILE` | File (mode 600) with the solver's Ed25519 key in hex; enables filling | unset |
 | `DEX_ORDER_BOOK` | `OrderBook` component, to enable resting orders with partial fills | unset |
@@ -69,12 +71,13 @@ depth and quotes but cannot trade.
 | `DEX_FAILED_FEE_LIMIT_XRD` | Loss limit: the solver stops sending when network fees paid on failed transactions in the last hour reach this | `3` |
 | `DEX_ACCOUNT_FAILURE_LIMIT` | Failed fills in 24 hours after which an account may not post orders and its orders are skipped | `6` |
 | `DEX_MAX_RESTING_PER_TICK`, `DEX_MAX_BOOK_PER_TICK` | Resting signed orders, and book orders, looked at per solver pass (market orders are not limited) | `20`, `20` |
-| `DEX_MIN_BOOK_ORDER_XRD` | Book orders worth less than this are not bought by the solver with its own funds | `5` |
+| `DEX_MIN_BOOK_ORDER_XRD` | Smallest “In parts” (order-book) order, valued in XRD, the order form lets a user place; book orders worth less are also not bought by the solver with its own funds. Value = the XRD sold, or for an order buying XRD the XRD asked for; pairs without XRD are not restricted. Enforced by the site only: the contract has no minimum. Published as `orderBook.minOrderXrd` in `/api/config` | `100` on mainnet, `5` on Stokenet |
 | `DEX_LOW_XRD` | `/api/health` reports the solver as low on funds below this XRD balance | `30` |
 
 Numbers are checked at start-up: a value that is not a number in range stops the server rather
 than being ignored. `GET /api/health` answers 200 when all is well and 503 with a list of problems
-(markets not loaded, solver pass overdue, loss limit reached, solver XRD low) for an uptime monitor.
+(markets not loaded, solver pass overdue, loss limit reached, solver XRD low, solver holding a token
+other than XRD) for an uptime monitor.
 
 ## Tests
 

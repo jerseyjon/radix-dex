@@ -110,6 +110,77 @@ export function grossNeeded(o: { minBuyAmount: string; limitBuyAmount?: string; 
   return Decimal.max(floor, o.limitBuyAmount ?? 0);
 }
 
+// ---------------------------------------------------------------- charges in XRD (since 22 Nov 2026)
+
+/**
+ * Where the solver takes its charges (network fee and service fee) on a fill. They are always XRD:
+ * - `proceeds`: the order buys XRD; the charges come out of the XRD it receives.
+ * - `input`: the order sells XRD; the charges come out of the XRD it sells, before the rest is swapped.
+ * - `hop`: neither token is XRD; the route goes through XRD and the charges are taken between the two swaps.
+ */
+export type ChargeAt = 'proceeds' | 'input' | 'hop';
+
+export function chargeAt(sell: string, buy: string, xrd: string): ChargeAt {
+  return buy === xrd ? 'proceeds' : sell === xrd ? 'input' : 'hop';
+}
+
+/**
+ * The solver's full charges in XRD: the network fee estimate plus the service fee on `xrdBase` (the
+ * XRD the trade moves: what it sells, receives, or passes through), rounded down to XRD's 18 places
+ * so the solver never takes more than it states.
+ */
+export function xrdCharges(xrdBase: string | Decimal, gasXrd: string | Decimal, feeBps: number): Decimal {
+  return floorTo(new Decimal(gasXrd).plus(new Decimal(xrdBase).mul(feeBps).div(10_000)), 18);
+}
+
+/** The least the solver takes when the signed allowance falls short of its estimate: the network fee less the tolerated shortfall, no service fee. */
+export function reducedXrdCharges(gasXrd: string | Decimal, gasShortfall = GAS_SHORTFALL_TOLERANCE): Decimal {
+  const tolerance = Math.min(Math.max(gasShortfall, 0), 1);
+  return floorTo(new Decimal(gasXrd).mul(1 - tolerance), 18);
+}
+
+/**
+ * What a fill that takes `take` XRD before the last swap must deliver: the signed minimum (plus the
+ * buffer when a pool is involved), and the order's trigger scaled to the XRD actually swapped, so
+ * the order's own price is met on what is traded for it. `xrdBase` is the XRD available at the point
+ * of the take (the amount sold for `input`, the first swap's output for `hop`). The scaled trigger is
+ * rounded down to the bought token's places (`buyDivisibility`, default 18), as a pool's output is.
+ */
+export function xrdLegNeeded(o: { xrdBase: string; take: string; minBuyAmount: string; limitBuyAmount?: string; bufferBps?: number; buyDivisibility?: number }): Decimal | undefined {
+  const base = new Decimal(o.xrdBase), take = new Decimal(o.take);
+  if (!base.gt(0) || take.lt(0) || !take.lt(base)) return undefined;
+  const floor = new Decimal(o.minBuyAmount).mul(10_000 + (o.bufferBps ?? POOL_FILL_BUFFER_BPS)).div(10_000);
+  const trigger = floorTo(new Decimal(o.limitBuyAmount ?? o.minBuyAmount).mul(base.minus(take)).div(base), o.buyDivisibility ?? 18);
+  return Decimal.max(floor, trigger);
+}
+
+/**
+ * Check a fill whose charges are taken in XRD before the last swap (`input` and `hop`): the user
+ * receives everything the swap (and any resting orders) produce, `out`. Undefined if that is short
+ * of what `xrdLegNeeded` asks.
+ */
+export function planXrdLegFill(o: { xrdBase: string; take: string; out: string; minBuyAmount: string; limitBuyAmount?: string; bufferBps?: number; buyDivisibility?: number }): { solverTake: string; userReceives: string } | undefined {
+  const need = xrdLegNeeded(o);
+  if (!need || new Decimal(o.out).lt(need)) return undefined;
+  return { solverTake: new Decimal(o.take).toFixed(), userReceives: new Decimal(o.out).toFixed() };
+}
+
+/**
+ * A smaller take to try when the full charges leave the order short: estimated from one quote
+ * (`out` for `xrdBase − takeFull`) at its average rate, with 10% to spare, and never below `takeMin`.
+ * The result is only a candidate: the caller must quote it and check it with `planXrdLegFill`.
+ */
+export function retryXrdTake(o: { xrdBase: string; takeFull: string; takeMin: string; out: string; need: string }): Decimal | undefined {
+  const full = new Decimal(o.takeFull), min = new Decimal(o.takeMin), out = new Decimal(o.out);
+  const swapped = new Decimal(o.xrdBase).minus(full);
+  if (!swapped.gt(0) || !out.gt(0) || min.gte(full)) return undefined;
+  const short = new Decimal(o.need).minus(out);
+  if (!short.gt(0)) return full;
+  const rate = out.div(swapped);
+  const take = floorTo(full.minus(short.div(rate).mul('1.1')), 18);
+  return take.lt(min) ? min : take;
+}
+
 export interface MakerFill {
   order: OpenOrder;
   /** What the maker is owed before fees, in the token the taker sells. */

@@ -1,6 +1,8 @@
 // Stokenet test of the deployed contracts through the real server and solver:
 //   1. a limit order is filled through our own pool, with price improvement going to the user;
 //   2. an order hard-cancelled in the on-ledger registry can no longer be filled.
+// Since 22 Nov 2026 the solver's charges are XRD only: a buy of TUSD with XRD has them set aside from the XRD
+// sold before the swap, and the solver must end the run holding no more TUSD than it started with.
 // Needs scripts/stokenet-setup.ts to have run.
 import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -31,6 +33,8 @@ const alice = await accountOf(aliceKey, net.networkId);
 const bobKey = keyFromHex(s.bob);
 const bob = await accountOf(bobKey, net.networkId);
 const solverAccount = await app.solver!.account();
+// (The live Stokenet site shares this solver account; a fill of its own meanwhile could move its TUSD.)
+const solverTusdAtStart = await balance(solverAccount, s.tusd);
 const feeOf = async (txid: string) => (await gw.accountActivity(solverAccount, 10)).find((t) => t.txid === txid)?.feeXrd;
 
 /** Any order through the HTTP API: who, what, the signed minimum, and optionally a trigger above it or a market kind. */
@@ -113,14 +117,18 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
   expect((await balance(alice, net.xrd)) === before, 'user\'s XRD untouched');
 }
 
-// 3. Exchange-style limit order: it fills when the market reaches its price, and the fees come out of the proceeds.
+// 3. Exchange-style limit order buying TUSD with XRD: it fills when the market reaches its price, and the
+// fees are set aside in XRD from the 60 XRD sold, before the rest is swapped.
 {
   const q60 = await json('/api/quote?sell=' + net.xrd + '&buy=' + s.tusd + '&amount=60');
   const q = Number(q60.buyAmount);
-  // The signed minimum is the price less the network allowance the server quotes for this route (its fee estimate plus a margin) and 0.10%, as the site does.
-  const allowance = Number(q60.gasAllowanceInBuyToken);
-  expect(allowance > 0 && Number(q60.gasInBuyToken) > 0 && allowance > Number(q60.gasInBuyToken), 'the quote gives a network allowance (' + allowance.toFixed(6) + ' TUSD) above the fee estimate (' + Number(q60.gasInBuyToken).toFixed(6) + ')');
-  const terms = (gross: number) => ({ limitBuyAmount: n(gross), minBuyAmount: n(gross - allowance - gross * 0.001) });
+  expect(q60.feeAt === 'sell' && q60.feeToken === net.xrd && Number(q60.xrdBase) === 60, 'the quote says the fees come from the XRD sold (' + q60.feeAt + ', base ' + q60.xrdBase + ')');
+  // The signed minimum is the order's price on what is left after the network allowance the server quotes (its fee estimate plus a margin, in XRD) and 0.10% of the XRD, as the site does.
+  const allowance = Number(q60.gasAllowanceXrd);
+  expect(allowance > 0 && Number(q60.gasXrd) > 0 && allowance > Number(q60.gasXrd), 'the quote gives a network allowance (' + allowance.toFixed(4) + ' XRD) above the fee estimate (' + q60.gasXrd + ' XRD)');
+  const charges = allowance + 60 * 0.001;
+  const terms = (gross: number) => ({ limitBuyAmount: n(gross), minBuyAmount: n(gross * (60 - charges) / 60) });
+  const solverXrd0 = await balance(solverAccount, net.xrd);
   const above = await post(aliceKey, { sell: net.xrd, sellAmount: '60', buy: s.tusd, ...terms(q * 1.02) });
   const at = await post(aliceKey, { sell: net.xrd, sellAmount: '60', buy: s.tusd, ...terms(q * 0.9995) });
   const before = await balance(alice, s.tusd);
@@ -129,6 +137,9 @@ expect(depth.bids.length > 0 && depth.asks.length > 0, 'order book has ' + depth
   const got = (await balance(alice, s.tusd)) - before;
   expect(tick.poolFilled === 1 && st?.status === 'filled', 'a limit order priced just under the market fills (' + st?.status + '), fee paid by solver: ' + (st?.fillTx ? await feeOf(st.fillTx) : '?') + ' XRD');
   expect(got >= Number(terms(q * 0.9995).minBuyAmount) && got < q * 0.9995, 'it paid ' + got.toFixed(6) + ' TUSD: below its price of ' + (q * 0.9995).toFixed(6) + ' by the fees, above its signed minimum');
+  const fee = Number(st?.fillTx ? await feeOf(st.fillTx) : NaN);
+  const solverGain = (await balance(solverAccount, net.xrd)) - solverXrd0;
+  expect(solverGain + fee > 0.75 * Number(q60.gasXrd), 'the solver kept ' + (solverGain + fee).toFixed(4) + ' XRD of the order (net of its ' + fee + ' XRD network fee: ' + solverGain.toFixed(4) + ')');
   const stAbove = await stateOf(alice, above.id);
   expect(stAbove?.status === 'open', 'the same order priced 2% above the market is still open');
   const book = await json('/api/depth?market=' + encodeURIComponent(markets[0].id));
@@ -172,10 +183,13 @@ if ((await balance(bob, s.tusd)) < 80) {
   const bobGot = (await balance(bob, net.xrd)) - before.bx, bobPaid = before.bt - (await balance(bob, s.tusd));
   const aliceGot = (await balance(alice, s.tusd)) - before.at, alicePaid = before.ax - (await balance(alice, net.xrd));
   expect(Math.abs(bobPaid - Number(spend)) < 1e-9 && Math.abs(alicePaid - 150) < 1e-9, 'Bob paid exactly ' + spend + ' TUSD and Alice exactly 150 XRD');
-  expect(Math.abs(aliceGot - gross * 0.999) < 1e-6, 'Alice received her price less 0.10%: ' + aliceGot.toFixed(6) + ' TUSD');
+  // A maker fee would be in TUSD, which the solver does not keep: Alice gets her full price.
+  expect(Math.abs(aliceGot - gross) < 1e-6, 'Alice received her full price, no maker fee in TUSD: ' + aliceGot.toFixed(6) + ' TUSD');
   const bobGross = bobGot + 1.38 + (bobGot + 1.38) / 0.999 * 0.001;
   // Better even after the dearer network fee: 1.35 XRD against 1 XRD for the pool alone.
   expect(bobGot > (poolOnly - 1) * 0.999, 'Bob got ' + bobGot.toFixed(4) + ' XRD after fees (' + bobGross.toFixed(4) + ' before), better than the pool alone at ' + poolOnly.toFixed(4));
 }
+const solverTusd = await balance(solverAccount, s.tusd);
+expect(Math.abs(solverTusd - solverTusdAtStart) < 1e-12, 'the solver ends holding no more TUSD than it started with (' + solverTusdAtStart + ' → ' + solverTusd + ')');
 server.close();
 console.log(process.exitCode ? 'SOME CHECKS FAILED' : 'ALL CHECKS PASSED');

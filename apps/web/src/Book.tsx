@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { Depth } from '@radix-dex/core/browser';
 import type { MarketTrade } from './api';
 import { ladder } from './book';
-import { fmtAmount, fmtPrice } from './format';
+import { fmtAmount, fmtPrice, shownPrice } from './format';
 import { Empty, SkeletonRows, TabPanel, Tabs } from './ui';
 
 const ROWS = 11;
@@ -18,6 +18,7 @@ export function Book({ depth, trades, explorer, baseSymbol, quoteSymbol, onPick 
   const asks = ladder(depth?.asks ?? [], ROWS);
   const bids = ladder(depth?.bids ?? [], ROWS);
   const max = Math.max(asks[asks.length - 1]?.total ?? 0, bids[bids.length - 1]?.total ?? 0, 1e-18);
+  const mid = shownPrice(depth?.mid); // the mid as shown, so picking it fills exactly what the reader sees
   const spread = asks[0] && bids[0] ? ((asks[0].price - bids[0].price) / ((asks[0].price + bids[0].price) / 2)) * 100 : undefined;
 
   const row = (side: 'ask' | 'bid') => (l: (typeof asks)[number], i: number) => (
@@ -40,7 +41,9 @@ export function Book({ depth, trades, explorer, baseSymbol, quoteSymbol, onPick 
         <div className="book-cols"><span>Price ({quoteSymbol})</span><span>Size ({baseSymbol})</span><span>Total</span></div>
         <div className="book-side asks">{depth ? [...asks].reverse().map(row('ask')) : <SkeletonRows rows={ROWS} label="Loading the order book" />}</div>
         <div className="book-mid">
-          <strong>{depth ? fmtPrice(depth.mid) : <span className="skeleton mid" />}</strong>
+          {mid !== undefined
+            ? <button type="button" className="mid-pick" onClick={() => onPick(mid)} title="Use as limit price"><strong>{fmtPrice(mid)}</strong></button>
+            : <strong>{depth ? fmtPrice(depth.mid) : <span className="skeleton mid" />}</strong>}
           <span className="head-note">{spread === undefined ? (depth ? 'one-sided' : 'loading…') : <>spread <b>{spread.toFixed(2)}%</b></>}</span>
         </div>
         <div className="book-side bids">{depth ? bids.map(row('bid')) : <SkeletonRows rows={ROWS} label="Loading the order book" />}</div>

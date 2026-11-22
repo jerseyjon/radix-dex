@@ -50,6 +50,7 @@ export function Orders({ orders, trades, explorer, markets, account, onChanged, 
     // A fill has been sent and the ledger has not answered yet: it may well have filled.
     if (o.pending) return 'filling: waiting for the ledger, check Trades';
     if (!o.outlook) return 'checking…';
+    if (o.outlook.reason) return o.outlook.reason;
     const d = describe(o), sell = Number(o.sellAmount), avail = Number(o.outlook.available), need = Number(o.outlook.needed);
     if (avail >= need) return 'filling now';
     if (o.kind === 'market') return 'price moved beyond your slippage limit';

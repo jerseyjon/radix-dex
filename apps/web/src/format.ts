@@ -12,6 +12,15 @@ export function fmtPrice(v: number | null | undefined): string {
   return v.toFixed(decimals).replace(/0+$/, '').replace(/\.$/, '');
 }
 
+/** The price fmtPrice shows, as a number: for handing a displayed (rounded) price on, e.g. the book's mid to the order form. */
+export function shownPrice(v: number | null | undefined): number | undefined {
+  if (v == null || !Number.isFinite(v) || v <= 0) return undefined;
+  if (v < 1e-14) return Number(v.toPrecision(5));
+  const decimals = v >= 1000 ? 1 : v >= 1 ? 4 : Math.min(18, Math.ceil(-Math.log10(v)) + 4);
+  const r = Number(v.toFixed(decimals));
+  return r > 0 ? r : undefined;
+}
+
 /** Decimals a chart axis needs to show about five significant digits of this price (none for large prices). */
 export function pricePrecision(v: number): number {
   if (!(v > 0) || !Number.isFinite(v)) return 4;
