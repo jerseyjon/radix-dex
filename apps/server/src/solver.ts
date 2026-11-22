@@ -534,7 +534,7 @@ export class Solver {
       ...exec, take: candidate, poolOut, total: fromOthers.plus(poolOut), net: fromOthers.plus(poolOut),
       poolIn: exec.at === 'hop' ? exec.poolIn : amount.toFixed(),
     };
-    const plan = planXrdLegFill({ xrdBase: next.xrdBase.toFixed(), take: candidate.toFixed(), out: next.total.toFixed(), minBuyAmount: o.minBuyAmount, limitBuyAmount: limitOf(o).toFixed() });
+    const plan = planXrdLegFill({ xrdBase: next.xrdBase.toFixed(), take: candidate.toFixed(), out: next.total.toFixed(), minBuyAmount: o.minBuyAmount, limitBuyAmount: limitOf(o).toFixed(), bufferBps: exec.route.length ? undefined : 0, buyDivisibility: this.divisibility(o.buy) });
     return plan ? { exec: next, plan } : undefined;
   }
 
@@ -559,7 +559,7 @@ export class Solver {
       this.outlook.set(o.id, { available: exec.total.toFixed(), needed: grossNeeded(terms).toFixed(), at: Date.now() });
       plan = planPoolFill({ ...terms, quotedOut: exec.total.toFixed(), feeBps: this.config.feeBps, divisibility: this.divisibility(o.buy) });
     } else {
-      const terms = { xrdBase: exec.xrdBase.toFixed(), take: exec.take.toFixed(), minBuyAmount: o.minBuyAmount, limitBuyAmount: limit, bufferBps };
+      const terms = { xrdBase: exec.xrdBase.toFixed(), take: exec.take.toFixed(), minBuyAmount: o.minBuyAmount, limitBuyAmount: limit, bufferBps, buyDivisibility: this.divisibility(o.buy) };
       const need = xrdLegNeeded(terms);
       if (!need) { this.outlook.delete(o.id); return { kind: 'noPlan' }; }
       // Shown in whole-order terms (as if no charges were taken first), so it compares with the order's own price.

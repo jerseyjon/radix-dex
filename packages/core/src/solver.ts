@@ -143,13 +143,14 @@ export function reducedXrdCharges(gasXrd: string | Decimal, gasShortfall = GAS_S
  * What a fill that takes `take` XRD before the last swap must deliver: the signed minimum (plus the
  * buffer when a pool is involved), and the order's trigger scaled to the XRD actually swapped, so
  * the order's own price is met on what is traded for it. `xrdBase` is the XRD available at the point
- * of the take (the amount sold for `input`, the first swap's output for `hop`).
+ * of the take (the amount sold for `input`, the first swap's output for `hop`). The scaled trigger is
+ * rounded down to the bought token's places (`buyDivisibility`, default 18), as a pool's output is.
  */
-export function xrdLegNeeded(o: { xrdBase: string; take: string; minBuyAmount: string; limitBuyAmount?: string; bufferBps?: number }): Decimal | undefined {
+export function xrdLegNeeded(o: { xrdBase: string; take: string; minBuyAmount: string; limitBuyAmount?: string; bufferBps?: number; buyDivisibility?: number }): Decimal | undefined {
   const base = new Decimal(o.xrdBase), take = new Decimal(o.take);
   if (!base.gt(0) || take.lt(0) || !take.lt(base)) return undefined;
   const floor = new Decimal(o.minBuyAmount).mul(10_000 + (o.bufferBps ?? POOL_FILL_BUFFER_BPS)).div(10_000);
-  const trigger = new Decimal(o.limitBuyAmount ?? o.minBuyAmount).mul(base.minus(take)).div(base);
+  const trigger = floorTo(new Decimal(o.limitBuyAmount ?? o.minBuyAmount).mul(base.minus(take)).div(base), o.buyDivisibility ?? 18);
   return Decimal.max(floor, trigger);
 }
 
@@ -158,7 +159,7 @@ export function xrdLegNeeded(o: { xrdBase: string; take: string; minBuyAmount: s
  * receives everything the swap (and any resting orders) produce, `out`. Undefined if that is short
  * of what `xrdLegNeeded` asks.
  */
-export function planXrdLegFill(o: { xrdBase: string; take: string; out: string; minBuyAmount: string; limitBuyAmount?: string; bufferBps?: number }): { solverTake: string; userReceives: string } | undefined {
+export function planXrdLegFill(o: { xrdBase: string; take: string; out: string; minBuyAmount: string; limitBuyAmount?: string; bufferBps?: number; buyDivisibility?: number }): { solverTake: string; userReceives: string } | undefined {
   const need = xrdLegNeeded(o);
   if (!need || new Decimal(o.out).lt(need)) return undefined;
   return { solverTake: new Decimal(o.take).toFixed(), userReceives: new Decimal(o.out).toFixed() };
