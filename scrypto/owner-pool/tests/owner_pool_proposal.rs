@@ -1,7 +1,12 @@
 //! Tests for the `OwnerPool` blueprint (proposed in the pool audit, 22 Nov 2026; approved by the
-//! owner with a 5% fee cap). Not published.
+//! owner with a 5% fee cap). Not published. Updated for the audit fixes (owner-pool-audit.md):
+//! instantiation presents the badge (L-1), deposit/withdraw take a reserves guard (M-1, passed as
+//! `None` here), and quote fails where swap would (L-2).
 
 use scrypto_test::prelude::*;
+
+/// `deposit`/`withdraw` reserves guard left off (audit M-1 fix; tested in owner_pool_audit2.rs).
+const NO_GUARD: Option<(Decimal, Decimal)> = None;
 
 #[derive(Clone, Copy)]
 struct Actor {
@@ -60,6 +65,7 @@ impl World {
         let (owner, badge, package) = (self.owner, self.badge, self.package);
         let m = ManifestBuilder::new()
             .lock_fee_from_faucet()
+            .create_proof_from_account_of_amount(owner.account, badge, dec!(1))
             .withdraw_from_account(owner.account, a, amount_a)
             .withdraw_from_account(owner.account, b, amount_b)
             .take_all_from_worktop(a, "a")
@@ -86,7 +92,7 @@ impl World {
             .create_proof_from_account_of_amount(self.owner.account, badge, dec!(1))
             .withdraw_from_account(who.account, a, amount_a)
             .take_all_from_worktop(a, "a")
-            .call_method_with_name_lookup(pool, "deposit", |l| (Some(l.bucket("a")), None::<ManifestBucket>))
+            .call_method_with_name_lookup(pool, "deposit", |l| (Some(l.bucket("a")), None::<ManifestBucket>, NO_GUARD))
             .build();
         self.run_as(who, m)
     }
@@ -121,7 +127,7 @@ fn proposal_only_the_owner_moves_liquidity() {
     assert_eq!(w.reserves(pool), (dec!(25_000), dec!(2_500)));
     // An outsider can neither deposit nor withdraw.
     let m = ManifestBuilder::new().lock_fee_from_faucet().withdraw_from_account(other.account, xrd, dec!(10)).take_all_from_worktop(xrd, "a")
-        .call_method_with_name_lookup(pool, "deposit", |l| (Some(l.bucket("a")), None::<ManifestBucket>)).build();
+        .call_method_with_name_lookup(pool, "deposit", |l| (Some(l.bucket("a")), None::<ManifestBucket>, NO_GUARD)).build();
     w.run_as(other, m).expect_commit_failure();
     w.owner_call(other, pool, "withdraw_all", manifest_args!()).expect_commit_failure();
     w.owner_call(other, pool, "set_fee", manifest_args!(0u16)).expect_commit_failure();
@@ -157,7 +163,7 @@ fn proposal_fee_cap_pause_minimum_and_one_sided_price_moves() {
     w.owner_call(owner, pool, "set_paused", manifest_args!(true)).expect_commit_success();
     w.swap(other, pool, xrd, dec!(1), None).expect_commit_failure_containing_error("Swaps are paused");
     // Withdrawals still work while paused.
-    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(1), dec!(1))).expect_commit_success();
+    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(1), dec!(1), NO_GUARD)).expect_commit_success();
     w.owner_call(owner, pool, "set_paused", manifest_args!(false)).expect_commit_success();
 
     // A one-sided deposit moves the price: the bot's lever.
@@ -278,18 +284,20 @@ impl World {
 
     /// `OwnerPool::instantiate` (empty pool).
     fn empty_pool(&mut self, a: ResourceAddress, b: ResourceAddress, fee_bps: u16) -> TransactionReceipt {
-        let (badge, package) = (self.badge, self.package);
+        let (owner, badge, package) = (self.owner, self.badge, self.package);
         let m = ManifestBuilder::new()
             .lock_fee_from_faucet()
+            .create_proof_from_account_of_amount(owner.account, badge, dec!(1))
             .call_function(package, "OwnerPool", "instantiate", manifest_args!(a, b, fee_bps, badge))
             .build();
-        self.ledger.execute_manifest(m, vec![])
+        self.run_as(owner, m)
     }
 
     fn try_pool(&mut self, a: ResourceAddress, amount_a: Decimal, b: ResourceAddress, amount_b: Decimal, fee_bps: u16) -> TransactionReceipt {
         let (owner, badge, package) = (self.owner, self.badge, self.package);
         let m = ManifestBuilder::new()
             .lock_fee_from_faucet()
+            .create_proof_from_account_of_amount(owner.account, badge, dec!(1))
             .withdraw_from_account(owner.account, a, amount_a)
             .withdraw_from_account(owner.account, b, amount_b)
             .take_all_from_worktop(a, "a")
@@ -312,7 +320,7 @@ impl World {
             .withdraw_from_account(who.account, b, amount_b)
             .take_all_from_worktop(a, "a")
             .take_all_from_worktop(b, "b")
-            .call_method_with_name_lookup(pool, "deposit", |l| (Some(l.bucket("a")), Some(l.bucket("b"))))
+            .call_method_with_name_lookup(pool, "deposit", |l| (Some(l.bucket("a")), Some(l.bucket("b")), NO_GUARD))
             .try_deposit_entire_worktop_or_abort(who.account, None)
             .build();
         self.run_as(who, m)
@@ -401,7 +409,7 @@ fn owner_only_deposit_and_withdraw() {
     let (ox, ou) = (w.balance(other, xrd), w.balance(other, usd));
     w.deposit_both(other, pool, xrd, dec!(10), usd, dec!(1)).expect_commit_failure();
     w.deposit(other, pool, xrd, dec!(10)).expect_commit_failure(); // presents the OWNER's proof from the wrong signer
-    w.owner_call(other, pool, "withdraw", manifest_args!(dec!(1), dec!(1))).expect_commit_failure();
+    w.owner_call(other, pool, "withdraw", manifest_args!(dec!(1), dec!(1), NO_GUARD)).expect_commit_failure();
     w.owner_call(other, pool, "withdraw_all", manifest_args!()).expect_commit_failure();
     assert_eq!((w.balance(other, xrd), w.balance(other, usd)), (ox, ou));
     assert_eq!(w.reserves(pool), (dec!(25_000), dec!(2_500)));
@@ -412,19 +420,19 @@ fn owner_only_deposit_and_withdraw() {
 
     // Owner withdraws exact amounts, including one side only.
     let (bx, bu) = (w.balance(owner, xrd), w.balance(owner, usd));
-    let r = w.owner_call(owner, pool, "withdraw", manifest_args!(dec!("123.456"), dec!("0.000001")));
+    let r = w.owner_call(owner, pool, "withdraw", manifest_args!(dec!("123.456"), dec!("0.000001"), NO_GUARD));
     let ev: Vec<LiquidityEv> = w.events(&r, "OwnerPoolLiquidityEvent");
     assert_eq!(ev[0].amount_a, dec!("-123.456"));
     assert_eq!(ev[0].amount_b, dec!("-0.000001"));
     assert_eq!(w.balance(owner, xrd) - bx, dec!("123.456"));
     assert_eq!(w.balance(owner, usd) - bu, dec!("0.000001"));
-    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(0), dec!(100))).expect_commit_success();
+    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(0), dec!(100), NO_GUARD)).expect_commit_success();
     assert_eq!(w.reserves(pool), (dec!("25876.544"), dec!("2500.499999")));
 
     // More than the pool holds, a negative amount, or finer than the token's divisibility: refused.
-    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(30_000), dec!(0))).expect_commit_failure();
-    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(-1), dec!(0))).expect_commit_failure();
-    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(0), dec!("0.0000001"))).expect_commit_failure();
+    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(30_000), dec!(0), NO_GUARD)).expect_commit_failure();
+    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(-1), dec!(0), NO_GUARD)).expect_commit_failure();
+    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(0), dec!("0.0000001"), NO_GUARD)).expect_commit_failure();
     assert_eq!(w.reserves(pool), (dec!("25876.544"), dec!("2500.499999")));
 
     // Owner cannot deposit a foreign token, or put token B in the A slot.
@@ -548,15 +556,15 @@ fn zero_and_dust_amounts() {
     w.swap(other, pool, xrd, dec!(0), None).expect_commit_failure_containing_error("Nothing to swap");
     w.try_read(pool, "quote", manifest_args!(xrd, dec!(0))).expect_commit_failure_containing_error("Nothing to swap");
     w.try_read(pool, "quote", manifest_args!(tkt, dec!(1))).expect_commit_failure_containing_error("Token is not in this pool");
-    // 1e-18 XRD is worth far less than 0.000001 USD: refused, not paid zero.
-    assert_eq!(w.read::<Decimal>(pool, "quote", manifest_args!(xrd, unit(18))), Decimal::ZERO);
+    // 1e-18 XRD is worth far less than 0.000001 USD: refused, not paid zero (and quote agrees).
+    w.try_read(pool, "quote", manifest_args!(xrd, unit(18))).expect_commit_failure_containing_error("Trade too small");
     w.swap(other, pool, xrd, unit(18), None).expect_commit_failure_containing_error("Trade too small");
     // 0.00001 XRD is worth 0.000000997 USD after the fee: under one unit, refused.
     w.swap(other, pool, xrd, dec!("0.00001"), None).expect_commit_failure_containing_error("Trade too small");
 
     // A 0-place token: the fee on 1 ticket rounds UP to the whole ticket, so a 1-ticket trade pays nothing and is refused.
     let tpool = w.pool(tkt, dec!(1_000), xrd, dec!(50_000), 30);
-    assert_eq!(w.read::<Decimal>(tpool, "quote", manifest_args!(tkt, dec!(1))), Decimal::ZERO);
+    w.try_read(tpool, "quote", manifest_args!(tkt, dec!(1))).expect_commit_failure_containing_error("Trade too small");
     w.swap(other, tpool, tkt, dec!(1), None).expect_commit_failure_containing_error("Trade too small");
     // 2 tickets: fee 1 ticket (rounded up), 1 effective: 50000 * 1 / 1001.
     let before = w.balance(other, xrd);
@@ -575,10 +583,10 @@ fn zero_and_dust_amounts() {
     let m = ManifestBuilder::new()
         .lock_fee_from_faucet()
         .create_proof_from_account_of_amount(owner.account, badge, dec!(1))
-        .call_method(pool, "deposit", manifest_args!(None::<ManifestBucket>, None::<ManifestBucket>))
+        .call_method(pool, "deposit", manifest_args!(None::<ManifestBucket>, None::<ManifestBucket>, NO_GUARD))
         .build();
     w.run_as(owner, m).expect_commit_success();
-    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(0), dec!(0))).expect_commit_success();
+    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(0), dec!(0), NO_GUARD)).expect_commit_success();
     assert_eq!(w.reserves(pool), r0);
 }
 
@@ -616,7 +624,7 @@ fn emptying_and_refilling() {
 
     // One side emptied: swaps both ways refuse ("Pool is empty"), never pay out of the other side.
     let (rx, _) = w.reserves(pool);
-    w.owner_call(owner, pool, "withdraw", manifest_args!(rx, dec!(0))).expect_commit_success();
+    w.owner_call(owner, pool, "withdraw", manifest_args!(rx, dec!(0), NO_GUARD)).expect_commit_success();
     w.swap(other, pool, usd, dec!(1), None).expect_commit_failure_containing_error("Pool is empty");
     w.swap(other, pool, xrd, dec!(1), None).expect_commit_failure_containing_error("Pool is empty");
     // A one-sided refill restores trading.
@@ -659,9 +667,9 @@ fn low_divisibility_tokens() {
         let owner = w.owner;
         if da < 18 {
             let bad = unit(da + 1);
-            w.owner_call(owner, pool, "withdraw", manifest_args!(bad, dec!(0))).expect_commit_failure();
+            w.owner_call(owner, pool, "withdraw", manifest_args!(bad, dec!(0), NO_GUARD)).expect_commit_failure();
         }
-        w.owner_call(owner, pool, "withdraw", manifest_args!(unit(da), unit(db))).expect_commit_success();
+        w.owner_call(owner, pool, "withdraw", manifest_args!(unit(da), unit(db), NO_GUARD)).expect_commit_success();
         w.owner_call(owner, pool, "withdraw_all", manifest_args!()).expect_commit_success();
         assert_eq!(w.reserves(pool), (Decimal::ZERO, Decimal::ZERO));
     }
@@ -770,10 +778,10 @@ fn freeze_of_one_vault_leaves_the_other_token_withdrawable() {
     let vault = InternalAddress::new_or_panic(vault.0);
     w.ledger.execute_manifest(ManifestBuilder::new().lock_fee_from_faucet().freeze_withdraw(vault).build(), vec![]).expect_commit_success();
     let before = w.balance(owner, usd);
-    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(0), dec!(5_000))).expect_commit_success();
+    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(0), dec!(5_000), NO_GUARD)).expect_commit_success();
     assert_eq!(w.balance(owner, usd) - before, dec!(5_000));
     // The frozen token itself stays put until the issuer unfreezes it; so does `withdraw_all`.
-    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(1), dec!(0))).expect_commit_failure();
+    w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(1), dec!(0), NO_GUARD)).expect_commit_failure();
     w.owner_call(owner, pool, "withdraw_all", manifest_args!()).expect_commit_failure();
     w.ledger.execute_manifest(ManifestBuilder::new().lock_fee_from_faucet().unfreeze_withdraw(vault).build(), vec![]).expect_commit_success();
     w.owner_call(owner, pool, "withdraw_all", manifest_args!()).expect_commit_success();

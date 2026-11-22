@@ -30,6 +30,7 @@ Why it is built this way: [docs/REVIEW.md](docs/REVIEW.md). How it works:
 | `apps/server` | HTTP API (markets, candles, depth, quotes, orders) and the solver loop |
 | `apps/web` | The trading terminal (React + Vite) |
 | `scrypto/dex-contracts` | `OrderRegistry` (hard cancel), `Pool` (rounding-safe constant-product pool) and `OrderBook` (resting orders with partial fills) |
+| `scrypto/owner-pool` | `OwnerPool`: a constant-product pool only the owner badge can fund or withdraw from, for a market-making bot. Its own crate and package (not yet published), so `dex-contracts` still rebuilds to the published wasm. Before instantiating: the badge must be a non-fungible, or a 0-divisibility fungible with supply 1, with no minter and every role locked (a proof of any amount of the badge is full, permanent ownership); both pooled tokens must have recall, freeze and mint denied and locked. See `docs/review-2026-11-21/owner-pool-audit.md`. |
 | `scripts` | Live checks and Stokenet end-to-end tests |
 
 ## Run it
@@ -89,6 +90,7 @@ npx tsx scripts/stokenet-pool-e2e.ts   # pool fill and on-ledger cancel against 
 npx tsx scripts/stokenet-book-e2e.ts   # on-ledger order book: partial fills, cancel, fill when a pool reaches the price
 scripts/run-stokenet.sh                # run the Stokenet test site with wallet connect on port 8788
 scrypto/run.sh test                    # contract tests, including attempts to drain the pool
+CRATE=owner-pool scrypto/run.sh test   # OwnerPool tests (slow: about 10 minutes)
 ```
 
 The Radix Connector browser extension only runs on `https://` pages and on `http://localhost` or

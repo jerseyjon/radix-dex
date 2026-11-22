@@ -272,8 +272,42 @@ Recommendations:
 All tests pass against 054bd6f. Tests that demonstrate a finding assert the weakness (M-1, L-1,
 L-2, I-1, I-2, I-3), so a fix will turn them red on purpose; invert them then.
 
-Run with the same image and command as `scrypto/run.sh`, on the separate target volume:
+Run with the same image and command as `scrypto/run.sh`, on the separate target volume (before
+the L-3 move; the tests now live in `scrypto/owner-pool`, see "Fixes applied"):
 `docker run --rm -v "$PWD/dex-contracts:/app" -v radix-dex-cargo:/usr/local/cargo/registry -v radix-dex-target-pool-audit:/target -e CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback radix-dex-scrypto:1.92 cargo test --test owner_pool_audit2`
+
+## Fixes applied
+
+Branch `pool-audit`, after add3b8e. The blueprint moved to its own crate, so paths below are
+`scrypto/owner-pool/src/lib.rs` (the blueprint) and `scrypto/owner-pool/tests/`.
+
+| Id | Status | What changed |
+|----|--------|--------------|
+| M-1 | Fixed | `deposit(a, b, expected)` and `withdraw(amount_a, amount_b, expected)` take `expected: Option<(Decimal, Decimal)>`; `Some((ra, rb))` fails "Reserves moved" unless the vaults hold exactly that before anything moves; `None` skips the check (lib.rs 239-240, 259-260, `check_reserves` 289-293). `withdraw_all` keeps no guard: it empties the pool, which sets no price, so there is nothing to sandwich (lib.rs 269-274). The bot should always pass the reserves it read. |
+| L-1 | Fixed | `build` refuses XRD or either pool token as the badge ("Bad owner badge") and calls `Runtime::assert_access_rule(rule!(require(owner_badge)))`, so both instantiation functions need a proof of the badge in the caller's auth zone (lib.rs 134-135). Instantiating manifests must now start with `CREATE_PROOF_FROM_ACCOUNT_OF_AMOUNT` of the badge. No supply or divisibility check on the badge (see I-2). |
+| L-2 | Fixed | `quote` fails "Swaps are paused" while paused, "Trade too small" where the output would be 0, and "Amount has more decimal places than the token allows" for amounts the input token cannot hold (lib.rs 176-195). `swap` is unchanged. |
+| L-3 | Fixed | `OwnerPool` and its two test files moved to `scrypto/owner-pool/` (crate `owner_pool`, same Cargo profile and lockfile versions). `dex-contracts/src/lib.rs` is back to its 5d8ad90 text; its `src`, `Cargo.toml` and `Cargo.lock` are identical to 5d8ad90. A fresh build in a new empty target volume gave wasm sha256 `b3954135…f4082a` and rpd sha256 `08853663…1f396d9b`, identical to `data/contracts/`. (With the module present, the same crate had built to wasm sha256 `5dde7622…e6b3ca`.) `scrypto/run.sh` takes `CRATE=owner-pool`. |
+| I-1 | Documented | Pooled tokens must have recall, freeze, mint and withdraw/deposit roles denied (or allow-all for withdraw/deposit) and locked: blueprint doc comment (lib.rs 23-33) and README. Test still demonstrates the issuer drain. |
+| I-2 | Documented, rule unchanged | `require(badge)` kept. Doc comment and README: the badge must be a non-fungible, or 0-divisibility supply-1 fungible, no minter, not recallable or freezable, all role updaters locked. Test still demonstrates the dust-fraction owner. |
+| I-3 | Accepted | Unchanged; test still documents the under-payment at extreme ratios. |
+| I-4 | Accepted | Unchanged (unreachable). |
+| I-5 | Partly addressed by L-1 | A stranger can no longer name the owner's badge (he cannot prove it); he can still create a pool owned by his own badge. List pools by component address only (doc comment). |
+| I-6 | Accepted | Unchanged; `withdraw(0, x, None)` / `deposit(None, …)` remain the frozen-side fallbacks. |
+| I-7 | Accepted | Unchanged. |
+
+Tests after the fixes (same image, volume `radix-dex-target-pool-audit`,
+`CRATE=owner-pool TARGET_VOLUME=radix-dex-target-pool-audit scrypto/run.sh test --test owner_pool_proposal --test owner_pool_audit2`):
+`owner_pool_audit2.rs` **17 passed, 0 failed** (661 s); `owner_pool_proposal.rs` **15 passed, 0
+failed** (101 s). The M-1, L-1 and L-2 tests are inverted to prove the fixes
+(`audit_m1_guarded_one_sided_deposit_cannot_be_sandwiched`, `audit_l1_badge_checked_at_instantiation`,
+`audit_l2_quote_agrees_with_swap`); `audit_m1_reserves_guard_on_deposit_and_withdraw` is new
+(matching, mismatched by one unit on either side, and `None`). The matrix and dust tests now treat a
+refused quote as "Trade too small" and check that `swap` refuses too. The I-1, I-2 and I-3 tests are
+unchanged and still pass. The proposal tests were updated only for the new signatures (badge proof at
+instantiation, `None` guard) and for `quote` failing on dust.
+
+Not changed, for the owner to decide: a cold/hot badge split; an on-ledger check of the badge's
+supply/divisibility or of the pooled tokens' roles.
 
 ## Not verified
 

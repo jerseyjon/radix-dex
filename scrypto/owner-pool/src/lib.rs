@@ -1,5 +1,6 @@
 //! From the pool audit (22 Nov 2026); the owner approved it with a 5% fee cap. Not yet published:
-//! using it needs a new package.
+//! it lives in its own crate (`scrypto/owner-pool`) so it becomes its own package, and so the
+//! published `dex-contracts` package still rebuilds to the same wasm.
 //!
 //! `OwnerPool`: a constant-product pool whose liquidity belongs to one owner. Built for the owner's
 //! stated use: he is the only liquidity provider and a market-making bot will manage the pool.
@@ -14,6 +15,22 @@
 //! * The owner can change the fee within a fixed cap, pause swaps (never withdrawals), and move the
 //!   price by depositing or withdrawing either side alone. Every change emits an event.
 //! * `swap_with_minimum` lets a caller who does not use manifest assertions protect himself.
+//! * `deposit` and `withdraw` take an optional `expected` pair of reserves and fail if the pool no
+//!   longer holds exactly that, so a bot's price move cannot be sandwiched (audit M-1).
+//! * `quote` fails wherever `swap` would: while paused, when the output would be zero, and for an
+//!   amount the input token's divisibility cannot hold (audit L-2).
+//!
+//! Operating rules (not enforced on ledger; check on the Gateway before instantiating):
+//! * The owner badge is total and permanent control (`OwnerRole::Fixed`): it can never be rotated.
+//!   It must be a fresh non-fungible, or a fungible with divisibility 0 and supply 1, with no
+//!   minter (or minter `DenyAll`), not recallable, not freezable, and every role updater locked.
+//!   `require(badge)` accepts a proof of ANY amount of the badge, so with a divisible badge a dust
+//!   fraction is full ownership (audit I-2). Instantiation requires a proof of the badge and refuses
+//!   XRD and either pool token as the badge (audit L-1), but cannot check the rest.
+//! * Pooled tokens must have their recaller, freezer, minter and withdraw/deposit roles `DenyAll`
+//!   (or `AllowAll` for withdraw/deposit) AND locked. A token whose issuer can recall or mint can
+//!   drain the other side of the pool; one that can freeze can halt it (audit I-1).
+//! * Anyone can instantiate an `OwnerPool`; list pools by component address only (audit I-5).
 use scrypto::prelude::*;
 
 /// Hard cap on the swap fee, in basis points (5%). Fixed in code; `instantiate`,
@@ -109,9 +126,13 @@ mod owner_pool {
             Self::build(ra, rb, fee_bps, owner_badge, Some((a, b)))
         }
 
+        /// Both instantiations require a proof of `owner_badge` in the caller's auth zone, so a
+        /// mistyped or unheld badge address fails here instead of handing the pool away for ever.
         fn build(resource_a: ResourceAddress, resource_b: ResourceAddress, fee_bps: u16, owner_badge: ResourceAddress, seed: Option<(FungibleBucket, FungibleBucket)>) -> Global<OwnerPool> {
             assert!(resource_a != resource_b, "The two tokens must differ");
             assert!(fee_bps <= OWNER_POOL_MAX_FEE_BPS, "Fee too high");
+            assert!(owner_badge != resource_a && owner_badge != resource_b && owner_badge != XRD, "Bad owner badge");
+            Runtime::assert_access_rule(rule!(require(owner_badge)));
             let mut vault_a = FungibleVault::new(resource_a);
             let mut vault_b = FungibleVault::new(resource_b);
             if let Some((a, b)) = seed {
@@ -152,8 +173,25 @@ mod owner_pool {
             self.paused
         }
 
+        /// What `swap` would pay for `input_amount` now. Fails wherever `swap` would fail: while
+        /// paused ("Swaps are paused"), for an output of zero ("Trade too small"), and for an amount
+        /// with more decimal places than the input token allows (no bucket can hold it).
         pub fn quote(&self, input_resource: ResourceAddress, input_amount: Decimal) -> Decimal {
-            self.compute_swap(input_resource, input_amount)
+            assert!(!self.paused, "Swaps are paused");
+            let div_in = if input_resource == self.resource_a {
+                self.divisibility_a
+            } else if input_resource == self.resource_b {
+                self.divisibility_b
+            } else {
+                panic!("Token is not in this pool")
+            };
+            assert!(
+                input_amount.checked_round(div_in, RoundingMode::ToZero) == Some(input_amount),
+                "Amount has more decimal places than the token allows"
+            );
+            let output = self.compute_swap(input_resource, input_amount);
+            assert!(output > Decimal::ZERO, "Trade too small");
+            output
         }
 
         pub fn swap(&mut self, input: FungibleBucket) -> FungibleBucket {
@@ -195,7 +233,11 @@ mod owner_pool {
 
         /// Owner: add either or both tokens, at any ratio. Changing the ratio moves the price;
         /// that is how a market-making bot keeps the pool at the market.
-        pub fn deposit(&mut self, a: Option<FungibleBucket>, b: Option<FungibleBucket>) {
+        /// `expected`: if `Some((ra, rb))`, fail with "Reserves moved" unless the pool holds exactly
+        /// `ra` of A and `rb` of B before the deposit. A bot should always pass the reserves it
+        /// computed its amounts from; `None` skips the check.
+        pub fn deposit(&mut self, a: Option<FungibleBucket>, b: Option<FungibleBucket>, expected: Option<(Decimal, Decimal)>) {
+            self.check_reserves(expected);
             let (mut da, mut db) = (Decimal::ZERO, Decimal::ZERO);
             if let Some(a) = a {
                 assert!(a.resource_address() == self.resource_a, "Wrong token A");
@@ -213,7 +255,9 @@ mod owner_pool {
         /// Owner: take out any amounts. Never paused, never locked.
         /// A zero amount does not touch its vault, so if a token's issuer freezes one vault the
         /// owner can still take the other token out.
-        pub fn withdraw(&mut self, amount_a: Decimal, amount_b: Decimal) -> (FungibleBucket, FungibleBucket) {
+        /// `expected`: as for `deposit`, checked before anything is taken.
+        pub fn withdraw(&mut self, amount_a: Decimal, amount_b: Decimal, expected: Option<(Decimal, Decimal)>) -> (FungibleBucket, FungibleBucket) {
+            self.check_reserves(expected);
             let take = |vault: &mut FungibleVault, resource: ResourceAddress, amount: Decimal| {
                 if amount == Decimal::ZERO { FungibleBucket::new(resource) } else { vault.take(amount) }
             };
@@ -222,10 +266,11 @@ mod owner_pool {
             out
         }
 
-        /// Owner: take out everything.
+        /// Owner: take out everything. No reserves guard: emptying the pool sets no price, so a
+        /// trade landing just before it leaves nothing behind for anyone to trade against.
         pub fn withdraw_all(&mut self) -> (FungibleBucket, FungibleBucket) {
             let (a, b) = self.reserves();
-            self.withdraw(a, b)
+            self.withdraw(a, b, None)
         }
 
         /// Owner: change the fee, within the cap fixed in code.
@@ -239,6 +284,12 @@ mod owner_pool {
         pub fn set_paused(&mut self, paused: bool) {
             self.paused = paused;
             Runtime::emit_event(OwnerPoolConfigEvent { fee_bps: self.fee_bps, paused });
+        }
+
+        fn check_reserves(&self, expected: Option<(Decimal, Decimal)>) {
+            if let Some((ea, eb)) = expected {
+                assert!(self.vault_a.amount() == ea && self.vault_b.amount() == eb, "Reserves moved");
+            }
         }
 
         fn liquidity_event(&self, amount_a: Decimal, amount_b: Decimal) {
