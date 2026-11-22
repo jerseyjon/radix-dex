@@ -1,7 +1,7 @@
 import type { Gateway } from './gateway.ts';
 import { Decimal, addr, bucket, dec } from './manifest.ts';
 import type { Depth, DepthLevel, Market, Pool, Quote } from './types.ts';
-import { swapInstruction } from './venues.ts';
+import { VENUE_GAS_MARGIN_XRD, poolsToProbe, swapInstruction } from './venues.ts';
 
 const other = (pool: Pool, token: string): string | undefined =>
   pool.tokens[0] === token ? pool.tokens[1] : pool.tokens[1] === token ? pool.tokens[0] : undefined;
@@ -110,37 +110,53 @@ export class Quoter {
       // A pool short of liquidity can hand part of the input back, so measure what was really sold.
       const sold = net(sell).neg();
       if (!received.gt(0) || !sold.gt(0)) return undefined;
+      // The measured fee, plus a margin for venues whose cost moves with the pool's state (see VENUE_GAS_MARGIN_XRD).
+      const margin = route.reduce((a, p) => a.plus(VENUE_GAS_MARGIN_XRD[p.venue] ?? 0), new Decimal(0));
       return {
         sell, buy,
         sellAmount: sold.toFixed(),
         buyAmount: received.toFixed(),
         price: received.div(sold).toSignificantDigits(12).toFixed(),
         route,
-        networkFeeXrd: res.feeXrd,
+        networkFeeXrd: margin.gt(0) ? new Decimal(res.feeXrd).plus(margin).toFixed(6) : res.feeXrd,
       };
     }
     return undefined;
   }
 
-  /** Candidate routes: the deepest direct pools, plus one two-hop route through `hub` (normally XRD). */
+  /**
+   * Candidate routes: the deepest direct pools, plus a two-hop route through `hub` (normally XRD)
+   * over the deepest pool on each side. Best-effort pools (see `poolsToProbe`) are added to these
+   * rather than ranked against them: each direct one as a route of its own, and each as an
+   * alternative leg of the two-hop route. The first two-hop route is the one over the deepest
+   * ordinary pools whenever both legs have one.
+   */
   candidateRoutes(pools: Pool[], sell: string, buy: string, hub: string, maxDirect = 3): Pool[][] {
-    const byDepth = (a: Pool, b: Pool) => b.tvlUsd - a.tvlUsd;
-    const direct = pools.filter((p) => other(p, sell) === buy).sort(byDepth).slice(0, maxDirect).map((p) => [p]);
-    const routes = [...direct];
+    const routes = poolsToProbe(pools.filter((p) => other(p, sell) === buy), maxDirect).map((p) => [p]);
     if (sell !== hub && buy !== hub) {
-      const leg1 = pools.filter((p) => other(p, sell) === hub).sort(byDepth)[0];
-      const leg2 = pools.filter((p) => other(p, hub) === buy).sort(byDepth)[0];
-      if (leg1 && leg2) routes.push([leg1, leg2]);
+      const legs1 = poolsToProbe(pools.filter((p) => other(p, sell) === hub), 1);
+      const legs2 = poolsToProbe(pools.filter((p) => other(p, hub) === buy), 1);
+      // poolsToProbe puts the ordinary pool first, so the first pair is the ordinary route when there is one.
+      for (const leg1 of legs1) for (const leg2 of legs2) routes.push([leg1, leg2]);
     }
     return routes;
   }
 
-  /** Best single route by amount received. */
+  /**
+   * Best single route by amount received. A route that sells the whole amount beats one that hands
+   * part of it back (a pool short of liquidity on one side): received amounts are only comparable
+   * for the same amount sold. Any one route failing, by error or by failed preview, only drops that route.
+   */
   async best(pools: Pool[], sell: string, buy: string, sellAmount: string | Decimal, hub: string): Promise<Quote | undefined> {
     const routes = this.candidateRoutes(pools, sell, buy, hub);
     const quotes = await Promise.all(routes.map((r) => this.simulate(r, sell, sellAmount).catch((e) => { this.errors++; this.lastFailure = String((e as Error)?.message ?? e).slice(0, 200); return undefined; })));
+    const whole = await this.divisibility(sell).then((d) => new Decimal(sellAmount).toDecimalPlaces(d, Decimal.ROUND_DOWN), () => new Decimal(sellAmount));
+    const full = (q: Quote) => new Decimal(q.sellAmount).gte(whole);
     let best: Quote | undefined;
-    for (const q of quotes) if (q && (!best || new Decimal(q.buyAmount).gt(best.buyAmount))) best = q;
+    for (const q of quotes) {
+      if (!q) continue;
+      if (!best || (full(q) && !full(best)) || (full(q) === full(best) && new Decimal(q.buyAmount).gt(best.buyAmount))) best = q;
+    }
     return best;
   }
 

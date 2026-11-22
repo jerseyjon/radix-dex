@@ -1,6 +1,6 @@
 import {
   type Depth, type Gateway, type LedgerSwap, type Market, type Pool, type Quote, type Token,
-  Quoter, buildMarkets, filterAllowedPools, listDefiPlaza, listOciswap, mergeDepth, tokensFromLedger, defaultJsonFetch, Decimal } from '@radix-dex/core';
+  Quoter, buildMarkets, filterAllowedPools, listCaviarNine, listDefiPlaza, listOciswap, mergeDepth, poolsToProbe, tokensFromLedger, defaultJsonFetch, Decimal } from '@radix-dex/core';
 import { readFileSync } from 'node:fs';
 import type { Config } from './config.ts';
 
@@ -83,14 +83,22 @@ export class MarketData {
     const results = await Promise.allSettled([listOciswap(min), listDefiPlaza(min)]);
     const listed: Pool[] = [];
     const tokens = new Map<string, Token>();
+    const pricesUsd: Record<string, number> = {};
     const errors: string[] = [];
     for (const r of results) {
       if (r.status === 'rejected') { errors.push(String(r.reason?.message ?? r.reason)); continue; }
       listed.push(...r.value.pools);
       for (const t of r.value.tokens) tokens.set(t.address, t);
+      Object.assign(pricesUsd, r.value.pricesUsd ?? {});
+    }
+    if (listed.length === 0) { this.lastError = errors.join('; ') || undefined; return; }
+    // Best-effort venues, read from the ledger and valued at the prices just listed. Their failure is noted, never fatal.
+    try {
+      listed.push(...(await listCaviarNine(this.gateway, { pricesUsd })).pools);
+    } catch (e) {
+      errors.push(`caviarnine: ${String((e as Error)?.message ?? e)}`);
     }
     this.lastError = errors.length ? errors.join('; ') : undefined;
-    if (listed.length === 0) return;
     const pools = await filterAllowedPools(this.gateway, listed);
     const missing = [...new Set(pools.flatMap((p) => p.tokens))].filter((a) => !tokens.has(a));
     if (missing.length) for (const t of await tokensFromLedger(this.gateway, missing)) tokens.set(t.address, t);
@@ -195,19 +203,20 @@ export class MarketData {
     return this.depthCache.get(market.id, async () => {
       // Probe the three deepest pools. Two was too few: a slightly smaller low-fee pool is where small
       // orders really trade, and without it the book showed a spread nobody pays. More would multiply Gateway load.
-      const pools = [...market.pools].sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 3);
+      // Best-effort pools are probed as well, not in place of these; one that fails adds no levels.
+      const pools = poolsToProbe(market.pools, 3);
       const parts = await Promise.all(pools.map((p) => this.quoter.poolDepth(market, p).catch(() => ({ bids: [], asks: [] }))));
       return mergeDepth(market.id, parts);
     });
   }
 
   /**
-   * Recent swaps in a market's three deepest pools, read from the ledger, each labelled with its venue.
+   * Recent swaps in a market's three deepest pools (and its best-effort pools), read from the ledger, each labelled with its venue.
    * A pool that cannot be read is left out rather than failing the list.
    */
   venueTrades(market: Market): Promise<(LedgerSwap & { venue: string })[]> {
     return this.tradesCache.get(market.id, async () => {
-      const pools = [...market.pools].sort((a, b) => b.tvlUsd - a.tvlUsd).slice(0, 3);
+      const pools = poolsToProbe(market.pools, 3);
       // Only the pool's own holdings count as its side of a trade: its component, or the native pool that holds its funds.
       const lists = await Promise.all(pools.map((p) => this.gateway.swapsAt(p.address, market.base.address, market.quote.address, 30, [p.address, ...(p.holders ?? [])]).catch(() => [] as LedgerSwap[])));
       const seen = new Set<string>(), out: (LedgerSwap & { venue: string })[] = [];

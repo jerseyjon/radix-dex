@@ -37,7 +37,18 @@ bucket through one pool. It does **not** re-implement pool maths.
 |---|---|---|
 | Ociswap Basic / Precision | `pool.swap(bucket)` | allow-listed packages only |
 | DefiPlaza | `pair.swap(bucket)` on the pair component | can hand back part of the input when short of liquidity |
-| CaviarNine Shape | `pool.swap(bucket)` | later; team gone, admin badge live |
+| CaviarNine Shape (unmaintained) | `pool.swap(bucket)` | best-effort, two pools only (see below); team gone, admin badge live |
+
+**CaviarNine** (added 22 Nov 2026): only the XRD/hUSDC and LSULP/XRD QuantaSwap pools in
+`CAVIARNINE_POOLS`, read from the ledger (no API exists any more). Both are heavily one-sided.
+They are *best-effort*: probed for quotes, depth and trades in addition to the three deepest
+ordinary pools rather than ranked against them, and any failure (listing, preview, stream)
+just drops them. Each pool's `reserves` are what each side can take in (the other side's
+balance at the pool's own price, from its active bin), so depth probes stay inside the thin
+side, which a swap cannot exceed, and reach into the deep side. Quotes through them carry a
+0.3 XRD margin on the measured network fee, as their cost grows with the bins crossed. Shown
+as "CaviarNine (unmaintained)". Their protocol fee goes to a separate fee-vaults component,
+so a trade's size on the tape is what the pool kept (about 0.08% under what the trader paid).
 
 ### Quoting by preview
 
