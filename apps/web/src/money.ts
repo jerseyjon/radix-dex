@@ -106,33 +106,53 @@ export function limitTerms(side: 'buy' | 'sell', price: string, amount: string, 
 export interface Fees { network: Dec; service: Dec }
 
 /**
- * The solver's fees on a fill, in the token bought. `gasInBuyToken` is the route's network fee from
- * the quote: for a signed limit order its allowance (`gasAllowanceInBuyToken`, the estimate plus 25%),
- * for a market order its estimate. Without it, `gasXrd × margin` is used when XRD is bought, or
- * converted at the order's own rate when XRD is sold; otherwise there is no network fee to allow for
- * (the caller must not sign such an order: see `networkFeeKnown`).
+ * Where the solver takes its charges: they are always XRD (since 22 Nov 2026).
+ * `proceeds`: from the XRD the order buys. `input`: from the XRD it sells, before the swap.
+ * `hop`: neither token is XRD; between the two swaps of a route through XRD.
  */
-export function solverFees(o: {
-  gross: DecIn; feeBps: number; gasInBuyToken?: string | null; gasXrd: string; margin?: number;
-  buyIsXrd: boolean; sellIsXrd: boolean; sellAmount: string;
-}): Fees {
+export type ChargeAt = 'proceeds' | 'input' | 'hop';
+export const chargeAtFor = (sell: string, buy: string, xrd: string): ChargeAt => (buy === xrd ? 'proceeds' : sell === xrd ? 'input' : 'hop');
+
+export interface XrdCharges {
+  at: ChargeAt;
+  /** In XRD: the network fee (or its signed allowance) and the service fee, and their sum, rounded down to 18 places as the solver rounds. */
+  network: Dec; service: Dec; totalXrd: Dec;
+  /** The XRD the service fee is charged on: the XRD bought, the XRD sold, or what the first swap produces. */
+  xrdBase: Dec;
+  /** What the user is left with, in the token bought, and the charges' equivalent in it. */
+  net: Dec; inBuyToken: Dec;
+  /** For `input`: the XRD actually swapped, after the charges are set aside. */
+  swappedXrd?: Dec;
+}
+
+/**
+ * The solver's charges in XRD on an order whose trade produces `gross` of the token bought (its
+ * price times size for a limit order, the quote for a market order), and what that leaves the user.
+ * Charges taken from the proceeds come straight off `gross`; charges taken before the last swap
+ * reduce what is swapped, so the user gets `gross × (base − charges) / base`: their own price on
+ * what is swapped. `gasXrd` is the network fee in XRD (for a signed limit order its allowance:
+ * the estimate plus 25%). `xrdBase` is needed for `hop` (from the quote). Undefined if the charges
+ * would take everything, or the base is unknown.
+ */
+export function xrdCharges(o: { at: ChargeAt; gross: DecIn; sellAmount: DecIn; xrdBase?: string | null; gasXrd: DecIn; feeBps: number }): XrdCharges | undefined {
   const gross = new Decimal(o.gross);
-  const fallbackXrd = new Decimal(o.gasXrd).times(String(o.margin ?? 1));
-  const network = o.gasInBuyToken != null ? new Decimal(o.gasInBuyToken)
-    : o.buyIsXrd ? fallbackXrd
-    : o.sellIsXrd ? gross.div(o.sellAmount).times(fallbackXrd)
-    : new Decimal(0);
-  return { network, service: gross.times(o.feeBps).div(10_000) };
+  const base = o.at === 'proceeds' ? gross : o.at === 'input' ? new Decimal(o.sellAmount) : o.xrdBase != null ? new Decimal(o.xrdBase) : undefined;
+  if (!base || !base.gt(0) || !gross.gt(0)) return undefined;
+  const network = new Decimal(o.gasXrd), service = base.times(o.feeBps).div(10_000);
+  const totalXrd = network.plus(service).toDecimalPlaces(MAX_PLACES, Decimal.ROUND_DOWN);
+  if (!totalXrd.lt(base)) return undefined;
+  const net = o.at === 'proceeds' ? gross.minus(totalXrd) : gross.times(base.minus(totalXrd)).div(base);
+  return { at: o.at, network, service, totalXrd, xrdBase: base, net, inBuyToken: gross.minus(net), swappedXrd: o.at === 'input' ? base.minus(totalXrd) : undefined };
 }
 
-/** Can the network fee be priced in the token bought: a route figure from the quote, or XRD on one side? */
-export function networkFeeKnown(o: { gasInBuyToken?: string | null; buyIsXrd: boolean; sellIsXrd: boolean }): boolean {
-  return o.gasInBuyToken != null || o.buyIsXrd || o.sellIsXrd;
-}
-
-/** The signed minimum of a limit order: gross less the network and service fees, rounded down. Undefined if not positive. */
+/** Gross less two fees in the same token, rounded down. Undefined if not positive. */
 export function minAfterFees(gross: DecIn, fees: Fees): string | undefined {
   return positivePlain(new Decimal(gross).minus(fees.network).minus(fees.service));
+}
+
+/** The signed minimum after XRD charges: what they leave the user, rounded down to the bought token's places. Undefined if nothing is left. */
+export function minAfterXrdCharges(c: XrdCharges | undefined, places = MAX_PLACES): string | undefined {
+  return c ? positivePlain(c.net, places) : undefined;
 }
 
 /** Least a market order accepts: `expected` less the slippage allowance (percent), rounded down. */
