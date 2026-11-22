@@ -15,10 +15,36 @@
 //! * The owner can change the fee within a fixed cap, pause swaps (never withdrawals), and move the
 //!   price by depositing or withdrawing either side alone. Every change emits an event.
 //! * `swap_with_minimum` lets a caller who does not use manifest assertions protect himself.
-//! * `deposit` and `withdraw` take an optional `expected` pair of reserves and fail if the pool no
-//!   longer holds exactly that, so a bot's price move cannot be sandwiched (audit M-1).
+//! * `deposit`, `withdraw`, `rebalance` and `owner_rebalance` take an optional `expected` pair of
+//!   reserves and fail if the pool no longer holds exactly that, so a bot's price move cannot be
+//!   sandwiched (audit M-1).
 //! * `quote` fails wherever `swap` would: while paused, when the output would be zero, and for an
 //!   amount the input token's divisibility cannot hold (audit L-2).
+//!
+//! Cold/hot split (docs/review-2026-11-21/owner-pool-split-design.md):
+//! * OWNER (cold badge, kept in the owner's wallet): everything, including every way funds leave the
+//!   component, the fee, the pause, and choosing, replacing or revoking the operator and its limits.
+//! * OPERATOR (hot badge, held by the market-making bot; optional): may only move funds between the
+//!   component's INVENTORY vaults and its trading RESERVES (`rebalance`), pause/unpause its own pause
+//!   flag, and set the fee inside an owner-set range. No operator method takes a bucket out of the
+//!   component or returns one.
+//! * Inventory is not part of the trading curve. Swaps and `quote` see only the reserves; swap fees
+//!   stay in the reserves, as before.
+//! * A stolen operator key can still misprice the curve and trade against it. That is bounded on
+//!   ledger by owner-set limits: a budget per window of epochs (refilled continuously, so splitting
+//!   a move into many small calls does not help) that every operator move spends from, and caps on
+//!   the reserves the operator may raise either side to, and floors it may not lower them below.
+//!   A move costs its price change measured from BOTH the current price and the ANCHOR, plus the
+//!   growth of the curve's depth. The design document derives the bound and shows why each part is
+//!   needed (without them, shrink / swap / regrow drains the pool for free).
+//! * The ANCHOR is a price only the owner STATES (`set_operator`, `set_anchor`) or the operator
+//!   moves with a budgeted `rebalance`. Swaps never move it and neither do the owner's `deposit`,
+//!   `withdraw` or `owner_rebalance`: the curve's current price is whatever the last swap left it at,
+//!   which anyone, a thief included, can set with his own capital (split audit M-1). Whenever the
+//!   owner states an anchor the operator's allowance drops to zero and refills from there.
+//! * The owner's pause (`set_paused`) is a full stop for the hot key: no swaps, no `rebalance`, no
+//!   `operator_set_fee`. Revoking the operator turns it on, as does any `set_operator` made while
+//!   the operator's pause was on: the owner reopens swaps himself once the curve is right.
 //!
 //! Operating rules (not enforced on ledger; check on the Gateway before instantiating):
 //! * The owner badge is total and permanent control (`OwnerRole::Fixed`): it can never be rotated.
@@ -27,6 +53,8 @@
 //!   `require(badge)` accepts a proof of ANY amount of the badge, so with a divisible badge a dust
 //!   fraction is full ownership (audit I-2). Instantiation requires a proof of the badge and refuses
 //!   XRD and either pool token as the badge (audit L-1), but cannot check the rest.
+//!   The same rules apply to the operator badge; `set_operator` likewise needs a proof of it and
+//!   refuses the owner badge, XRD and the pool tokens.
 //! * Pooled tokens must have their recaller, freezer, minter and withdraw/deposit roles `DenyAll`
 //!   (or `AllowAll` for withdraw/deposit) AND locked. A token whose issuer can recall or mint can
 //!   drain the other side of the pool; one that can freeze can halt it (audit I-1).
@@ -34,8 +62,40 @@
 use scrypto::prelude::*;
 
 /// Hard cap on the swap fee, in basis points (5%). Fixed in code; `instantiate`,
-/// `instantiate_with_liquidity` and `set_fee` all refuse anything above it.
+/// `instantiate_with_liquidity`, `set_fee` and `set_operator_limits` all refuse anything above it.
 pub const OWNER_POOL_MAX_FEE_BPS: u16 = 500;
+
+/// Largest price-move budget the owner may give the operator per window: 10,000 bps of cost,
+/// i.e. a cumulative log-price path of at most 1.0 (a factor e = 2.718) per window.
+pub const OWNER_POOL_MAX_MOVE_BUDGET_BPS: u16 = 10_000;
+
+/// What the operator may do. Set by the owner (`set_operator_limits`). At instantiation: budget 0,
+/// caps 0, floors Decimal::MAX and fee range [0, 0], so a new operator can do nothing that moves the
+/// price, raises or lowers a reserve, or changes the fee until the owner says so.
+#[derive(ScryptoSbor, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperatorLimits {
+    /// Budget per window, in basis points of "cost". A `rebalance` from reserves (Ra, Rb), price
+    /// P = Rb/Ra, to (Ra', Rb'), price P', with anchor price A, costs (each term rounded up)
+    ///   max(d(P, P'), d(A, P')) + max(0, Ra'Rb' / (Ra Rb) - 1) / 2,   d(x, y) = max(x/y, y/x) - 1
+    /// i.e. the price change from where the curve is and from where the operator last left it, plus
+    /// the growth of its depth. Each term is at least the matching log change, so the budget bounds
+    /// the operator's cumulative log path in price and in depth. An exactly proportional decrease
+    /// (no raise, price unchanged) is free and leaves the anchor where it was.
+    pub move_budget_bps: u16,
+    /// The budget refills linearly over this many epochs (and never above one full budget).
+    pub window_epochs: u64,
+    /// When an operator call raises either reserve, both reserves afterwards must be at most these.
+    pub max_reserve_a: Decimal,
+    pub max_reserve_b: Decimal,
+    /// When an operator call lowers a reserve, that reserve afterwards must be at least its floor
+    /// (so a stolen key cannot shrink the curve to dust; split audit L-1). At most the cap.
+    pub min_reserve_a: Decimal,
+    pub min_reserve_b: Decimal,
+    /// The operator may set the fee anywhere in [min_fee_bps, max_fee_bps]. A range of one value
+    /// (min == max, the default) gives it no fee power at all: the fee stays the owner's.
+    pub min_fee_bps: u16,
+    pub max_fee_bps: u16,
+}
 
 #[derive(ScryptoSbor, ScryptoEvent)]
 pub struct OwnerPoolSwapEvent {
@@ -48,6 +108,7 @@ pub struct OwnerPoolSwapEvent {
     pub reserve_b: Decimal,
 }
 
+/// Owner deposits into / withdrawals from the trading reserves.
 #[derive(ScryptoSbor, ScryptoEvent)]
 pub struct OwnerPoolLiquidityEvent {
     /// Positive when deposited, negative when withdrawn.
@@ -57,10 +118,54 @@ pub struct OwnerPoolLiquidityEvent {
     pub reserve_b: Decimal,
 }
 
+/// Owner deposits into / withdrawals from the inventory.
+#[derive(ScryptoSbor, ScryptoEvent)]
+pub struct OwnerPoolInventoryEvent {
+    /// Positive when deposited, negative when withdrawn.
+    pub amount_a: Decimal,
+    pub amount_b: Decimal,
+    pub inventory_a: Decimal,
+    pub inventory_b: Decimal,
+}
+
+/// A move between inventory and reserves, by the operator or the owner.
+#[derive(ScryptoSbor, ScryptoEvent)]
+pub struct OwnerPoolRebalanceEvent {
+    /// Positive: inventory to reserves. Negative: reserves to inventory.
+    pub amount_a: Decimal,
+    pub amount_b: Decimal,
+    pub reserve_a: Decimal,
+    pub reserve_b: Decimal,
+    pub inventory_a: Decimal,
+    pub inventory_b: Decimal,
+    /// Budget this move cost (zero for the owner, who has no budget).
+    pub cost: Decimal,
+    /// Operator budget available after the move, refill included (what `operator_status` reports).
+    pub allowance: Decimal,
+    pub by_owner: bool,
+}
+
 #[derive(ScryptoSbor, ScryptoEvent)]
 pub struct OwnerPoolConfigEvent {
     pub fee_bps: u16,
+    /// The owner's pause. Only the owner can set or clear it.
     pub paused: bool,
+    /// The operator's pause. The operator or the owner can set or clear it.
+    pub operator_paused: bool,
+}
+
+/// The owner stated a new anchor price: `anchor_b` of B for `anchor_a` of A. The operator's
+/// allowance is zero after it.
+#[derive(ScryptoSbor, ScryptoEvent)]
+pub struct OwnerPoolAnchorEvent {
+    pub anchor_a: Decimal,
+    pub anchor_b: Decimal,
+}
+
+#[derive(ScryptoSbor, ScryptoEvent)]
+pub struct OwnerPoolOperatorEvent {
+    pub operator: Option<ResourceAddress>,
+    pub limits: OperatorLimits,
 }
 
 fn floor_to(value: PreciseDecimal, divisibility: u8) -> Decimal {
@@ -84,22 +189,75 @@ fn fungible_divisibility(resource: ResourceAddress) -> u8 {
     }
 }
 
+const ATTO: u64 = 1_000_000_000_000_000_000;
+
+/// max(hi/lo) - 1 for two positive integers, in attos, rounded UP.
+fn ratio_excess_attos(x: I512, y: I512) -> I512 {
+    let (hi, lo) = if x >= y { (x, y) } else { (y, x) };
+    ((hi - lo) * I512::from(ATTO) + lo - I512::from(1)) / lo
+}
+
+/// d(P, P') for the price of reserves (ra, rb) versus (na, nb), all > 0, in attos, rounded up:
+/// max(r, 1/r) - 1 where r = (nb / na) / (rb / ra). Exact integer arithmetic (I512 on attos).
+fn price_distance_attos(ra: Decimal, rb: Decimal, na: Decimal, nb: Decimal) -> I512 {
+    ratio_excess_attos(I512::from(nb.attos()) * I512::from(ra.attos()), I512::from(rb.attos()) * I512::from(na.attos()))
+}
+
+/// max(0, k'/k - 1) / 2 for k = ra * rb, k' = na * nb, in attos, rounded up (>= ln of depth growth).
+fn depth_growth_attos(ra: Decimal, rb: Decimal, na: Decimal, nb: Decimal) -> I512 {
+    let k = I512::from(ra.attos()) * I512::from(rb.attos());
+    let k2 = I512::from(na.attos()) * I512::from(nb.attos());
+    if k2 <= k {
+        return I512::from(0);
+    }
+    ((k2 - k) * I512::from(ATTO) + I512::from(2) * k - I512::from(1)) / (I512::from(2) * k)
+}
+
+/// A Decimal from an attos amount known to fit (callers pass at most one budget, <= 1.0).
+fn attos_to_decimal(attos: I512) -> Decimal {
+    Decimal::from_attos(I192::from(i128::try_from(attos).expect("Amount out of range")))
+}
+
 #[blueprint]
-#[events(OwnerPoolSwapEvent, OwnerPoolLiquidityEvent, OwnerPoolConfigEvent)]
+#[events(
+    OwnerPoolSwapEvent,
+    OwnerPoolLiquidityEvent,
+    OwnerPoolInventoryEvent,
+    OwnerPoolRebalanceEvent,
+    OwnerPoolConfigEvent,
+    OwnerPoolOperatorEvent,
+    OwnerPoolAnchorEvent
+)]
 mod owner_pool {
     enable_method_auth! {
+        roles {
+            // Only the component itself can change this role, and only from `set_operator`, which
+            // the owner calls and which checks the badge. The owner cannot set it natively.
+            operator => updatable_by: [SELF];
+        },
         methods {
             swap => PUBLIC;
             swap_with_minimum => PUBLIC;
             quote => PUBLIC;
             reserves => PUBLIC;
+            inventory => PUBLIC;
             fee_bps => PUBLIC;
             is_paused => PUBLIC;
+            operator_status => PUBLIC;
             deposit => restrict_to: [OWNER];
             withdraw => restrict_to: [OWNER];
             withdraw_all => restrict_to: [OWNER];
+            deposit_inventory => restrict_to: [OWNER];
+            withdraw_inventory => restrict_to: [OWNER];
+            owner_rebalance => restrict_to: [OWNER];
             set_fee => restrict_to: [OWNER];
             set_paused => restrict_to: [OWNER];
+            set_operator => restrict_to: [OWNER];
+            set_operator_limits => restrict_to: [OWNER];
+            set_anchor => restrict_to: [OWNER];
+            rebalance => restrict_to: [operator];
+            operator_set_fee => restrict_to: [operator];
+            set_operator_paused => restrict_to: [OWNER, operator];
         }
     }
 
@@ -108,19 +266,36 @@ mod owner_pool {
         resource_b: ResourceAddress,
         divisibility_a: u8,
         divisibility_b: u8,
+        /// Trading reserves: the curve.
         vault_a: FungibleVault,
         vault_b: FungibleVault,
         fee_bps: u16,
         paused: bool,
+        operator_paused: bool,
+        /// Not part of the curve. Only the owner takes funds out; the operator can only move them
+        /// to and from the reserves.
+        inventory_a: FungibleVault,
+        inventory_b: FungibleVault,
+        owner_badge: ResourceAddress,
+        operator: Option<ResourceAddress>,
+        limits: OperatorLimits,
+        /// Operator budget left, as of `allowance_epoch`.
+        allowance: Decimal,
+        allowance_epoch: u64,
+        /// The anchor price, as a pair (A, B): `B` of token B for `A` of token A. Stated by the owner
+        /// (`set_operator`, `set_anchor`) or moved by a budgeted operator `rebalance` (to the reserves
+        /// it leaves). Nothing else moves it. (0, 0) until the owner states one.
+        anchor: (Decimal, Decimal),
     }
 
     impl OwnerPool {
-        /// An empty pool. Only `owner_badge` can fund it.
+        /// An empty pool with no operator. Only `owner_badge` can fund it.
         pub fn instantiate(resource_a: ResourceAddress, resource_b: ResourceAddress, fee_bps: u16, owner_badge: ResourceAddress) -> Global<OwnerPool> {
             Self::build(resource_a, resource_b, fee_bps, owner_badge, None)
         }
 
-        /// A pool funded in the same transaction, so nobody can touch it before the owner's price is set.
+        /// A pool funded in the same transaction, so nobody can touch it before the owner's price is
+        /// set. No operator; the owner adds one with `set_operator` and `set_operator_limits`.
         pub fn instantiate_with_liquidity(a: FungibleBucket, b: FungibleBucket, fee_bps: u16, owner_badge: ResourceAddress) -> Global<OwnerPool> {
             let (ra, rb) = (a.resource_address(), b.resource_address());
             Self::build(ra, rb, fee_bps, owner_badge, Some((a, b)))
@@ -148,9 +323,30 @@ mod owner_pool {
                 vault_b,
                 fee_bps,
                 paused: false,
+                operator_paused: false,
+                inventory_a: FungibleVault::new(resource_a),
+                inventory_b: FungibleVault::new(resource_b),
+                owner_badge,
+                operator: None,
+                limits: OperatorLimits {
+                    move_budget_bps: 0,
+                    window_epochs: 1,
+                    max_reserve_a: Decimal::ZERO,
+                    max_reserve_b: Decimal::ZERO,
+                    min_reserve_a: Decimal::MAX,
+                    min_reserve_b: Decimal::MAX,
+                    min_fee_bps: 0,
+                    max_fee_bps: 0,
+                },
+                allowance: Decimal::ZERO,
+                allowance_epoch: Runtime::current_epoch().number(),
+                anchor: (Decimal::ZERO, Decimal::ZERO),
             }
             .instantiate()
             .prepare_to_globalize(OwnerRole::Fixed(rule!(require(owner_badge))))
+            .roles(roles! {
+                operator => rule!(deny_all);
+            })
             .metadata(metadata! {
                 init {
                     "name" => "radix-dex owner pool", updatable;
@@ -161,23 +357,39 @@ mod owner_pool {
             .globalize()
         }
 
+        // ------------------------------------------------------------------ public reads
+
+        /// Trading reserves (the curve).
         pub fn reserves(&self) -> (Decimal, Decimal) {
             (self.vault_a.amount(), self.vault_b.amount())
+        }
+
+        /// Inventory: owned by the pool's owner, not traded.
+        pub fn inventory(&self) -> (Decimal, Decimal) {
+            (self.inventory_a.amount(), self.inventory_b.amount())
         }
 
         pub fn fee_bps(&self) -> u16 {
             self.fee_bps
         }
 
+        /// True while either the owner's or the operator's pause is on.
         pub fn is_paused(&self) -> bool {
-            self.paused
+            self.paused || self.operator_paused
         }
+
+        /// (operator badge, its limits, budget available now, operator pause flag, anchor reserves).
+        pub fn operator_status(&self) -> (Option<ResourceAddress>, OperatorLimits, Decimal, bool, (Decimal, Decimal)) {
+            (self.operator, self.limits, self.allowance_now(), self.operator_paused, self.anchor)
+        }
+
+        // ------------------------------------------------------------------ public trading
 
         /// What `swap` would pay for `input_amount` now. Fails wherever `swap` would fail: while
         /// paused ("Swaps are paused"), for an output of zero ("Trade too small"), and for an amount
         /// with more decimal places than the input token allows (no bucket can hold it).
         pub fn quote(&self, input_resource: ResourceAddress, input_amount: Decimal) -> Decimal {
-            assert!(!self.paused, "Swaps are paused");
+            assert!(!self.paused && !self.operator_paused, "Swaps are paused");
             let div_in = if input_resource == self.resource_a {
                 self.divisibility_a
             } else if input_resource == self.resource_b {
@@ -198,9 +410,10 @@ mod owner_pool {
             self.swap_with_minimum(input, Decimal::ZERO)
         }
 
-        /// Swap the whole bucket; fail unless at least `minimum` comes out.
+        /// Swap the whole bucket; fail unless at least `minimum` comes out. The input, fee included,
+        /// goes into the trading reserves.
         pub fn swap_with_minimum(&mut self, input: FungibleBucket, minimum: Decimal) -> FungibleBucket {
-            assert!(!self.paused, "Swaps are paused");
+            assert!(!self.paused && !self.operator_paused, "Swaps are paused");
             let input_resource = input.resource_address();
             let input_amount = input.amount();
             let output_amount = self.compute_swap(input_resource, input_amount);
@@ -231,11 +444,14 @@ mod owner_pool {
             output
         }
 
-        /// Owner: add either or both tokens, at any ratio. Changing the ratio moves the price;
-        /// that is how a market-making bot keeps the pool at the market.
+        // ------------------------------------------------------------------ owner: funds
+
+        /// Owner: add either or both tokens to the trading reserves, at any ratio. Changing the
+        /// ratio moves the price. Does NOT move the anchor: if this deposit reprices the curve, state
+        /// the new price with `set_anchor` in the same transaction. Check the curve's price against
+        /// the market first: depth added at a price someone moved with a swap is exposed to him.
         /// `expected`: if `Some((ra, rb))`, fail with "Reserves moved" unless the pool holds exactly
-        /// `ra` of A and `rb` of B before the deposit. A bot should always pass the reserves it
-        /// computed its amounts from; `None` skips the check.
+        /// `ra` of A and `rb` of B before the deposit. `None` skips the check.
         pub fn deposit(&mut self, a: Option<FungibleBucket>, b: Option<FungibleBucket>, expected: Option<(Decimal, Decimal)>) {
             self.check_reserves(expected);
             let (mut da, mut db) = (Decimal::ZERO, Decimal::ZERO);
@@ -252,38 +468,306 @@ mod owner_pool {
             self.liquidity_event(da, db);
         }
 
-        /// Owner: take out any amounts. Never paused, never locked.
+        /// Owner: take any amounts out of the trading reserves. Never paused, never locked.
         /// A zero amount does not touch its vault, so if a token's issuer freezes one vault the
         /// owner can still take the other token out.
-        /// `expected`: as for `deposit`, checked before anything is taken.
+        /// `expected`: as for `deposit`, checked before anything is taken. Does not move the anchor.
         pub fn withdraw(&mut self, amount_a: Decimal, amount_b: Decimal, expected: Option<(Decimal, Decimal)>) -> (FungibleBucket, FungibleBucket) {
             self.check_reserves(expected);
-            let take = |vault: &mut FungibleVault, resource: ResourceAddress, amount: Decimal| {
-                if amount == Decimal::ZERO { FungibleBucket::new(resource) } else { vault.take(amount) }
-            };
-            let out = (take(&mut self.vault_a, self.resource_a, amount_a), take(&mut self.vault_b, self.resource_b, amount_b));
+            let out = (
+                Self::take(&mut self.vault_a, self.resource_a, amount_a),
+                Self::take(&mut self.vault_b, self.resource_b, amount_b),
+            );
             self.liquidity_event(-amount_a, -amount_b);
             out
         }
 
-        /// Owner: take out everything. No reserves guard: emptying the pool sets no price, so a
-        /// trade landing just before it leaves nothing behind for anyone to trade against.
+        /// Owner: take out everything, reserves and inventory. No reserves guard: emptying the pool
+        /// sets no price, so a trade landing just before it leaves nothing behind to trade against.
+        /// FROZEN VAULTS: this touches every NON-EMPTY vault of the four (zero amounts skip their
+        /// vault), so if a token's issuer has withdraw-frozen a vault that still holds tokens, the
+        /// whole call fails. A failed vault take cannot be caught inside a transaction, so there is
+        /// no "take what you can" variant; take the rest per vault instead: `withdraw(0, x, None)`,
+        /// `withdraw(x, 0, None)`, `withdraw_inventory(0, x)`, `withdraw_inventory(x, 0)` (owner
+        /// pool audit I-6).
         pub fn withdraw_all(&mut self) -> (FungibleBucket, FungibleBucket) {
             let (a, b) = self.reserves();
-            self.withdraw(a, b, None)
+            let (mut out_a, mut out_b) = self.withdraw(a, b, None);
+            let (ia, ib) = self.inventory();
+            if ia > Decimal::ZERO || ib > Decimal::ZERO {
+                let (xa, xb) = self.withdraw_inventory(ia, ib);
+                out_a.put(xa);
+                out_b.put(xb);
+            }
+            (out_a, out_b)
         }
+
+        /// Owner: add either or both tokens to the inventory (not traded).
+        pub fn deposit_inventory(&mut self, a: Option<FungibleBucket>, b: Option<FungibleBucket>) {
+            let (mut da, mut db) = (Decimal::ZERO, Decimal::ZERO);
+            if let Some(a) = a {
+                assert!(a.resource_address() == self.resource_a, "Wrong token A");
+                da = a.amount();
+                self.inventory_a.put(a);
+            }
+            if let Some(b) = b {
+                assert!(b.resource_address() == self.resource_b, "Wrong token B");
+                db = b.amount();
+                self.inventory_b.put(b);
+            }
+            self.inventory_event(da, db);
+        }
+
+        /// Owner: take any amounts out of the inventory. Zero amounts do not touch their vault.
+        pub fn withdraw_inventory(&mut self, amount_a: Decimal, amount_b: Decimal) -> (FungibleBucket, FungibleBucket) {
+            let out = (
+                Self::take(&mut self.inventory_a, self.resource_a, amount_a),
+                Self::take(&mut self.inventory_b, self.resource_b, amount_b),
+            );
+            self.inventory_event(-amount_a, -amount_b);
+            out
+        }
+
+        /// Owner: move between inventory and reserves with no limits (see `rebalance`). Works while
+        /// paused. Does NOT move the anchor (see `deposit`).
+        pub fn owner_rebalance(&mut self, to_reserve_a: Decimal, to_reserve_b: Decimal, expected: Option<(Decimal, Decimal)>) {
+            self.move_inventory(to_reserve_a, to_reserve_b, expected, true);
+        }
+
+        // ------------------------------------------------------------------ owner: settings
 
         /// Owner: change the fee, within the cap fixed in code.
         pub fn set_fee(&mut self, fee_bps: u16) {
             assert!(fee_bps <= OWNER_POOL_MAX_FEE_BPS, "Fee too high");
             self.fee_bps = fee_bps;
-            Runtime::emit_event(OwnerPoolConfigEvent { fee_bps, paused: self.paused });
+            self.config_event();
         }
 
-        /// Owner: stop or restart swaps. Withdrawals are never paused.
+        /// Owner: stop or restart swaps. Withdrawals are never paused. The operator cannot clear
+        /// this pause (it has its own flag, which the owner can also clear).
         pub fn set_paused(&mut self, paused: bool) {
             self.paused = paused;
-            Runtime::emit_event(OwnerPoolConfigEvent { fee_bps: self.fee_bps, paused });
+            self.config_event();
+        }
+
+        /// Owner: appoint, replace (`Some(new)`) or revoke (`None`) the operator. Takes effect in
+        /// this transaction: the old badge loses every operator right at once. A new badge must be
+        /// proved in the caller's auth zone (so a typo cannot appoint a stranger), and must not be
+        /// the owner badge, XRD or a pool token.
+        /// `anchor`: the price the owner states, as (A, B) = "B of token B for A of token A", taken
+        /// from the MARKET, not from the curve. Required when appointing or replacing; optional when
+        /// revoking. Every call clears the operator's pause flag and sets its allowance to zero (a
+        /// new operator starts with nothing and refills over a window; a replacement does not inherit
+        /// what the old key left).
+        /// No call reopens swaps. A REVOKE (`None`) turns the OWNER's pause on, and so does any call
+        /// made while the operator's pause was on (e.g. replacing a key whose thief had paused):
+        /// behind a pause the curve may have been mispriced over several windows, so swaps stay
+        /// closed until the owner has checked or restored the curve (`owner_rebalance`, `set_anchor`)
+        /// and calls `set_paused(false)` (split audit 2, Low-1). Appointing or replacing while the
+        /// operator's pause is off leaves the owner's pause as it was.
+        pub fn set_operator(&mut self, badge: Option<ResourceAddress>, anchor: Option<(Decimal, Decimal)>) {
+            let rule = match badge {
+                Some(b) => {
+                    assert!(
+                        b != self.owner_badge && b != self.resource_a && b != self.resource_b && b != XRD,
+                        "Bad operator badge"
+                    );
+                    Runtime::assert_access_rule(rule!(require(b)));
+                    rule!(require(b))
+                }
+                None => rule!(deny_all),
+            };
+            if badge.is_some() {
+                assert!(anchor.is_some(), "State the anchor price");
+            }
+            Runtime::global_component().set_role("operator", rule);
+            self.operator = badge;
+            if badge.is_none() || self.operator_paused {
+                self.paused = true;
+            }
+            self.operator_paused = false;
+            self.zero_allowance();
+            if let Some((a, b)) = anchor {
+                self.state_anchor(a, b);
+            }
+            Runtime::emit_event(OwnerPoolOperatorEvent { operator: badge, limits: self.limits });
+            self.config_event();
+        }
+
+        /// Owner: state the anchor price, (A, B) = "B of token B for A of token A", e.g. (1, 0.05)
+        /// for 0.05 B per A. Take it from the MARKET, never from the curve's reserves (a swap can
+        /// set those). Sets the operator's allowance to zero; it refills normally from now.
+        /// `expected`: as for `deposit`, so the owner can tie the statement to the curve he saw.
+        pub fn set_anchor(&mut self, anchor_a: Decimal, anchor_b: Decimal, expected: Option<(Decimal, Decimal)>) {
+            self.check_reserves(expected);
+            self.state_anchor(anchor_a, anchor_b);
+        }
+
+        /// Owner: set what the operator may do (see `OperatorLimits`). Budget already accrued is
+        /// kept, but never more than the new budget.
+        pub fn set_operator_limits(
+            &mut self,
+            move_budget_bps: u16,
+            window_epochs: u64,
+            max_reserve_a: Decimal,
+            max_reserve_b: Decimal,
+            min_reserve_a: Decimal,
+            min_reserve_b: Decimal,
+            min_fee_bps: u16,
+            max_fee_bps: u16,
+        ) {
+            assert!(move_budget_bps <= OWNER_POOL_MAX_MOVE_BUDGET_BPS, "Budget too high");
+            assert!(window_epochs >= 1, "Window must be at least one epoch");
+            assert!(max_reserve_a >= Decimal::ZERO && max_reserve_b >= Decimal::ZERO, "Negative cap");
+            assert!(min_reserve_a >= Decimal::ZERO && min_reserve_b >= Decimal::ZERO, "Negative floor");
+            assert!(min_reserve_a <= max_reserve_a && min_reserve_b <= max_reserve_b, "Floor above cap");
+            assert!(min_fee_bps <= max_fee_bps && max_fee_bps <= OWNER_POOL_MAX_FEE_BPS, "Bad fee range");
+            self.refill();
+            self.limits = OperatorLimits { move_budget_bps, window_epochs, max_reserve_a, max_reserve_b, min_reserve_a, min_reserve_b, min_fee_bps, max_fee_bps };
+            self.allowance = self.allowance.min(Self::budget(&self.limits));
+            Runtime::emit_event(OwnerPoolOperatorEvent { operator: self.operator, limits: self.limits });
+        }
+
+        // ------------------------------------------------------------------ operator
+
+        /// Operator: move funds between inventory and reserves, inside the component. Positive
+        /// amounts go from inventory to reserves, negative from reserves to inventory. Nothing is
+        /// returned. Limits (owner-set): both reserves must be non-zero before and after; if either
+        /// reserve is raised, both must end at or below their caps; the move costs budget (see
+        /// `OperatorLimits::move_budget_bps`) and fails "Operator price-move limit" beyond it.
+        /// A lowered reserve must stay at or above its floor. Refused while the owner's pause is on.
+        /// Sets the anchor to the new price (unless it was a free proportional decrease).
+        /// `expected`: as for `deposit`.
+        pub fn rebalance(&mut self, to_reserve_a: Decimal, to_reserve_b: Decimal, expected: Option<(Decimal, Decimal)>) {
+            assert!(!self.paused, "Paused by the owner");
+            self.move_inventory(to_reserve_a, to_reserve_b, expected, false);
+        }
+
+        /// Operator: set the fee within the owner's range. Refused while the owner's pause is on, and
+        /// always when the range is a single value (the default): then the fee is the owner's alone,
+        /// and an operator cannot undo an owner `set_fee`.
+        pub fn operator_set_fee(&mut self, fee_bps: u16) {
+            assert!(!self.paused, "Paused by the owner");
+            assert!(self.limits.min_fee_bps < self.limits.max_fee_bps, "The operator may not change the fee");
+            assert!(fee_bps >= self.limits.min_fee_bps && fee_bps <= self.limits.max_fee_bps, "Fee outside the operator's range");
+            self.fee_bps = fee_bps;
+            self.config_event();
+        }
+
+        /// Operator or owner: the operator's own pause flag. Does not touch the owner's pause. Allowed
+        /// while the owner's pause is on (setting or clearing it then changes nothing that trades).
+        pub fn set_operator_paused(&mut self, paused: bool) {
+            self.operator_paused = paused;
+            self.config_event();
+        }
+
+        // ------------------------------------------------------------------ internals
+
+        fn take(vault: &mut FungibleVault, resource: ResourceAddress, amount: Decimal) -> FungibleBucket {
+            if amount == Decimal::ZERO { FungibleBucket::new(resource) } else { vault.take(amount) }
+        }
+
+        /// Signed move of one token between its inventory vault and its reserve vault.
+        fn shift(inventory: &mut FungibleVault, reserve: &mut FungibleVault, amount: Decimal) {
+            if amount > Decimal::ZERO {
+                reserve.put(inventory.take(amount));
+            } else if amount < Decimal::ZERO {
+                inventory.put(reserve.take(-amount));
+            }
+        }
+
+        fn move_inventory(&mut self, da: Decimal, db: Decimal, expected: Option<(Decimal, Decimal)>, by_owner: bool) {
+            self.check_reserves(expected);
+            let mut cost = Decimal::ZERO;
+            let mut move_anchor = !by_owner;
+            if !by_owner {
+                let (ra, rb) = self.reserves();
+                assert!(ra > Decimal::ZERO && rb > Decimal::ZERO, "Pool is empty");
+                let (na, nb) = (ra.checked_add(da).expect("Overflow"), rb.checked_add(db).expect("Overflow"));
+                assert!(na > Decimal::ZERO && nb > Decimal::ZERO, "Operator cannot empty a side");
+                let raises = da > Decimal::ZERO || db > Decimal::ZERO;
+                if raises {
+                    assert!(na <= self.limits.max_reserve_a && nb <= self.limits.max_reserve_b, "Above the operator's reserve cap");
+                }
+                if da < Decimal::ZERO {
+                    assert!(na >= self.limits.min_reserve_a, "Below the operator's reserve floor");
+                }
+                if db < Decimal::ZERO {
+                    assert!(nb >= self.limits.min_reserve_b, "Below the operator's reserve floor");
+                }
+                let from_current = price_distance_attos(ra, rb, na, nb);
+                if !raises && from_current == I512::from(0) {
+                    // Exactly proportional decrease: shrinks the curve at its price. Free; the
+                    // anchor stays, so a later regrow is still measured from it.
+                    move_anchor = false;
+                } else {
+                    let (aa, ab) = self.anchor;
+                    assert!(aa > Decimal::ZERO && ab > Decimal::ZERO, "No anchor price");
+                    let from_anchor = price_distance_attos(aa, ab, na, nb);
+                    let price = if from_current >= from_anchor { from_current } else { from_anchor };
+                    let total = price + depth_growth_attos(ra, rb, na, nb);
+                    self.refill();
+                    let have = I512::from(self.allowance.attos());
+                    assert!(total <= have, "Operator price-move limit");
+                    cost = attos_to_decimal(total);
+                    self.allowance = attos_to_decimal(have - total);
+                }
+            }
+            Self::shift(&mut self.inventory_a, &mut self.vault_a, da);
+            Self::shift(&mut self.inventory_b, &mut self.vault_b, db);
+            if move_anchor {
+                // Budgeted operator move: the anchor follows it (it moved at most `cost` from the
+                // old anchor, which the cost includes). Owner moves never touch the anchor.
+                self.anchor = self.reserves();
+            }
+            let (reserve_a, reserve_b) = self.reserves();
+            let (inventory_a, inventory_b) = self.inventory();
+            Runtime::emit_event(OwnerPoolRebalanceEvent {
+                amount_a: da,
+                amount_b: db,
+                reserve_a,
+                reserve_b,
+                inventory_a,
+                inventory_b,
+                cost,
+                // The allowance available now, as `operator_status` reports it (refill included; a
+                // free move or an owner move does not store the refill, split audit 2 Low-2).
+                allowance: self.allowance_now(),
+                by_owner,
+            });
+        }
+
+        fn budget(limits: &OperatorLimits) -> Decimal {
+            Decimal::from(limits.move_budget_bps) / Decimal::from(10_000u32)
+        }
+
+        /// Budget available now: what was left, plus budget * elapsed / window, at most one budget.
+        fn allowance_now(&self) -> Decimal {
+            let budget = Self::budget(&self.limits);
+            let elapsed = Runtime::current_epoch().number().saturating_sub(self.allowance_epoch);
+            if elapsed >= self.limits.window_epochs {
+                return budget;
+            }
+            let accrued = budget * Decimal::from(elapsed) / Decimal::from(self.limits.window_epochs);
+            self.allowance.checked_add(accrued).expect("Overflow").min(budget)
+        }
+
+        fn refill(&mut self) {
+            self.allowance = self.allowance_now();
+            self.allowance_epoch = Runtime::current_epoch().number();
+        }
+
+        /// The owner states an anchor: both parts positive; the allowance drops to zero.
+        fn state_anchor(&mut self, anchor_a: Decimal, anchor_b: Decimal) {
+            assert!(anchor_a > Decimal::ZERO && anchor_b > Decimal::ZERO, "Bad anchor");
+            self.anchor = (anchor_a, anchor_b);
+            self.zero_allowance();
+            Runtime::emit_event(OwnerPoolAnchorEvent { anchor_a, anchor_b });
+        }
+
+        fn zero_allowance(&mut self) {
+            self.allowance = Decimal::ZERO;
+            self.allowance_epoch = Runtime::current_epoch().number();
         }
 
         fn check_reserves(&self, expected: Option<(Decimal, Decimal)>) {
@@ -295,6 +779,15 @@ mod owner_pool {
         fn liquidity_event(&self, amount_a: Decimal, amount_b: Decimal) {
             let (reserve_a, reserve_b) = self.reserves();
             Runtime::emit_event(OwnerPoolLiquidityEvent { amount_a, amount_b, reserve_a, reserve_b });
+        }
+
+        fn inventory_event(&self, amount_a: Decimal, amount_b: Decimal) {
+            let (inventory_a, inventory_b) = self.inventory();
+            Runtime::emit_event(OwnerPoolInventoryEvent { amount_a, amount_b, inventory_a, inventory_b });
+        }
+
+        fn config_event(&self) {
+            Runtime::emit_event(OwnerPoolConfigEvent { fee_bps: self.fee_bps, paused: self.paused, operator_paused: self.operator_paused });
         }
 
         /// Output for an input, rounded down; the fee (rounded up) stays in the pool.
