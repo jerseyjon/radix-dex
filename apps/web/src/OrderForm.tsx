@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { type Depth, Decimal, bookPlaceManifest, limitOrderManifest, marketOrderManifest, newCancelSecret, orderKeyFromSecret, routePath } from '@radix-dex/core/browser';
 import { type MarketSummary, type QuoteResult, type ServerConfig, STATIC, api } from './api';
 import { estimate } from './book';
-import { cleanAmount, fmtAmount, fmtPrice } from './format';
+import { cleanAmount, fmtAmount, fmtPrice, venueName } from './format';
 import {
   type XrdCharges, bookContractPrice, bookOrderBelowMinimum, chargeAtFor, exceeds, limitTerms, minAfterXrdCharges, normaliseInput, numberToPlain, parsePlain, placesFor, placesIn,
   positivePlain, shareOf, toPlain, withSlippage, xrdCharges,
@@ -303,7 +303,7 @@ export function OrderForm(props: {
           {marketFees?.swappedXrd && <div><dt>Swapped</dt><dd>{fmtAmount(marketFees.swappedXrd.toNumber())} XRD</dd></div>}
           {marketFees
             ? <div title={`Network fee estimate + ${pct(config.feeBps)}, in XRD`}><dt>Fees ({feeWhere})</dt><dd>{feeText(marketFees)}</dd></div>
-            : <div><dt>Route</dt><dd>{quote ? quote.route.map((p) => p.venue).join(' → ') : '—'}</dd></div>}
+            : <div><dt>Route</dt><dd>{quote ? quote.route.map((p) => venueName(p.venue)).join(' → ') : '—'}</dd></div>}
           {viaSolver && !solverFills && <div><dt>Note</dt><dd className="warn">{NOT_FILLED}</dd></div>}
           <div><dt>Max slippage</dt><dd className="seg mini" role="group" aria-label="Maximum slippage">{SLIPPAGES.map((s) => <button key={s} className={s === slippage ? 'on' : ''} aria-pressed={s === slippage} onClick={() => setSlippage(s)}>{s}%</button>)}</dd></div>
         </dl>

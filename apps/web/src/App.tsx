@@ -4,7 +4,7 @@ import { type Candle, type MarketSummary, type MarketTrade, type OrderView, type
 import { Book } from './Book';
 import { Chart } from './Chart';
 import { DepthChart } from './DepthChart';
-import { fmtPrice, fmtTime, fmtUsd, shortAddr } from './format';
+import { fmtPrice, fmtTime, fmtUsd, shortAddr, venueName } from './format';
 import { Markets } from './Markets';
 import { OrderForm } from './OrderForm';
 import { Orders } from './Orders';
@@ -201,7 +201,7 @@ export function App() {
         <dl className="stats">
           <div><dt>Liquidity</dt><dd>{fmtUsd(market.tvlUsd)}</dd></div>
           <div><dt>24h volume</dt><dd>{fmtUsd(market.volume24hUsd)}</dd></div>
-          <div className="venues"><dt>Venues</dt><dd>{market.venues.join(', ') || 'orders only'}</dd></div>
+          <div className="venues"><dt>Venues</dt><dd>{market.venues.map(venueName).join(', ') || 'orders only'}</dd></div>
         </dl>
         <div className="right">
           <span className={`net ${config.network}`}><span className="dot" aria-hidden="true" />{config.network}</span>
