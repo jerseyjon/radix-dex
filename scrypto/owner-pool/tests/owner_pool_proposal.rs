@@ -114,6 +114,14 @@ impl World {
         let m = ManifestBuilder::new().lock_fee_from_faucet().call_method(pool, "reserves", manifest_args!()).build();
         self.ledger.execute_manifest(m, vec![]).expect_commit_success().output(1)
     }
+
+    /// The pool's trading-reserve vault for `r` (since the cold/hot split the component also holds
+    /// an inventory vault per token; these tests leave inventory empty, so it is the funded one).
+    fn reserve_vault(&mut self, pool: ComponentAddress, r: ResourceAddress) -> InternalAddress {
+        let vaults = self.ledger.get_component_vaults(pool, r);
+        let v = vaults.into_iter().find(|v| self.ledger.inspect_vault_balance(*v).unwrap_or_default() > Decimal::ZERO).expect("funded vault");
+        InternalAddress::new_or_panic(v.0)
+    }
 }
 
 #[test]
@@ -184,8 +192,8 @@ fn proposal_recall_does_not_brick_and_huge_supplies_do_not_overflow() {
     let rec = w.token_with(dec!(1_000_000), 18, roles);
     let usd = w.token(dec!(1_000_000), 6);
     let pool = w.pool(rec, dec!(10_000), usd, dec!(5_000), 30);
-    let vault = w.ledger.get_component_vaults(pool, rec)[0];
-    let m = ManifestBuilder::new().lock_fee_from_faucet().recall(InternalAddress::new_or_panic(vault.0), dec!(1))
+    let vault = w.reserve_vault(pool, rec);
+    let m = ManifestBuilder::new().lock_fee_from_faucet().recall(vault, dec!(1))
         .try_deposit_entire_worktop_or_abort(owner.account, None).build();
     w.ledger.execute_manifest(m, vec![]).expect_commit_success();
     w.swap(owner, pool, usd, dec!(10), None).expect_commit_success();
@@ -259,6 +267,7 @@ struct LiquidityEv {
 struct ConfigEv {
     fee_bps: u16,
     paused: bool,
+    operator_paused: bool,
 }
 
 impl World {
@@ -473,7 +482,7 @@ fn swap_both_directions_with_fee_exact_amounts() {
     // At the 5% cap.
     let r = w.set_fee(pool, MAX_FEE_BPS);
     let ev: Vec<ConfigEv> = w.events(&r, "OwnerPoolConfigEvent");
-    assert_eq!(ev, vec![ConfigEv { fee_bps: MAX_FEE_BPS, paused: false }]);
+    assert_eq!(ev, vec![ConfigEv { fee_bps: MAX_FEE_BPS, paused: false, operator_paused: false }]);
     let before = w.balance(other, usd);
     let r = w.swap(other, pool, xrd, dec!(100), None);
     let ev: Vec<SwapEv> = w.events(&r, "OwnerPoolSwapEvent");
@@ -517,7 +526,7 @@ fn fee_change_within_and_above_cap() {
     let owner = w.owner;
     let r = w.owner_call(owner, pool, "set_paused", manifest_args!(true));
     let ev: Vec<ConfigEv> = w.events(&r, "OwnerPoolConfigEvent");
-    assert_eq!(ev, vec![ConfigEv { fee_bps: MAX_FEE_BPS, paused: true }]);
+    assert_eq!(ev, vec![ConfigEv { fee_bps: MAX_FEE_BPS, paused: true, operator_paused: false }]);
 }
 
 /// `swap_with_minimum` at the exact boundary at the 5% fee, and that a failed minimum moves nothing.
@@ -774,8 +783,7 @@ fn freeze_of_one_vault_leaves_the_other_token_withdrawable() {
     let frz = w.token_with(dec!(1_000_000), 18, roles);
     let usd = w.token(dec!(1_000_000), 6);
     let pool = w.pool(frz, dec!(10_000), usd, dec!(5_000), 30);
-    let vault = w.ledger.get_component_vaults(pool, frz)[0];
-    let vault = InternalAddress::new_or_panic(vault.0);
+    let vault = w.reserve_vault(pool, frz);
     w.ledger.execute_manifest(ManifestBuilder::new().lock_fee_from_faucet().freeze_withdraw(vault).build(), vec![]).expect_commit_success();
     let before = w.balance(owner, usd);
     w.owner_call(owner, pool, "withdraw", manifest_args!(dec!(0), dec!(5_000), NO_GUARD)).expect_commit_success();

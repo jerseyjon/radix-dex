@@ -182,8 +182,12 @@ impl W {
             .collect()
     }
 
+    /// The trading-reserve vault for `r`. Since the cold/hot split the component also holds an
+    /// inventory vault per token; these tests leave inventory empty, so it is the funded one.
     fn vault(&mut self, pool: ComponentAddress, r: ResourceAddress) -> InternalAddress {
-        InternalAddress::new_or_panic(self.ledger.get_component_vaults(pool, r)[0].0)
+        let vaults = self.ledger.get_component_vaults(pool, r);
+        let v = vaults.into_iter().find(|v| self.ledger.inspect_vault_balance(*v).unwrap_or_default() > Decimal::ZERO).expect("funded vault");
+        InternalAddress::new_or_panic(v.0)
     }
 }
 
