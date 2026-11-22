@@ -91,6 +91,14 @@ export interface SolverIdentity {
   badge: string;
 }
 
+/**
+ * The last line before the solver sweeps the worktop into its account: the transaction fails unless
+ * nothing but XRD is left there. The solver earns and holds XRD only, so any other token left over
+ * (a pool handing back input, rounding change from the order book) stops the fill, in preview, for free.
+ */
+export const onlyXrdLeft = (xrd: string): string =>
+  `ASSERT_WORKTOP_RESOURCES_ONLY Map<Address, Enum>(${addr(xrd)} => Enum<2u8>(Decimal("0")));`;
+
 const head = (s: SolverIdentity, feeLockXrd: string) => [
   `CALL_METHOD ${addr(s.account)} "lock_fee" ${dec(feeLockXrd)};`,
   `CALL_METHOD ${addr(s.account)} "create_proof_of_amount" ${addr(s.badge)} Decimal("1");`,
@@ -156,19 +164,37 @@ export function crossFillManifest(o: { solver: SolverIdentity; feeLockXrd: strin
 
 /**
  * Root manifest that fills a taker order against resting orders and, for what is left, pools.
- * Each maker is paid `pay` of the token the taker sells. `poolIn` of that token goes through
- * `route`. The taker gets everything the makers sold plus what the pools returned, less
- * `solverTake`. Whatever remains (the makers' fees) goes to the solver.
+ * Each maker is paid `pay` of the token the taker sells; book orders are paid `pay` the same way.
+ * Everything of the sold token left after that goes through `route` (`poolIn` is what the plan
+ * expects to be there). The taker gets everything the makers sold plus what the pools returned.
+ *
+ * The solver's charges, `solverTake`, are XRD, taken where `chargeAt` says (see `ChargeAt`):
+ * out of the XRD the taker sells before anything else (`input`), out of the XRD it buys at the end
+ * (`proceeds`), or between the two swaps of a route through XRD (`hop`, pools only). Whatever is left
+ * at the end goes to the solver, and must be XRD alone or the transaction fails.
  */
 export function takeFillManifest(o: {
   solver: SolverIdentity; feeLockXrd: string; sell: string; buy: string; makerPays: string[]; poolIn: string; route: Pool[]; solverTake: string;
+  /** XRD's address on this network: the only token the solver may be left holding. */
+  xrd: string;
+  /** Where the charges are taken. Default `proceeds`, which needs the taker to buy XRD. */
+  chargeAt?: 'proceeds' | 'input' | 'hop';
   /** Purchases from the on-ledger order book, paid in the token the taker sells. */
   bookFills?: { book: string; id: number; pay: string }[];
   /** What the makers and the book must have delivered between them before the pool leg, or the transaction fails. */
   assertBought?: string;
 }): string {
+  const at = o.chargeAt ?? 'proceeds';
+  const take = new Decimal(o.solverTake);
+  if (at === 'proceeds' && o.buy !== o.xrd && take.gt(0)) throw new Error('charges from the proceeds need the taker to buy XRD');
+  if (at === 'input' && o.sell !== o.xrd) throw new Error('charges from the input need the taker to sell XRD');
+  const keep = (name: string) => [
+    `TAKE_FROM_WORKTOP ${addr(o.xrd)} ${dec(o.solverTake)} ${bucket(name)};`,
+    `CALL_METHOD ${addr(o.solver.account)} "deposit" ${bucket(name)};`,
+  ];
   const lines = [...head(o.solver, o.feeLockXrd), `YIELD_TO_CHILD NamedIntent("taker");`];
   o.makerPays.forEach((_, i) => lines.push(`YIELD_TO_CHILD NamedIntent("maker_${i}");`));
+  if (at === 'input' && take.gt(0)) lines.push(...keep('fee'));
   o.makerPays.forEach((pay, i) => lines.push(
     `TAKE_FROM_WORKTOP ${addr(o.sell)} ${dec(pay)} ${bucket(`pay_${i}`)};`,
     `YIELD_TO_CHILD NamedIntent("maker_${i}") ${bucket(`pay_${i}`)};`,
@@ -182,20 +208,24 @@ export function takeFillManifest(o: {
   });
   // If a book order was bought by someone else first, stop here rather than short-change the taker.
   if (o.assertBought && new Decimal(o.assertBought).gt(0)) lines.push(`ASSERT_WORKTOP_CONTAINS ${addr(o.buy)} ${dec(o.assertBought)};`);
-  if (o.route.length && new Decimal(o.poolIn).gt(0)) {
+  if (at === 'hop') {
+    // Pools only: sell → XRD, keep the charges, XRD → buy.
+    const path = routePath(o.route, o.sell);
+    if (o.route.length !== 2 || path[1] !== o.xrd || path[2] !== o.buy || o.makerPays.length || o.bookFills?.length) throw new Error('a hop fill needs a two-pool route through XRD and nothing else');
+    lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(o.sell)} ${bucket('in0')};`, ...routeInstructions([o.route[0]!], o.sell));
+    if (take.gt(0)) lines.push(...keep('fee'));
+    lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(o.xrd)} ${bucket('hop0')};`, ...routeInstructions([o.route[1]!], o.xrd, 'hop'));
+  } else if (o.route.length && new Decimal(o.poolIn).gt(0)) {
     const path = routePath(o.route, o.sell);
     if (path[path.length - 1] !== o.buy) throw new Error('route does not end in the bought token');
-    lines.push(`TAKE_FROM_WORKTOP ${addr(o.sell)} ${dec(o.poolIn)} ${bucket('in0')};`, ...routeInstructions(o.route, o.sell));
+    // All that is left of the sold token, including any change a book order handed back.
+    lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(o.sell)} ${bucket('in0')};`, ...routeInstructions(o.route, o.sell));
   }
-  if (new Decimal(o.solverTake).gt(0)) {
-    lines.push(
-      `TAKE_FROM_WORKTOP ${addr(o.buy)} ${dec(o.solverTake)} ${bucket('fee')};`,
-      `CALL_METHOD ${addr(o.solver.account)} "deposit" ${bucket('fee')};`,
-    );
-  }
+  if (at === 'proceeds' && take.gt(0)) lines.push(...keep('fee'));
   lines.push(
     `TAKE_ALL_FROM_WORKTOP ${addr(o.buy)} ${bucket('out')};`,
     `YIELD_TO_CHILD NamedIntent("taker") ${bucket('out')};`,
+    onlyXrdLeft(o.xrd),
     `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
   );
   return lines.join('\n');

@@ -5,7 +5,7 @@ import type { Gateway } from './gateway.ts';
 import { Decimal, addr, bucket, dec, isAccount, isResource } from './manifest.ts';
 import type { Pool } from './types.ts';
 import { routeInstructions, routePath } from './quote.ts';
-import type { SolverIdentity } from './orders.ts';
+import { type SolverIdentity, onlyXrdLeft } from './orders.ts';
 import { type OpenOrder, limitOf, payout } from './solver.ts';
 
 /** One order as the component holds it. Amounts are decimal strings. */
@@ -74,9 +74,10 @@ export function bookFillInstructions(book: string, id: number, payResource: stri
  * what it bought through pools. It fails unless at least `minBack` of the payment token comes
  * back, so the solver can lose the network fee but never the money it put in.
  */
-export function bookArbManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; id: number; payResource: string; pay: string; boughtResource: string; route: Pool[]; minBack: string }): string {
+export function bookArbManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; id: number; payResource: string; pay: string; boughtResource: string; route: Pool[]; minBack: string; xrd: string }): string {
   const path = routePath(o.route, o.boughtResource);
   if (path[path.length - 1] !== o.payResource) throw new Error('route does not return the payment token');
+  if (o.payResource !== o.xrd) throw new Error('the solver buys book orders with XRD only');
   return [
     `CALL_METHOD ${addr(o.solver.account)} "lock_fee" ${dec(o.feeLockXrd)};`,
     `CALL_METHOD ${addr(o.solver.account)} "withdraw" ${addr(o.payResource)} ${dec(o.pay)};`,
@@ -84,6 +85,7 @@ export function bookArbManifest(o: { solver: SolverIdentity; feeLockXrd: string;
     `TAKE_ALL_FROM_WORKTOP ${addr(o.boughtResource)} ${bucket('in0')};`,
     ...routeInstructions(o.route, o.boughtResource),
     `ASSERT_WORKTOP_CONTAINS ${addr(o.payResource)} ${dec(o.minBack)};`,
+    onlyXrdLeft(o.xrd),
     `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
   ].join('\n');
 }
@@ -143,12 +145,56 @@ export const bookOrderLive = (o: BookOrder, nowSec: number): boolean =>
 
 // ---------------------------------------------------------------- choosing what to take
 
+/**
+ * What `fill(id, payment)` does, by the contract's own sums (`order_book.rs`): tokens sold round
+ * down to the sold token's places and are capped at what remains; the cost rounds up; whatever of
+ * the payment the cost does not use is handed back as `change`. Undefined where the contract would
+ * refuse the payment as too small.
+ */
+export function bookFillOutcome(order: Pick<BookOrder, 'price' | 'remaining'>, payment: string | Decimal, soldDiv: number, paidDiv: number): { sold: Decimal; cost: Decimal; change: Decimal } | undefined {
+  const pay = new Decimal(payment);
+  const affordable = pay.div(order.price).toDecimalPlaces(soldDiv, Decimal.ROUND_DOWN);
+  const sold = Decimal.min(affordable, order.remaining);
+  if (!sold.gt(0)) return undefined;
+  const cost = sold.mul(order.price).toDecimalPlaces(paidDiv, Decimal.ROUND_UP);
+  if (!cost.gt(0) || cost.gt(pay)) return undefined;
+  return { sold, cost, change: pay.minus(cost) };
+}
+
+/**
+ * Two book orders the solver can cross with XRD alone, with no other token left over: it pays
+ * `pay` XRD into `first` (which sells token T for XRD), receives exactly `middle` of T, pays all of
+ * it into `second` (which sells XRD for T) and gets `back` XRD, with no change of T either side.
+ * Every figure is the contract's own sum (`bookFillOutcome`). Tries the largest amount first and
+ * then up to `tries` smaller ones a unit of T apart, as most amounts leave a unit of change;
+ * undefined if none works or the profit does not cover `gasXrd`.
+ */
+export function planBookCrossExact(first: BookOrder, second: BookOrder, xrd: string, floatXrd: string, gasXrd: string, divisibility: (resource: string) => number, tries = 300): { pay: string; middle: string; back: string } | undefined {
+  if (first.id === second.id || first.buy !== xrd || second.sell !== xrd || first.sell !== second.buy) return undefined;
+  const p1 = new Decimal(first.price), p2 = new Decimal(second.price);
+  if (!p1.mul(p2).lt(1)) return undefined;
+  const tDiv = divisibility(first.sell), xDiv = divisibility(xrd);
+  const unit = new Decimal(10).pow(-tDiv);
+  let m = Decimal.min(first.remaining, new Decimal(second.remaining).mul(p2), new Decimal(floatXrd).div(p1)).toDecimalPlaces(tDiv, Decimal.ROUND_DOWN);
+  for (let i = 0; i < tries && m.gt(0); i++, m = m.minus(unit)) {
+    const pay = m.mul(p1).toDecimalPlaces(xDiv, Decimal.ROUND_UP);
+    if (pay.gt(floatXrd)) continue;
+    const a = bookFillOutcome(first, pay, tDiv, xDiv);
+    if (!a || !a.sold.eq(m)) continue; // the solver must receive exactly m of T
+    const b = bookFillOutcome(second, m, xDiv, tDiv);
+    if (!b || !b.change.isZero()) continue; // and pass all of it on, with no change
+    if (!b.sold.minus(pay).gt(gasXrd)) return undefined; // smaller amounts only earn less
+    return { pay: pay.toFixed(), middle: m.toFixed(), back: b.sold.toFixed() };
+  }
+  return undefined;
+}
+
 /** One thing a taker takes, costing `cost` of the token it sells and giving `gives` of the token it buys. */
 export type LiquidityItem =
   /** A signed order held by the server: taken whole, paid `pay` (its price less the maker fee). */
   | { kind: 'order'; order: OpenOrder; cost: string; pay: string; gives: string }
-  /** An order in the on-ledger book: as much of it as the taker can pay for. */
-  | { kind: 'book'; order: BookOrder; cost: string; gives: string };
+  /** An order in the on-ledger book: as much of it as the taker can pay for. `change` is what the contract hands back of the payment. */
+  | { kind: 'book'; order: BookOrder; cost: string; gives: string; change: string };
 
 /**
  * What a taker could take from other traders, cheapest first, spending no more than it sells.
@@ -186,8 +232,11 @@ export function pickLiquidity(
       if (!gives.gt(0)) continue;
       const cost = gives.mul(c.unit).toDecimalPlaces(sellDiv, Decimal.ROUND_UP);
       if (cost.gt(left)) continue;
+      // What the contract really does with that payment: at least `gives`, perhaps with change.
+      const r = bookFillOutcome(c.book, cost, buyDiv, sellDiv);
+      if (!r) continue;
       left = left.minus(cost);
-      out.push({ kind: 'book', order: c.book, cost: cost.toFixed(), gives: gives.toFixed() });
+      out.push({ kind: 'book', order: c.book, cost: cost.toFixed(), gives: r.sold.toFixed(), change: r.change.toFixed() });
     }
   }
   return out;
@@ -245,7 +294,8 @@ export async function readBookEvents(gateway: Gateway, component: string, fromSt
  * `first`, passes everything that buys into `second`, and must get at least `minBack` of the
  * token it started with, or the transaction fails.
  */
-export function bookCrossManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; first: number; second: number; payResource: string; pay: string; middleResource: string; minBack: string }): string {
+export function bookCrossManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; first: number; second: number; payResource: string; pay: string; middleResource: string; minBack: string; xrd: string }): string {
+  if (o.payResource !== o.xrd) throw new Error('the solver crosses book orders with XRD only');
   return [
     `CALL_METHOD ${addr(o.solver.account)} "lock_fee" ${dec(o.feeLockXrd)};`,
     `CALL_METHOD ${addr(o.solver.account)} "withdraw" ${addr(o.payResource)} ${dec(o.pay)};`,
@@ -253,6 +303,7 @@ export function bookCrossManifest(o: { solver: SolverIdentity; feeLockXrd: strin
     `TAKE_ALL_FROM_WORKTOP ${addr(o.middleResource)} ${bucket('middle')};`,
     `CALL_METHOD ${addr(o.book)} "fill" ${u64(o.second)} ${bucket('middle')};`,
     `ASSERT_WORKTOP_CONTAINS ${addr(o.payResource)} ${dec(o.minBack)};`,
+    onlyXrdLeft(o.xrd),
     `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
   ].join('\n');
 }
@@ -280,8 +331,11 @@ export function planBookCross(first: BookOrder, second: BookOrder, float: string
  * The same trade as `bookArbManifest` for a solver that holds the token the order sells rather
  * than the one it wants: sell `sellIn` of it through pools first, pay everything that returns
  * into the order, and require at least `minBack` of the starting token at the end.
+ *
+ * Not used by the solver since 22 Nov 2026: the order book hands back rounding change in the token
+ * paid, which would leave the solver holding a token other than XRD (the final assertion then fails).
  */
-export function bookArbPoolFirstManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; id: number; startResource: string; sellIn: string; payResource: string; route: Pool[]; minBack: string }): string {
+export function bookArbPoolFirstManifest(o: { solver: SolverIdentity; feeLockXrd: string; book: string; id: number; startResource: string; sellIn: string; payResource: string; route: Pool[]; minBack: string; xrd: string }): string {
   const path = routePath(o.route, o.startResource);
   if (path[path.length - 1] !== o.payResource) throw new Error('route does not reach the payment token');
   return [
@@ -292,6 +346,7 @@ export function bookArbPoolFirstManifest(o: { solver: SolverIdentity; feeLockXrd
     `TAKE_ALL_FROM_WORKTOP ${addr(o.payResource)} ${bucket('pay')};`,
     `CALL_METHOD ${addr(o.book)} "fill" ${u64(o.id)} ${bucket('pay')};`,
     `ASSERT_WORKTOP_CONTAINS ${addr(o.startResource)} ${dec(o.minBack)};`,
+    onlyXrdLeft(o.xrd),
     `CALL_METHOD ${addr(o.solver.account)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
   ].join('\n');
 }

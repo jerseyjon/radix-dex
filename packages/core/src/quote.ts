@@ -17,13 +17,13 @@ export function routePath(route: Pool[], sell: string): string[] {
   return path;
 }
 
-/** Manifest lines that swap bucket `in0` along `route`, leaving the final token on the worktop. */
-export function routeInstructions(route: Pool[], sell: string): string[] {
+/** Manifest lines that swap bucket `<prefix>0` (default `in0`) along `route`, leaving the final token on the worktop. */
+export function routeInstructions(route: Pool[], sell: string, prefix = 'in'): string[] {
   const path = routePath(route, sell);
   const lines: string[] = [];
   route.forEach((pool, i) => {
-    lines.push(swapInstruction(pool, `in${i}`, path[i + 1]!));
-    if (i < route.length - 1) lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(path[i + 1]!)} ${bucket(`in${i + 1}`)};`);
+    lines.push(swapInstruction(pool, `${prefix}${i}`, path[i + 1]!));
+    if (i < route.length - 1) lines.push(`TAKE_ALL_FROM_WORKTOP ${addr(path[i + 1]!)} ${bucket(`${prefix}${i + 1}`)};`);
   });
   return lines;
 }

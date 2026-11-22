@@ -135,6 +135,22 @@ export class MarketData {
     return this.markets.some((m) => (m.base.address === a && m.quote.address === b) || (m.base.address === b && m.quote.address === a));
   }
 
+  /** A two-pool route from `sell` to `buy` through XRD among the listed pools (deepest pool on each side), if there is one. */
+  xrdRoute(sell: string, buy: string): Pool[] | undefined {
+    const xrd = this.config.network.xrd;
+    if (sell === xrd || buy === xrd) return undefined;
+    return this.quoter.candidateRoutes(this.pools, sell, buy, xrd).find((r) => r.length === 2);
+  }
+
+  /**
+   * Can the solver fill orders between these two tokens? It takes its charges in XRD, so the pair
+   * must have XRD on one side, or a route through XRD (a listed pool from each token to XRD).
+   */
+  solverCanFill(sell: string, buy: string): boolean {
+    const xrd = this.config.network.xrd;
+    return sell === xrd || buy === xrd || this.xrdRoute(sell, buy) !== undefined;
+  }
+
   private readonly xrdRates = new Map<string, { at: number; perXrd: Decimal | undefined }>();
 
   /**
@@ -159,6 +175,21 @@ export class MarketData {
   quote(sell: string, buy: string, amount: string): Promise<Quote | undefined> {
     return this.quoteCache.get(`${sell}|${buy}|${amount}`, () => this.quoter.best(this.pools, sell, buy, amount, this.config.network.xrd));
   }
+
+  /**
+   * For a pair without XRD: the quote along the route through XRD the solver uses, and how much XRD
+   * the first swap produces (the amount its service fee is charged on). Undefined if there is no such route.
+   */
+  hopQuote(sell: string, buy: string, amount: string): Promise<(Quote & { xrdBase: string }) | undefined> {
+    return this.hopCache.get(`${sell}|${buy}|${amount}`, async () => {
+      const route = this.xrdRoute(sell, buy);
+      if (!route) return undefined;
+      const [whole, leg1] = await Promise.all([this.quoter.simulate(route, sell, amount), this.quoter.simulate([route[0]!], sell, amount)]);
+      if (!whole || !leg1) return undefined;
+      return { ...whole, xrdBase: leg1.buyAmount };
+    });
+  }
+  private readonly hopCache = new TtlCache<(Quote & { xrdBase: string }) | undefined>(8_000);
 
   depth(market: Market): Promise<Depth> {
     return this.depthCache.get(market.id, async () => {
