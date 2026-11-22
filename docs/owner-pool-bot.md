@@ -388,6 +388,82 @@ the bot's (on-ledger venues, `--venues`, `--quote-size`; drift is checked only w
 
 What it flagged on the Stokenet history (replay, 22 Nov 2026): see "Soak test" below.
 
+## Markout: per-trade profit record (read only)
+
+Owner's decision, 22 Nov 2026. The question it answers: **does the fee pay for the trades the pool
+takes?** A trader who knows the price is about to move trades against the pool just before it does;
+the fee is what the pool earns, the move afterwards is what it loses. The record is kept by the
+WATCHER (`scripts/owner-pool-watch.ts`, on by default, `--markout <path>`, `--no-markout`), never by
+the bot: it is not in the trading path and holds no key. Maths in `packages/core/src/ownerpool-markout.ts`
+(pure, tested in `packages/core/test/ownerpool-markout.test.ts`); summary in `scripts/owner-pool-markout.ts`.
+
+- **Trades** come from the pool's own `OwnerPoolSwapEvent` (emitted by the pool component's Main
+  module; fields `input_resource`, `input_amount`, `output_resource`, `output_amount`, `fee` (in the
+  input token, kept by the pool), `reserve_a`, `reserve_b` after the swap). Each is recorded with its
+  txid, time, side (`sellA`: the trader sold XRD; `buyA`: bought XRD), amounts, trade price (B per A,
+  fee included), the fee level in force (read off the trade: fee / input, in bps), the fee in XRD, the
+  size in XRD, the pool's mid after the swap, and the **reference at trade time**: the watcher's own
+  on-ledger venue reference (the bot's code and options: fee rule, the guard that refuses any OwnerPool
+  as a venue), mapped onto the pool with the bot's `--scale` calibration. It is read on the watcher tick
+  that sees the trade, so up to one tick (60 s) after it (`lagSec` in the log).
+- **Marks** at +5 and +30 minutes (`--markout-horizons`): the reference again (and, as a second view,
+  the pool's own mid), taken on the first tick at or after the due time (`lateSec`, at most a tick).
+- **Signs** (everything in XRD, from the pool's side, at a price P in B per A):
+  `pnl(P) = inA - outB / P` for a trader selling XRD, `inB / P - outA` for one buying XRD;
+  `feeXRD` = the fee (XRD in) or fee / P0 (TEUR or hUSDC in, at the trade-time reference P0);
+  **markout = pnl(P) - feeXRD: NEGATIVE means the trader was right** (the price moved their way after
+  the trade); **profit = fee + markout**.
+- **Break-even fee** = -markout / volume, in bps (0 when the markout is not negative): the fee that
+  would have covered the markout, assuming the same trades would still have happened at that fee.
+- **Kept in** `data/owner-pool-markout.jsonl` (gitignored): one `trade` line per swap, one `mark` line
+  per horizon. Pending marks are worked out from the file itself (trades without their marks), so a
+  restart loses nothing: a mark that came due while the watcher was down is taken at the next tick, late
+  (its `lateSec` says by how much). The watcher's checkpoint (`state.next`) makes sure no swap is
+  missed; a fresh watcher state starts from "now", so swaps before the first start are not recorded.
+
+**Summary:**
+
+```
+npx tsx scripts/owner-pool-markout.ts            # table: all, by trade size, by fee level
+npx tsx scripts/owner-pool-markout.ts --trades   # plus one line per trade
+npx tsx scripts/owner-pool-markout.ts --json     # the same as JSON
+```
+
+Columns: trades, volume (XRD), fees (XRD), average fee (bps); then per horizon N: `nN` trades marked,
+`mkNm` total markout, `profitNm` = fees + markout of the marked trades, `beNm` break-even fee (bps),
+`mid-mkNm` the markout against the pool's own mid instead of the reference (a second view: the pool's
+mid is where the bot was moving it, so it is not independent of the reference). Rows: ALL, by trade
+size (0-10, 10-100, 100-1000, >=1000 XRD; `--sizes`), by fee level in force.
+
+**How to read it.** Profit after markout is what matters, not the fee income. If `profit30m` is
+positive over a meaningful number of trades, the fee is earning more than traders take; if it is
+negative, traders are picking the pool off and the fee is too low (or the bot too slow). **The owner
+should tighten (lower) the fee only while profit after markout stays positive** at the fee level being
+considered, and `be30m` is the floor below which the trades seen so far would have lost money. Look
+at the size split too: losses concentrated in large trades mean informed flow, which a wider fee for
+size (not available in the contract) or a slower bot does not cure. A handful of trades says nothing:
+the markout of one trade is mostly noise.
+
+**On Stokenet** the reference is the mainnet XRD/hUSDC price scaled onto the TEUR test pool, and the
+test swaps are made by our own test account, so the numbers test the plumbing only, not real profit.
+
+**Tried on Stokenet (22 Nov 2026, 23:14-23:46 UTC).** The watcher with the markout record running
+(`data/soak/watch5m*.log`), the bot stopped. Seven swaps by the test account alice
+(`tsx scripts/stokenet-owner-pool.ts trade <xrd|teur> <amount> --send`, each asserting the exact quote,
+which matched the ledger's): at fee 100, sell 50 XRD (`txid_tdx_2_1edzjc0ju…`), buy with 0.04 TEUR
+(`…1hstngjja…`), sell 300 XRD (`…1tu2ev6pd…`); the fee was then set to 30; at 30, buy with 0.25 TEUR
+(`…1l3g6xudu…`), sell 5 XRD (`…1n4rcj9k5…`), buy with 0.01 TEUR (`…1v09l9c2u…`), sell 20 XRD
+(`…17t96egqh…`). All seven were recorded on the watcher tick after them (2-58 s), with the fee level
+read off the trade (100 / 30 bps); the +5 marks came 2-57 s after due. **The watcher was stopped and
+restarted at 23:21 between the +5 and +30 marks; all seven +30 marks were still taken (23:44-23:45),
+nothing lost.** Between the marks the mainnet Ociswap precision pool (the only live venue) moved
+0.000824 -> 0.000791 -> 0.000801, so the +30 marks differ from the +5 ones. Summary
+(`data/soak/markout5-summary.txt`): 7 trades, 750 XRD volume, fees 5.05 XRD (67 bps average); +5 min
+markout -0.078 XRD, profit 4.97; +30 min markout +0.194, profit 5.24, break-even fee 0 overall (by
+fee level: the 100 bps trades -2.42 markout at +30, break-even 61 bps; the 30 bps trades +2.62). These
+are test trades against a scaled test reference: the figures prove the recording, the signs and the
+restart, nothing about profit.
+
 ## What it cannot do (owner only)
 
 - **Restate the anchor** (`set_anchor`), or appoint/replace/revoke the operator (`set_operator`).

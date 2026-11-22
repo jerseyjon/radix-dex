@@ -22,7 +22,8 @@ export type OwnerPoolEvent =
   | { name: 'OwnerPoolAnchorEvent'; anchorA: string; anchorB: string }
   | { name: 'OwnerPoolRebalanceEvent'; amountA: string; amountB: string; reserveA: string; reserveB: string; inventoryA: string; inventoryB: string; cost: string; allowance: string; byOwner: boolean }
   | { name: 'OwnerPoolConfigEvent'; feeBps: number; paused: boolean; operatorPaused: boolean }
-  | { name: 'OwnerPoolSwapEvent'; reserveA: string; reserveB: string }
+  /** `fee` is in the INPUT resource, kept by the pool; amounts as the contract emits them; reserves after the swap. */
+  | { name: 'OwnerPoolSwapEvent'; reserveA: string; reserveB: string; inputResource?: string; inputAmount?: string; outputResource?: string; outputAmount?: string; fee?: string }
   /** `limits`: the operator limits in force after the call (field name -> value as text), when the event carries them. */
   | { name: 'OwnerPoolOperatorEvent'; operator: string | null; limits?: Record<string, string> }
   | { name: 'OwnerPoolLiquidityEvent'; reserveA: string; reserveB: string }
@@ -68,8 +69,14 @@ export function parseOwnerPoolEvent(name: string, fields: any[]): OwnerPoolEvent
       if (!Number.isInteger(fee) || fee < 0) throw new Error('event field fee_bps is not a u16');
       return { name, feeBps: fee, paused: bool(fields, 'paused'), operatorPaused: bool(fields, 'operator_paused') };
     }
-    case 'OwnerPoolSwapEvent':
-      return { name, reserveA: str(fields, 'reserve_a'), reserveB: str(fields, 'reserve_b') };
+    case 'OwnerPoolSwapEvent': {
+      const res = (n: string) => { const v = fieldOf(fields, n)?.value; return typeof v === 'string' && v.startsWith('resource_') ? v : undefined; };
+      const opt = (n: string) => (fieldOf(fields, n) ? str(fields, n) : undefined);
+      return {
+        name, reserveA: str(fields, 'reserve_a'), reserveB: str(fields, 'reserve_b'),
+        inputResource: res('input_resource'), inputAmount: opt('input_amount'), outputResource: res('output_resource'), outputAmount: opt('output_amount'), fee: opt('fee'),
+      };
+    }
     case 'OwnerPoolLiquidityEvent':
       return { name, reserveA: str(fields, 'reserve_a'), reserveB: str(fields, 'reserve_b') };
     case 'OwnerPoolInventoryEvent':

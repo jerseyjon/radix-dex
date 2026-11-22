@@ -20,11 +20,14 @@
 //   --bot-state <path>       the bot's state file (default data/owner-pool-bot-state.json), read only, for the scale
 //   --alert-url <url>        (or env OWNER_POOL_BOT_ALERT_URL) POST short text alerts there; --alert-interval <s> (default 3600)
 //   --state <path>           the watcher's own checkpoint (default data/owner-pool-watch-state.json)
+//   --markout <path>         per-trade profit record (default data/owner-pool-markout.jsonl): every swap through the pool with
+//                            the reference at trade time, marked again at +5 and +30 min (--markout-horizons 5,30); --no-markout
+//                            to skip. Summary: tsx scripts/owner-pool-markout.ts. Read only, live mode only.
 //   --interval <s> --pool <component> --network stokenet
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import {
   AlertSink, Decimal, Gateway, NETWORKS, OWNER_POOL_BOT_DEFAULTS as BD, OWNER_POOL_PACKAGES, OWNER_POOL_WATCH_DEFAULTS as W, aggregateVenues, calibrateScale, limitsRecord,
-  driftFindings, findOwnerAnchor, lastOwnerAnchor, readOwnerPoolTransactions, readOwnerPools, watchTransaction,
+  driftFindings, dueMarks, findOwnerAnchor, markRecord, parseMarkoutLines, tradeFromSwap, tradeRecord, type MarkoutRef, lastOwnerAnchor, readOwnerPoolTransactions, readOwnerPools, watchTransaction,
   type NetworkName, type OwnerAnchorStatement, type WatchFinding, type WatchState,
 } from '../packages/core/src/index.ts';
 import { assertReferenceExcludesOwnerPools, makeVenues, readVenueSource } from './owner-pool-sources.ts';
@@ -67,6 +70,8 @@ const cfg = {
   alertIntervalSec: num('alert-interval', W.alertIntervalSec),
   statePath: opt('state') ?? 'data/owner-pool-watch-state.json',
   pool: opt('pool') ?? 'component_tdx_2_1cz95qapuv8wtewsjv7zdlvf2nuffjvqntt6yy8ynsva7xsfw0a24qk',
+  markoutPath: argv.includes('--no-markout') ? undefined : opt('markout') ?? 'data/owner-pool-markout.jsonl',
+  markoutHorizonsMin: (opt('markout-horizons') ?? '5,30').split(',').map(Number).filter((x) => x > 0),
 };
 
 const gw = new Gateway(NETWORKS[NETWORK]);
@@ -178,6 +183,30 @@ async function tick(): Promise<void> {
     }
   }
   const mapped = ref.ok && scale ? ref.price * scale : undefined;
+
+  // Markout (read only): record each swap with the reference now (the tick that saw it), and mark due trades.
+  let markoutLine: Record<string, unknown> | undefined;
+  if (cfg.markoutPath && !replaying) {
+    const refNow: MarkoutRef | null = mapped && ref.ok ? { price: mapped, raw: ref.price, scale: scale!, at: now } : null;
+    let trades = 0, marks = 0;
+    for (const t of r.txs) for (const ev of t.events) {
+      if (ev.name !== 'OwnerPoolSwapEvent') continue;
+      const tr = tradeFromSwap(t, ev, pool.resourceA, pool.resourceB);
+      if (!tr) continue;
+      const rec = tradeRecord(tr, refNow);
+      appendFileSync(cfg.markoutPath, JSON.stringify(rec) + '\n');
+      trades++;
+      log({ event: 'markout-trade', txid: tr.txid, side: tr.side, input: tr.inputAmount, output: tr.outputAmount, feeBps: tr.feeBps, feeA: rec.feeA, volumeA: rec.volumeA, tradePrice: tr.tradePrice, reference: refNow?.price ?? null, lagSec: Math.round((now - tr.at) / 1000) });
+    }
+    const records = existsSync(cfg.markoutPath) ? parseMarkoutLines(readFileSync(cfg.markoutPath, 'utf8')) : [];
+    for (const d of dueMarks(records, now, cfg.markoutHorizonsMin)) {
+      const m = markRecord(d.trade, d.horizonMin, now, refNow, price);
+      appendFileSync(cfg.markoutPath, JSON.stringify(m) + '\n');
+      marks++;
+      log({ event: 'markout-mark', txid: d.trade.txid, horizonMin: d.horizonMin, lateSec: m.lateSec, markoutA: m.atRef?.markout ?? null, profitA: m.atRef ? d.trade.feeA + m.atRef.markout : null, atPoolMid: m.atPoolMid?.markout ?? null });
+    }
+    if (trades || marks) markoutLine = { trades, marks };
+  }
   if (mapped) {
     const drift = driftFindings({ reference: mapped, poolPrice: price, ownerAnchor: state.ownerAnchor?.anchor, maxAnchorDrift: cfg.maxAnchorDrift, maxPoolDrift: cfg.maxPoolDrift });
     const before = new Set(state.drifting ?? []);
@@ -199,6 +228,7 @@ async function tick(): Promise<void> {
     reference: ref.ok ? { price: ref.price, mapped, scale, scaleFrom, disagreement: Math.round(ref.disagreement * 1e5) / 1e5 } : { ok: false, reason: ref.reason },
     botLog: bl ? { txids: bl.txids.size, since: bl.since ? new Date(bl.since).toISOString() : null } : 'none: operator actions not compared',
     spend24h: state.watch.spends.reduce((a, x) => a + x.cost, 0),
+    ...(markoutLine ? { markout: markoutLine } : {}),
   });
 }
 

@@ -29,6 +29,7 @@
 //             account; the pool quotes again.
 //   quotes    compare the ledger's `quote` (by preview) with the TypeScript copy, many sizes both ways.
 //   gas       measure the preview fee of withdraw + swap_with_minimum + deposit_batch.
+//   trade <xrd|teur> <amount>   a test swap by alice (not the owner or operator), asserting the exact quote: for the markout record.
 //   builders  the builders the bot needs, on ledger: operator_set_fee 40 then 30 and set_operator_paused
 //             true then false (operator key, sent with --send); set_anchor and withdraw_inventory (owner,
 //             preview only), plus their refusals with the operator badge.
@@ -610,6 +611,28 @@ if (step === 'builders') {
   await run('withdraw_inventory 1 XRD + 0.000001 TEUR (owner, preview only)', ownerPoolWithdrawInventoryManifest({ pool: state.pool, owner: ownerSigner(), feeLockXrd: '20', amountA: '1', amountB: '0.000001' }), ownerKey, { previewOnly: true });
   await run('withdraw_inventory with the operator badge (must be refused)', ownerPoolWithdrawInventoryManifest({ pool: state.pool, owner: op, feeLockXrd: '10', amountA: '1', amountB: '0', to: operator }), operatorKey, { fail: /Unauthorized|AssertAccessRuleFailed|auth/i, previewOnly: true });
   show(await pool());
+}
+
+if (step === 'trade') {
+  // A test swap by alice (NOT the owner or the operator), for the markout record: trade <xrd|teur> <amount> [--send].
+  // The amount out is asserted at exactly the local quote, which must equal the ledger's.
+  const side = String(args[1] ?? '').toLowerCase(), amount = String(args[2] ?? '');
+  if (!['xrd', 'teur'].includes(side) || !(Number(amount) > 0)) throw new Error('usage: trade <xrd|teur> <amount> [--send]');
+  const [sell, buy] = side === 'xrd' ? [XRD, state.teur] : [state.teur, XRD];
+  const q = await pool();
+  const want = ownerPoolQuote(q, sell, amount);
+  const ledger = await ledgerQuote(sell, amount);
+  console.log(`trade: alice sells ${amount} ${side.toUpperCase()}; pool fee ${q.feeBps} bps; local quote ${want}, ledger quote ${ledger.ok ? ledger.out : 'FAILED ' + ledger.error}`);
+  if (!ledger.ok || ledger.out !== want) throw new Error('quote mismatch');
+  const r = await run(`alice sells ${amount} ${side.toUpperCase()}`, [
+    lockFee(alice),
+    `CALL_METHOD ${addr(alice)} "withdraw" ${addr(sell)} Decimal("${amount}");`,
+    `TAKE_ALL_FROM_WORKTOP ${addr(sell)} Bucket("in");`,
+    `CALL_METHOD ${addr(state.pool)} "swap" Bucket("in");`,
+    `ASSERT_WORKTOP_CONTAINS ${addr(buy)} ${dec(want)};`,
+    `CALL_METHOD ${addr(alice)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
+  ].join('\n'), aliceKey);
+  if (r.txid) { state.markoutTrades ??= []; state.markoutTrades.push({ at: new Date().toISOString(), sell: side, amount, out: want, txid: r.txid }); save(); }
 }
 
 if (step === 'status') {
