@@ -1,8 +1,9 @@
-//! Independent audit of the cold/hot split (branch `pool-split`, bd574a4 + 668f660). Each test PASSES
-//! when the behaviour it documents is present in the blueprint: a test named `*_attack_*` passing
-//! means the attack WORKS against the current code (invert it once the blueprint is fixed).
-//! Findings: M-1 owner reserve calls re-anchor at the thief's price (two tests); L-1 free dust
-//! shrink only the owner can undo; informational items; budget refill edge cases.
+//! Independent audit of the cold/hot split (branch `pool-split`, bd574a4 + 668f660), INVERTED after
+//! the fixes: each `*_attack_*` / `l1_*` / `informational_*` test now passes only when the attack is
+//! refused, or gains no more than the design document's bound. Findings: M-1 owner reserve calls
+//! re-anchored at the thief's price (fixed: owner calls never move the anchor; the owner states it);
+//! L-1 free dust shrink (fixed: owner-set reserve floors); informational items (fixed); budget refill
+//! edge cases. New: owner-stated off-market anchor (the residual D term) and `set_anchor`.
 
 use scrypto_test::prelude::*;
 
@@ -20,8 +21,23 @@ struct Limits {
     window_epochs: u64,
     max_reserve_a: Decimal,
     max_reserve_b: Decimal,
+    min_reserve_a: Decimal,
+    min_reserve_b: Decimal,
     min_fee_bps: u16,
     max_fee_bps: u16,
+}
+
+#[derive(ScryptoSbor, Debug, Clone, PartialEq)]
+struct AnchorEv {
+    anchor_a: Decimal,
+    anchor_b: Decimal,
+}
+
+#[derive(ScryptoSbor, Debug, Clone, PartialEq)]
+struct ConfigEv {
+    fee_bps: u16,
+    paused: bool,
+    operator_paused: bool,
 }
 
 #[derive(ScryptoSbor, Debug, Clone, PartialEq)]
@@ -137,19 +153,48 @@ impl W {
         self.run(&[bot], m)
     }
 
+    /// Owner appoints `badge` (held by `holder`), stating the market price 1 B per A as the anchor.
     fn appoint(&mut self, pool: ComponentAddress, holder: Actor, badge: ResourceAddress) -> TransactionReceipt {
+        self.appoint_at(pool, holder, badge, (dec!(1), dec!(1)))
+    }
+
+    fn appoint_at(&mut self, pool: ComponentAddress, holder: Actor, badge: ResourceAddress, anchor: (Decimal, Decimal)) -> TransactionReceipt {
         let (o, ob) = (self.owner, self.badge);
         let m = ManifestBuilder::new().lock_fee_from_faucet()
             .create_proof_from_account_of_amount(o.account, ob, dec!(1))
             .create_proof_from_account_of_amount(holder.account, badge, dec!(1))
-            .call_method(pool, "set_operator", manifest_args!(Some(badge)))
+            .call_method(pool, "set_operator", manifest_args!(Some(badge), Some(anchor)))
             .build();
         self.run(&[o, holder], m)
     }
 
+    /// Limits with reserve floors 0 (the thief may shrink to anything above empty: worst case).
     #[allow(clippy::too_many_arguments)]
     fn set_limits(&mut self, pool: ComponentAddress, budget_bps: u16, window: u64, cap_a: Decimal, cap_b: Decimal, min_fee: u16, max_fee: u16) -> TransactionReceipt {
-        self.as_owner(pool, "set_operator_limits", manifest_args!(budget_bps, window, cap_a, cap_b, min_fee, max_fee))
+        self.set_limits_floor(pool, budget_bps, window, cap_a, cap_b, dec!(0), dec!(0), min_fee, max_fee)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_limits_floor(&mut self, pool: ComponentAddress, budget_bps: u16, window: u64, cap_a: Decimal, cap_b: Decimal, floor_a: Decimal, floor_b: Decimal, min_fee: u16, max_fee: u16) -> TransactionReceipt {
+        self.as_owner(pool, "set_operator_limits", manifest_args!(budget_bps, window, cap_a, cap_b, floor_a, floor_b, min_fee, max_fee))
+    }
+
+    fn set_anchor(&mut self, pool: ComponentAddress, a: Decimal, b: Decimal, guard: Option<(Decimal, Decimal)>) -> TransactionReceipt {
+        self.as_owner(pool, "set_anchor", manifest_args!(a, b, guard))
+    }
+
+    /// Owner deposits into the reserves (either side optional), with an optional guard.
+    fn owner_deposit(&mut self, pool: ComponentAddress, xa: Decimal, xb: Decimal, guard: Option<(Decimal, Decimal)>) -> TransactionReceipt {
+        let (o, badge, a, b) = (self.owner, self.badge, self.a, self.b);
+        let mut m = ManifestBuilder::new().lock_fee_from_faucet().create_proof_from_account_of_amount(o.account, badge, dec!(1));
+        if xa > Decimal::ZERO { m = m.withdraw_from_account(o.account, a, xa).take_all_from_worktop(a, "a"); }
+        if xb > Decimal::ZERO { m = m.withdraw_from_account(o.account, b, xb).take_all_from_worktop(b, "b"); }
+        let m = m.call_method_with_name_lookup(pool, "deposit", |l| (
+            if xa > Decimal::ZERO { Some(l.bucket("a")) } else { None },
+            if xb > Decimal::ZERO { Some(l.bucket("b")) } else { None },
+            guard,
+        )).build();
+        self.run(&[o], m)
     }
 
     fn fund_inventory(&mut self, pool: ComponentAddress, xa: Decimal, xb: Decimal) -> TransactionReceipt {
@@ -238,6 +283,16 @@ fn design_bound(c: f64, d0: f64) -> f64 {
     20_000.0 * c * psi(d0 + 2.0 * c)
 }
 
+/// Sell A for B until the pool price (B per A) is `p_star`.
+fn arb_to_sell_a(w: &mut W, pool: ComponentAddress, p_star: f64) {
+    let (ra, rb) = w.reserves(pool);
+    let (fa, fb) = (f(ra), f(rb));
+    assert!(fb / fa > p_star);
+    let x = dec_floor((fa * fb / p_star).sqrt() - fa, 6);
+    let (bot, a) = (w.bot, w.a);
+    w.swap(bot, pool, a, x).expect_commit_success();
+}
+
 /// Buy A with B until the pool price (B per A) is `p_star`.
 fn arb_to_buy_a(w: &mut W, pool: ComponentAddress, p_star: f64) {
     let (ra, rb) = w.reserves(pool);
@@ -262,177 +317,219 @@ fn setup(w: &mut W) -> ComponentAddress {
 
 // ============================================================================ finding M-1
 
-/// ANY owner call that touches the reserves (`deposit`, `withdraw`, `owner_rebalance`) resets the
-/// anchor to the curve's CURRENT price, and the curve's current price is whatever the last swap left
-/// it at, i.e. whatever the thief's own swap set. The design's bound assumes "the anchor moves only by
-/// budgeted calls"; this breaks it.
-///
-/// 1. operator: free proportional shrink 18k/18k -> 4,564/4,564;
-/// 2. thief: sells A with his own capital until A is at 1/16 B (X = ln 16 from the market);
-/// 3. owner: reads the reserves and withdraws 1 B with the reserves guard (any reserve-touching owner
-///    call works, guarded or not: the guard checks the reserves the owner just read);
-/// 4. operator: regrows the curve by sqrt(1.199) AT the 1/16 price: costs only depth growth (~0.0995);
-/// 5. thief: buys A back to the market price.
-/// Without step 3, step 4 is refused (checked). With it, the thief nets ~ (L' - L) * 4 sinh^2(X/4).
-#[test]
-fn m1_attack_owner_call_resets_anchor_to_thief_price() {
-    let mut w = W::new();
-    let pool = setup(&mut w);
-    let (bot, a, b) = (w.bot, w.a, w.b);
-    let owner_total0 = w.total(pool);
-    let v0 = thief_value(&mut w, 1.0);
-
-    // 1. free shrink
-    w.rebalance(pool, dec!(-13_436), dec!(-13_436)).expect_commit_success();
-    assert_eq!(w.reserves(pool), (dec!(4_564), dec!(4_564)));
-    // 2. thief's own swap: A to 1/16 B
-    w.swap(bot, pool, a, dec!(13_692)).expect_commit_success();
+/// Exact (free) proportional shrink to L ~ `target_l`: first one tiny swap of the thief's own A makes
+/// both reserves multiples of 2^12 attos (searched off ledger, replicating compute_swap at fee 0),
+/// then the shrink is by exactly m / 2^12. The auditor's construction.
+fn exact_shrink(w: &mut W, pool: ComponentAddress, target_l: f64) {
+    let (bot, a) = (w.bot, w.a);
     let (ra, rb) = w.reserves(pool);
-    println!("M-1: curve price after the thief's swap {:.6} B per A", f(rb) / f(ra));
-
-    let regrow = |w: &mut W| -> (Decimal, Decimal) {
-        let (ra, rb) = w.reserves(pool);
-        let m = dec!("1.094988"); // sqrt(1.199) rounded down: depth cost ~0.0995
-        ((ra * (m - dec!(1))).checked_round(6, RoundingMode::ToZero).unwrap(), (rb * (m - dec!(1))).checked_round(6, RoundingMode::ToZero).unwrap())
-    };
-    // Control: without an owner call, the regrow is measured from the old anchor (1.0) and refused.
-    let (da, db) = regrow(&mut w);
-    w.rebalance(pool, da, db).expect_commit_failure_containing_error("Operator price-move limit");
-
-    // 3. the owner takes 1 B of profit, guarded by the reserves he just read
-    let (ra, rb) = w.reserves(pool);
-    w.as_owner(pool, "withdraw", manifest_args!(dec!(0), dec!(1), Some((ra, rb)))).expect_commit_success();
-    let anchor = w.status(pool).4;
-    println!("M-1: anchor after the owner's withdraw {:?} (price {:.6})", anchor, f(anchor.1) / f(anchor.0));
-
-    // 4. regrow at the thief's price
-    let (da, db) = regrow(&mut w);
-    let r = w.rebalance(pool, da, db);
+    let q = I192::from(4096);
+    let base = Decimal::from(f(ra).ceil() as u64 + 1);
+    let mut found = None;
+    for j in 0..200_000u64 {
+        let ra2 = base + Decimal::from_attos(I192::from(j) * q * I192::from(1_000_000_007i64));
+        let x = ra2 - ra;
+        let eff = PreciseDecimal::from(x);
+        let share = eff.checked_div(PreciseDecimal::from(ra) + eff).unwrap();
+        let out = Decimal::try_from((PreciseDecimal::from(rb) * share).checked_round(18, RoundingMode::ToNegativeInfinity).unwrap()).unwrap();
+        let rb2 = rb - out;
+        if rb2.attos() % q == I192::from(0) {
+            found = Some((x, ra2, rb2));
+            break;
+        }
+    }
+    let (x, ra2, rb2) = found.expect("no aligning swap found");
+    w.swap(bot, pool, a, x).expect_commit_success();
+    assert_eq!(w.reserves(pool), (ra2, rb2));
+    let m = I192::from((4096.0 * target_l / (f(ra2) * f(rb2)).sqrt()) as i64);
+    let na = Decimal::from_attos(ra2.attos() / q * m);
+    let nb = Decimal::from_attos(rb2.attos() / q * m);
+    let r = w.rebalance(pool, na - ra2, nb - rb2);
     let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-    let cost = f(ev[0].cost);
-    println!("M-1: regrow at the thief's price accepted, cost {}, reserves ({}, {})", ev[0].cost, ev[0].reserve_a, ev[0].reserve_b);
-    assert!(cost <= 0.1);
-
-    // 5. back to market
-    arb_to_buy_a(&mut w, pool, 1.0);
-    let gain = thief_value(&mut w, 1.0) - v0;
-    let (ta, tb) = w.total(pool);
-    let owner_loss = f(owner_total0.0) + f(owner_total0.1) - f(ta) - f(tb) - 1.0; // the owner took 1 B
-    let bound = design_bound(cost, 0.0);
-    println!("M-1: thief gain {gain:.4}, owner loss {owner_loss:.4}; design bound at C = {cost:.4}, D = 0: {bound:.4}; author's measured A: 20.57");
-    assert!((gain - owner_loss).abs() < 1e-3, "zero-sum at fee 0");
-    assert!(gain > 3.0 * bound, "the attack beats the design bound by more than 3x");
-    let _ = b;
+    assert_eq!(ev[0].cost, dec!(0), "exactly proportional shrink is free");
 }
 
-/// Worse: the reset anchor STAYS at the thief's price (only budgeted calls move it, and the regrow
-/// itself re-anchors there). After ONE owner call, the thief repeats the attack every window with no
-/// further owner action: swap the curve back to the anchor price with his own capital, shrink to fit
-/// the caps (near-proportional, ~free because P ~ A), regrow (depth cost only), sell back to market.
+/// Regrow the curve by the factor 1.094988 (depth cost ~0.0995), amounts rounded down to 6 places.
+fn regrow_amounts(w: &mut W, pool: ComponentAddress, m: Decimal) -> (Decimal, Decimal) {
+    let (ra, rb) = w.reserves(pool);
+    ((ra * (m - dec!(1))).checked_round(6, RoundingMode::ToZero).unwrap(), (rb * (m - dec!(1))).checked_round(6, RoundingMode::ToZero).unwrap())
+}
+
+/// M-1 (FIXED). Before the fix ANY owner call that touched the reserves (`deposit`, `withdraw`,
+/// `owner_rebalance`) re-anchored at the curve's CURRENT price, which the thief had just set with his
+/// own swap; the operator then regrew the curve at that price paying only the depth term (978.7
+/// gained in one window on this setup, against a design bound of ~218).
+/// Now none of those calls moves the anchor: it stays at the price the owner stated (1 B per A), the
+/// regrow at the thief's price (1/16) is measured from it and refused, in this window and later
+/// ones, and the thief can only take back his own trade, at a loss.
 #[test]
-fn m1_attack_repeats_every_window_after_one_owner_call() {
+fn m1_attack_owner_call_resets_anchor_to_thief_price_is_refused() {
     let mut w = W::new();
     let pool = setup(&mut w);
     let (bot, a) = (w.bot, w.a);
     let v0 = thief_value(&mut w, 1.0);
+    let anchor0 = w.status(pool).4;
+    assert_eq!(anchor0, (dec!(1), dec!(1)), "the anchor the owner stated at appointment");
+    let m = dec!("1.094988");
+
+    // 1. free shrink; 2. the thief's own swap: A to 1/16 B
+    w.rebalance(pool, dec!(-13_436), dec!(-13_436)).expect_commit_success();
+    w.swap(bot, pool, a, dec!(13_692)).expect_commit_success();
+    let (ra, rb) = w.reserves(pool);
+    println!("M-1: curve price after the thief's swap {:.6} B per A", f(rb) / f(ra));
+    let (da, db) = regrow_amounts(&mut w, pool, m);
+    w.rebalance(pool, da, db).expect_commit_failure_containing_error("Operator price-move limit");
+
+    // 3. every reserve-touching owner call, each guarded by the reserves just read: none moves the
+    //    anchor. (Removals and a B deposit only: they cannot help the thief, so the test isolates the
+    //    anchor.)
+    let (ra, rb) = w.reserves(pool);
+    w.as_owner(pool, "withdraw", manifest_args!(dec!(0), dec!(1), Some((ra, rb)))).expect_commit_success();
+    assert_eq!(w.status(pool).4, anchor0);
+    let (ra, rb) = w.reserves(pool);
+    w.owner_deposit(pool, dec!(0), dec!(1), Some((ra, rb))).expect_commit_success();
+    assert_eq!(w.status(pool).4, anchor0);
+    let (ra, rb) = w.reserves(pool);
+    w.as_owner(pool, "owner_rebalance", manifest_args!(dec!(-1), dec!(0), Some((ra, rb)))).expect_commit_success();
+    assert_eq!(w.status(pool).4, anchor0);
+    w.as_owner(pool, "withdraw", manifest_args!(dec!(1), dec!(0), NO_GUARD)).expect_commit_success();
+    assert_eq!(w.status(pool).4, anchor0);
+
+    // 4. regrow at the thief's price: refused now and after any number of refills. Even a 0.01%
+    //    regrow costs the distance (~15x) from the anchor.
+    for _ in 0..3 {
+        let (da, db) = regrow_amounts(&mut w, pool, m);
+        w.rebalance(pool, da, db).expect_commit_failure_containing_error("Operator price-move limit");
+        let (da, db) = regrow_amounts(&mut w, pool, dec!("1.0001"));
+        w.rebalance(pool, da, db).expect_commit_failure_containing_error("Operator price-move limit");
+        w.advance(100);
+    }
+
+    // 5. the thief takes his own trade back
+    arb_to_buy_a(&mut w, pool, 1.0);
+    let gain = thief_value(&mut w, 1.0) - v0;
+    println!("M-1 fixed: regrow refused; thief ends {gain:.6} (was +978.7 before the fix)");
+    assert!(gain < 1e-6, "thief gains nothing: {gain}");
+}
+
+/// M-1 multi-window variant (FIXED). Before, ONE owner call left the anchor at the thief's price and
+/// the thief then repeated shrink / push / regrow every window with no further owner action. Now the
+/// owner's call does not move the anchor, so the first regrow is refused and the cycle never starts,
+/// however many windows pass.
+#[test]
+fn m1_attack_repeats_every_window_after_one_owner_call_is_refused() {
+    let mut w = W::new();
+    let pool = setup(&mut w);
+    let (bot, a) = (w.bot, w.a);
+    w.rebalance(pool, dec!(-13_436), dec!(-13_436)).expect_commit_success();
+    w.swap(bot, pool, a, dec!(13_692)).expect_commit_success();
+    let (ra, rb) = w.reserves(pool);
+    w.as_owner(pool, "withdraw", manifest_args!(dec!(0), dec!(1), Some((ra, rb)))).expect_commit_success();
+    for _ in 0..3 {
+        let (da, db) = regrow_amounts(&mut w, pool, dec!("1.094988"));
+        w.rebalance(pool, da, db).expect_commit_failure_containing_error("Operator price-move limit");
+        w.advance(100);
+    }
+    assert_eq!(w.status(pool).4, (dec!(1), dec!(1)));
+}
+
+/// The residual after the fix (design document, term D): the anchor is off the market only because
+/// the OWNER stated it so (a stale or mistaken price: here 1.2 B per A while the market is 1). Each
+/// window the thief runs the auditor's cycle against it with no owner call: exact free shrink at the
+/// market price, push the curve to the anchor with his own capital, regrow to the caps paying the
+/// depth term (the regrow is at the anchor, so no price term), sell back to market. It works, but
+/// every cycle spends ~ one window's budget and gains only ~ (L' - L) * 4 sinh^2(D / 4), within the
+/// bound S * C * psi(D + 2C) with D = ln 1.2.
+#[test]
+fn m1_owner_stated_off_market_anchor_cycles_are_bounded() {
+    let mut w = W::new();
+    let pool = setup(&mut w);
+    let d = 1.2f64.ln();
+    let r = w.set_anchor(pool, dec!(1), dec!("1.2"), Some((dec!(18_000), dec!(18_000))));
+    let ev: Vec<AnchorEv> = w.events(&r, "OwnerPoolAnchorEvent");
+    assert_eq!(ev, vec![AnchorEv { anchor_a: dec!(1), anchor_b: dec!("1.2") }]);
+    assert_eq!(w.status(pool).2, dec!(0), "stating an anchor zeroes the allowance");
+    w.advance(100);
+    let v0 = thief_value(&mut w, 1.0);
+    let owner0 = w.total(pool);
     let mut spent = 0.0;
     let rounds = 3;
     for round in 0..rounds {
+        // 1. free shrink at the market price to L ~ 16,680
         if round == 0 {
-            w.rebalance(pool, dec!(-13_436), dec!(-13_436)).expect_commit_success();
-            w.swap(bot, pool, a, dec!(13_692)).expect_commit_success();
-            let (ra, rb) = w.reserves(pool);
-            w.as_owner(pool, "withdraw", manifest_args!(dec!(0), dec!(1), Some((ra, rb)))).expect_commit_success();
-        } else {
-            // The curve is back at ~market (1.0), the anchor still at ~1/16. A shrink here is free
-            // only if EXACTLY proportional, so the thief first makes both reserves multiples of 2^12
-            // attos with one tiny swap of his own (searched off ledger, replicating compute_swap at
-            // fee 0), then shrinks by exactly m / 2^12.
-            let (ra, rb) = w.reserves(pool);
-            let q = I192::from(4096);
-            let base = Decimal::from(f(ra).ceil() as u64 + 1); // whole tokens: attos divisible by 2^18
-            let mut found = None;
-            for j in 0..200_000u64 {
-                let ra2 = base + Decimal::from_attos(I192::from(j) * q * I192::from(1_000_000_007i64));
-                let x = ra2 - ra;
-                let eff = PreciseDecimal::from(x);
-                let share = eff.checked_div(PreciseDecimal::from(ra) + eff).unwrap();
-                let out = Decimal::try_from((PreciseDecimal::from(rb) * share).checked_round(18, RoundingMode::ToNegativeInfinity).unwrap()).unwrap();
-                let rb2 = rb - out;
-                if rb2.attos() % q == I192::from(0) {
-                    found = Some((x, ra2, rb2));
-                    break;
-                }
-            }
-            let (x, ra2, rb2) = found.expect("no aligning swap found");
-            w.swap(bot, pool, a, x).expect_commit_success();
-            assert_eq!(w.reserves(pool), (ra2, rb2));
-            // exact proportional shrink by m / 4096 to L ~ 4,562 (free, anchor stays at ~1/16)
-            let m = I192::from((4096.0 * 4562.0 / (f(ra2) * f(rb2)).sqrt()) as i64);
-            let na = Decimal::from_attos(ra2.attos() / q * m);
-            let nb = Decimal::from_attos(rb2.attos() / q * m);
-            let r = w.rebalance(pool, na - ra2, nb - rb2);
+            let x = dec!(1_320);
+            let r = w.rebalance(pool, -x, -x);
             let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
-            assert_eq!(ev[0].cost, dec!(0), "exactly proportional shrink is free");
-            // own capital: sell A until the curve sits at the anchor's price again
-            let anchor = w.status(pool).4;
-            let pa = f(anchor.1) / f(anchor.0);
-            let (ra, rb) = w.reserves(pool);
-            let x = dec_floor((f(ra) * f(rb) / pa).sqrt() - f(ra), 6);
-            w.swap(bot, pool, a, x).expect_commit_success();
+            assert_eq!(ev[0].cost, dec!(0));
+        } else {
+            exact_shrink(&mut w, pool, 16_680.0);
         }
-        let (ra, rb) = w.reserves(pool);
-        let m = dec!("1.094988");
-        let r = w.rebalance(pool, (ra * (m - dec!(1))).checked_round(6, RoundingMode::ToZero).unwrap(), (rb * (m - dec!(1))).checked_round(6, RoundingMode::ToZero).unwrap());
+        // 2. own capital: buy A until the curve sits at the anchor's price
+        arb_to_buy_a(&mut w, pool, 1.2);
+        // 3. regrow by 1.0935 (B ends just under its 20k cap): depth cost ~0.0979
+        let (da, db) = regrow_amounts(&mut w, pool, dec!("1.0935"));
+        let r = w.rebalance(pool, da, db);
         let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
         spent += f(ev[0].cost);
-        arb_to_buy_a(&mut w, pool, 1.0);
-        println!("M-1 repeat: round {round}, thief gain so far {:.4}", thief_value(&mut w, 1.0) - v0);
+        // 4. sell A back to market
+        arb_to_sell_a(&mut w, pool, 1.0);
+        println!("D-residual: round {round}, cost {}, thief gain so far {:.4}", ev[0].cost, thief_value(&mut w, 1.0) - v0);
         w.advance(100);
     }
     let gain = thief_value(&mut w, 1.0) - v0;
-    println!("M-1 repeat: budget spent {spent:.4}, thief gain {gain:.4}, design bound {:.4}", design_bound(spent, 0.0));
-    assert!(gain > design_bound(spent, 0.0));
+    let (ta, tb) = w.total(pool);
+    let owner_loss = f(owner0.0) + f(owner0.1) - f(ta) - f(tb);
+    let bound = design_bound(spent, d);
+    println!("D-residual: anchor stated 20% off market; {rounds} windows, budget spent {spent:.4}, thief gain {gain:.4} = owner loss {owner_loss:.4}; bound {bound:.4}");
+    assert!((gain - owner_loss).abs() < 1e-3, "zero-sum at fee 0");
+    assert!(gain > 0.0 && gain <= bound);
+    assert!(gain < 60.0, "about 13 per window, against 978.7 in ONE window before the fix");
 }
 
 // ============================================================================ L-1: dust shrink
 
-/// A stolen key can shrink the curve to 1 atto per side for free. Swaps then fail for everyone and a
-/// replacement bot cannot regrow it (depth growth from 1e-18 costs far more than any budget): only
-/// the owner (cold) can restore the curve. Griefing, no loss.
+/// L-1 (FIXED). A stolen key could shrink the curve to 1 atto per side for free and brick it until the
+/// owner acted. Now the owner sets reserve floors, and before any limits are set the operator cannot
+/// lower a reserve at all. Swaps keep working, and the operator may still RAISE a side a swap left
+/// below its floor.
 #[test]
-fn l1_dust_shrink_needs_the_owner_to_restore() {
+fn l1_dust_shrink_is_refused_by_the_floor() {
     let mut w = W::new();
     let pool = w.pool(dec!(10_000), dec!(10_000), 30);
     w.fund_inventory(pool, dec!(1_000), dec!(1_000)).expect_commit_success();
     let (bot, other, op, a) = (w.bot, w.other, w.op, w.a);
     w.appoint(pool, bot, op).expect_commit_success();
-    w.set_limits(pool, 300, 72, dec!(11_000), dec!(11_000), 10, 100).expect_commit_success();
-    w.advance(72);
     let atto = Decimal::from_attos(I192::from(1));
     let shrink = dec!(10_000) - atto;
-    let r = w.rebalance(pool, -shrink, -shrink);
+    // Default limits: no lowering at all.
+    w.rebalance(pool, -shrink, -shrink).expect_commit_failure_containing_error("Below the operator's reserve floor");
+    w.rebalance(pool, dec!(-1), dec!(-1)).expect_commit_failure_containing_error("Below the operator's reserve floor");
+    // Floors at half the curve.
+    w.set_limits_floor(pool, 300, 72, dec!(11_000), dec!(11_000), dec!(5_000), dec!(5_000), 10, 100).expect_commit_success();
+    w.advance(72);
+    w.rebalance(pool, -shrink, -shrink).expect_commit_failure_containing_error("Below the operator's reserve floor");
+    w.rebalance(pool, dec!(-5_001), dec!(-5_001)).expect_commit_failure_containing_error("Below the operator's reserve floor");
+    w.rebalance(pool, dec!(0), dec!(-5_001)).expect_commit_failure_containing_error("Below the operator's reserve floor");
+    let r = w.rebalance(pool, dec!(-5_000), dec!(-5_000));
     let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
     assert_eq!(ev[0].cost, dec!(0));
-    assert_eq!(w.reserves(pool), (atto, atto));
-    w.swap(other, pool, a, dec!(1)).expect_commit_failure();
-    // The bot (or a replacement) cannot regrow: refused by the budget.
-    w.rebalance(pool, dec!(1_000), dec!(1_000)).expect_commit_failure_containing_error("Operator price-move limit");
-    w.rebalance(pool, dec!(1), dec!(1)).expect_commit_failure_containing_error("Operator price-move limit");
-    // The owner can.
-    w.as_owner(pool, "owner_rebalance", manifest_args!(shrink, shrink, NO_GUARD)).expect_commit_success();
-    assert_eq!(w.reserves(pool), (dec!(10_000), dec!(10_000)));
+    assert_eq!(w.reserves(pool), (dec!(5_000), dec!(5_000)));
+    w.rebalance(pool, dec!(-1), dec!(0)).expect_commit_failure_containing_error("Below the operator's reserve floor");
     w.swap(other, pool, a, dec!(1)).expect_commit_success();
+    let (_, rb) = w.reserves(pool);
+    assert!(rb < dec!(5_000));
+    w.rebalance(pool, dec!(0), dec!(1)).expect_commit_success();
 }
 
 // ============================================================================ informational
 
-/// I-a: revoking the operator leaves its pause flag on (swaps stay stopped until the owner clears it).
-/// I-b: the default operator fee range is the INSTANTIATION fee, so after the owner changes the fee
-///      a newly appointed operator (default limits) can set it back.
-/// I-c: the owner's pause does not stop operator moves (no loss: nobody can trade while paused).
-/// I-d: a replacement operator inherits the thief's spent allowance and the thief's anchor; the owner
-///      cannot top the allowance up, only wait or shorten the window.
+/// All FIXED:
+/// I-a: revoking the operator clears its pause flag (swaps resume without a second owner call).
+/// I-b: the default operator fee range gives no fee power, so an operator on default limits cannot
+///      undo the owner's `set_fee`.
+/// I-c: the owner's pause is a full stop for the hot key: `rebalance` and `operator_set_fee` refused.
+/// I-d: a replacement operator does not inherit the old key's allowance (it starts at zero and
+///      refills) nor its anchor (the owner states one when appointing).
 #[test]
 fn informational_revoke_pause_fee_range_inheritance() {
     let mut w = W::new();
@@ -442,31 +539,82 @@ fn informational_revoke_pause_fee_range_inheritance() {
     // I-b
     w.as_owner(pool, "set_fee", manifest_args!(100u16)).expect_commit_success();
     w.appoint(pool, bot, op).expect_commit_success();
-    w.as_operator(pool, "operator_set_fee", manifest_args!(30u16)).expect_commit_success();
-    assert_eq!(w.read::<u16>(pool, "fee_bps"), 30);
+    for fee in [30u16, 100] {
+        w.as_operator(pool, "operator_set_fee", manifest_args!(fee)).expect_commit_failure_containing_error("The operator may not change the fee");
+    }
+    assert_eq!(w.read::<u16>(pool, "fee_bps"), 100);
     // I-c
     w.set_limits(pool, 300, 72, dec!(11_000), dec!(11_000), 10, 100).expect_commit_success();
     w.advance(72);
     w.as_owner(pool, "set_paused", manifest_args!(true)).expect_commit_success();
-    w.rebalance(pool, dec!(100), dec!(0)).expect_commit_success();
+    w.rebalance(pool, dec!(100), dec!(0)).expect_commit_failure_containing_error("Paused by the owner");
+    w.rebalance(pool, dec!(-1), dec!(-1)).expect_commit_failure_containing_error("Paused by the owner");
+    w.as_operator(pool, "operator_set_fee", manifest_args!(50u16)).expect_commit_failure_containing_error("Paused by the owner");
+    // its own pause flag is harmless while the owner's pause is on
+    w.as_operator(pool, "set_operator_paused", manifest_args!(true)).expect_commit_success();
+    w.as_operator(pool, "set_operator_paused", manifest_args!(false)).expect_commit_success();
+    // the owner still moves funds while paused
+    w.as_owner(pool, "owner_rebalance", manifest_args!(dec!(1), dec!(1), NO_GUARD)).expect_commit_success();
+    w.as_owner(pool, "owner_rebalance", manifest_args!(dec!(-1), dec!(-1), NO_GUARD)).expect_commit_success();
     w.as_owner(pool, "set_paused", manifest_args!(false)).expect_commit_success();
-    // I-d: the thief spends everything, then is replaced.
+    w.rebalance(pool, dec!(100), dec!(0)).expect_commit_success();
     let left = w.status(pool).2;
-    println!("I-d: allowance left after the thief's move {left}");
-    let anchor_thief = w.status(pool).4;
+    println!("I-d: allowance left after the old key's move {left}");
     // I-a
     w.as_operator(pool, "set_operator_paused", manifest_args!(true)).expect_commit_success();
-    w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>)).expect_commit_success();
-    w.swap(other, pool, a, dec!(1)).expect_commit_failure_containing_error("Swaps are paused");
-    w.as_owner(pool, "set_operator_paused", manifest_args!(false)).expect_commit_success();
+    let r = w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>, None::<(Decimal, Decimal)>));
+    let ev: Vec<ConfigEv> = w.events(&r, "OwnerPoolConfigEvent");
+    assert_eq!(ev, vec![ConfigEv { fee_bps: 100, paused: false, operator_paused: false }]);
+    assert!(!w.read::<bool>(pool, "is_paused"));
     w.swap(other, pool, a, dec!(1)).expect_commit_success();
-    // I-d continued: new operator, same allowance and anchor; owner re-setting limits does not top up.
+    // I-d: new operator: allowance zero, anchor as stated now; refills normally.
     let op2 = w.ledger.create_fungible_resource(dec!(1), 0, other.account);
-    w.appoint(pool, other, op2).expect_commit_success();
+    w.appoint_at(pool, other, op2, (dec!(1), dec!("1.01"))).expect_commit_success();
+    let (_, _, allowance, op_paused, anchor) = w.status(pool);
+    assert_eq!((allowance, op_paused, anchor), (dec!(0), false, (dec!(1), dec!("1.01"))));
     w.set_limits(pool, 300, 72, dec!(11_000), dec!(11_000), 10, 100).expect_commit_success();
+    assert_eq!(w.status(pool).2, dec!(0), "re-setting limits does not top up");
+    w.advance(36);
+    assert_eq!(w.status(pool).2, dec!("0.015"));
+}
+
+/// `set_anchor` (new): owner only (also in the role tables of owner_pool_split.rs); states the price
+/// as a pair, refuses a non-positive part, honours the reserves guard, zeroes the allowance (which
+/// then refills normally), and the operator's next move is measured from it. `set_operator` with an
+/// anchor does the same.
+#[test]
+fn set_anchor_states_price_and_zeroes_allowance() {
+    let mut w = W::new();
+    let pool = w.pool(dec!(10_000), dec!(10_000), 30);
+    w.fund_inventory(pool, dec!(1_000), dec!(1_000)).expect_commit_success();
+    let (bot, op) = (w.bot, w.op);
+    w.appoint(pool, bot, op).expect_commit_success();
+    w.set_limits(pool, 300, 72, dec!(11_000), dec!(11_000), 10, 100).expect_commit_success();
+    w.advance(72);
+    assert_eq!(w.status(pool).2, dec!("0.03"));
+    w.set_anchor(pool, dec!(1), dec!("1.01"), Some((dec!(1), dec!(1)))).expect_commit_failure_containing_error("Reserves moved");
+    w.set_anchor(pool, dec!(0), dec!(1), NO_GUARD).expect_commit_failure_containing_error("Bad anchor");
+    w.set_anchor(pool, dec!(1), dec!(-1), NO_GUARD).expect_commit_failure_containing_error("Bad anchor");
+    w.as_operator(pool, "set_anchor", manifest_args!(dec!(1), dec!("1.01"), NO_GUARD)).expect_commit_failure();
+    assert_eq!(w.status(pool).2, dec!("0.03"), "refused calls change nothing");
+    let r = w.set_anchor(pool, dec!(1), dec!("1.01"), Some((dec!(10_000), dec!(10_000))));
+    let ev: Vec<AnchorEv> = w.events(&r, "OwnerPoolAnchorEvent");
+    assert_eq!(ev, vec![AnchorEv { anchor_a: dec!(1), anchor_b: dec!("1.01") }]);
     let (_, _, allowance, _, anchor) = w.status(pool);
-    assert_eq!(anchor, anchor_thief);
-    assert!(allowance <= left + dec!("0.0001"));
+    assert_eq!((allowance, anchor), (dec!(0), (dec!(1), dec!("1.01"))));
+    w.rebalance(pool, dec!(0), dec!(100)).expect_commit_failure_containing_error("Operator price-move limit");
+    w.advance(72);
+    // A one-sided add that brings the curve to the stated anchor: max(d(P, P') = 0.01, d(A, P') = 0)
+    // + depth (1.01 - 1) / 2 = 0.015. The anchor then follows the operator's move.
+    let r = w.rebalance(pool, dec!(0), dec!(100));
+    let ev: Vec<RebalanceEv> = w.events(&r, "OwnerPoolRebalanceEvent");
+    assert_eq!(ev[0].cost, dec!("0.015"));
+    assert_eq!(w.status(pool).4, (dec!(10_000), dec!(10_100)));
+    // Revoking may state an anchor too; it also zeroes the allowance.
+    w.advance(72);
+    w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>, Some((dec!(2), dec!(3))))).expect_commit_success();
+    let (o, _, allowance, _, anchor) = w.status(pool);
+    assert_eq!((o, allowance, anchor), (None, dec!(0), (dec!(2), dec!(3))));
 }
 
 // ============================================================================ budget edge cases

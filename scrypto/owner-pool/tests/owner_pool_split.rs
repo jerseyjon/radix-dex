@@ -21,6 +21,8 @@ struct Limits {
     window_epochs: u64,
     max_reserve_a: Decimal,
     max_reserve_b: Decimal,
+    min_reserve_a: Decimal,
+    min_reserve_b: Decimal,
     min_fee_bps: u16,
     max_fee_bps: u16,
 }
@@ -182,14 +184,20 @@ impl W {
         let m = ManifestBuilder::new().lock_fee_from_faucet()
             .create_proof_from_account_of_amount(o.account, ob, dec!(1))
             .create_proof_from_account_of_amount(holder.account, badge, dec!(1))
-            .call_method(pool, "set_operator", manifest_args!(Some(badge)))
+            .call_method(pool, "set_operator", manifest_args!(Some(badge), Some((dec!(1), dec!(1)))))
             .build();
         self.run(&[o, holder], m)
     }
 
+    /// Limits with reserve floors 0 (the operator may shrink to anything above empty).
     #[allow(clippy::too_many_arguments)]
     fn set_limits(&mut self, pool: ComponentAddress, budget_bps: u16, window: u64, cap_a: Decimal, cap_b: Decimal, min_fee: u16, max_fee: u16) -> TransactionReceipt {
-        self.as_owner(pool, "set_operator_limits", manifest_args!(budget_bps, window, cap_a, cap_b, min_fee, max_fee))
+        self.set_limits_floor(pool, budget_bps, window, cap_a, cap_b, dec!(0), dec!(0), min_fee, max_fee)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_limits_floor(&mut self, pool: ComponentAddress, budget_bps: u16, window: u64, cap_a: Decimal, cap_b: Decimal, floor_a: Decimal, floor_b: Decimal, min_fee: u16, max_fee: u16) -> TransactionReceipt {
+        self.as_owner(pool, "set_operator_limits", manifest_args!(budget_bps, window, cap_a, cap_b, floor_a, floor_b, min_fee, max_fee))
     }
 
     /// Owner puts (xa, xb) into the inventory.
@@ -282,7 +290,7 @@ fn dec_floor(x: f64, places: usize) -> Decimal {
 
 /// Every method x {owner, operator, stranger}. Expected:
 ///   owner only: deposit, withdraw, withdraw_all, deposit_inventory, withdraw_inventory,
-///               owner_rebalance, set_fee, set_paused, set_operator, set_operator_limits
+///               owner_rebalance, set_fee, set_paused, set_operator, set_operator_limits, set_anchor
 ///   operator only: rebalance, operator_set_fee
 ///   owner or operator: set_operator_paused
 ///   public: swap, swap_with_minimum, quote, reserves, inventory, fee_bps, is_paused, operator_status
@@ -295,7 +303,7 @@ fn split_role_table() {
     w.advance(10);
 
     // Order matters only for the owner's own successful run at the end (withdraw_all empties the pool).
-    let owner_only = ["withdraw", "withdraw_inventory", "owner_rebalance", "set_fee", "set_paused", "set_operator_limits", "withdraw_all", "set_operator"];
+    let owner_only = ["withdraw", "withdraw_inventory", "owner_rebalance", "set_fee", "set_paused", "set_operator_limits", "withdraw_all", "set_anchor", "set_operator"];
     let operator_only = ["rebalance", "operator_set_fee"];
     let args = |m: &str| -> ManifestArgs {
         match m {
@@ -305,8 +313,9 @@ fn split_role_table() {
             "owner_rebalance" => manifest_args!(dec!(1), dec!(0), NO_GUARD),
             "set_fee" => manifest_args!(20u16),
             "set_paused" => manifest_args!(true),
-            "set_operator" => manifest_args!(None::<ResourceAddress>),
-            "set_operator_limits" => manifest_args!(10_000u16, 1u64, dec!(1_000_000), dec!(1_000_000), 0u16, 500u16),
+            "set_operator" => manifest_args!(None::<ResourceAddress>, NO_GUARD),
+            "set_operator_limits" => manifest_args!(10_000u16, 1u64, dec!(1_000_000), dec!(1_000_000), dec!(0), dec!(0), 0u16, 500u16),
+            "set_anchor" => manifest_args!(dec!(1), dec!(1), NO_GUARD),
             "rebalance" => manifest_args!(dec!(1), dec!(1), NO_GUARD),
             "operator_set_fee" => manifest_args!(20u16),
             _ => unreachable!(),
@@ -391,8 +400,9 @@ fn operator_cannot_extract_funds_by_any_method() {
         ("withdraw_inventory", manifest_args!(dec!(10_000), dec!(10_000))),
         ("withdraw_inventory", manifest_args!(dec!(0), dec!(1))),
         ("owner_rebalance", manifest_args!(dec!(-9_999), dec!(0), NO_GUARD)),
-        ("set_operator", manifest_args!(None::<ResourceAddress>)),
-        ("set_operator_limits", manifest_args!(10_000u16, 1u64, big, big, 0u16, 500u16)),
+        ("set_operator", manifest_args!(None::<ResourceAddress>, NO_GUARD)),
+        ("set_operator_limits", manifest_args!(10_000u16, 1u64, big, big, dec!(0), dec!(0), 0u16, 500u16)),
+        ("set_anchor", manifest_args!(dec!(1), dec!(1000), NO_GUARD)),
         ("set_fee", manifest_args!(0u16)),
         ("set_paused", manifest_args!(false)),
         // its own methods, with amounts that would empty or overdraw
@@ -444,17 +454,22 @@ fn operator_limits_within_and_across_windows() {
     let mut w = W::new();
     let pool = w.managed_pool(30);
     let (_, limits0, allowance0, _, anchor0) = w.status(pool);
-    assert_eq!(anchor0, (dec!(10_000), dec!(10_000)));
-    // Defaults: the operator can move nothing that costs budget or raises a reserve.
-    assert_eq!(limits0, Limits { move_budget_bps: 0, window_epochs: 1, max_reserve_a: dec!(0), max_reserve_b: dec!(0), min_fee_bps: 30, max_fee_bps: 30 });
+    assert_eq!(anchor0, (dec!(1), dec!(1)), "the anchor the owner stated at appointment");
+    // Defaults: the operator can move nothing that costs budget, raises or lowers a reserve, and
+    // cannot touch the fee.
+    assert_eq!(limits0, Limits {
+        move_budget_bps: 0, window_epochs: 1, max_reserve_a: dec!(0), max_reserve_b: dec!(0),
+        min_reserve_a: Decimal::MAX, min_reserve_b: Decimal::MAX, min_fee_bps: 0, max_fee_bps: 0,
+    });
     assert_eq!(allowance0, dec!(0));
     w.rebalance(pool, dec!(1), dec!(0)).expect_commit_failure_containing_error("Above the operator's reserve cap");
-    w.rebalance(pool, dec!(-1), dec!(0)).expect_commit_failure_containing_error("Operator price-move limit");
-    w.rebalance(pool, dec!(-1), dec!(-1)).expect_commit_success(); // proportional decrease: costs nothing
+    w.rebalance(pool, dec!(-1), dec!(0)).expect_commit_failure_containing_error("Below the operator's reserve floor");
+    w.rebalance(pool, dec!(-1), dec!(-1)).expect_commit_failure_containing_error("Below the operator's reserve floor");
     w.rebalance(pool, dec!(1), dec!(1)).expect_commit_failure_containing_error("Above the operator's reserve cap");
-    w.as_operator(pool, "operator_set_fee", manifest_args!(29u16)).expect_commit_failure_containing_error("Fee outside the operator's range");
-    w.as_operator(pool, "operator_set_fee", manifest_args!(30u16)).expect_commit_success();
-    w.owner_restore(pool);
+    for fee in [0u16, 29, 30] {
+        w.as_operator(pool, "operator_set_fee", manifest_args!(fee)).expect_commit_failure_containing_error("The operator may not change the fee");
+    }
+    assert_eq!(w.reserves(pool), (dec!(10_000), dec!(10_000)));
 
     // Bad limit settings are refused.
     let big = dec!(1_000_000);
@@ -463,6 +478,8 @@ fn operator_limits_within_and_across_windows() {
     w.set_limits(pool, 1_000, 10, dec!(-1), big, 0, 0).expect_commit_failure_containing_error("Negative cap");
     w.set_limits(pool, 1_000, 10, big, big, 20, 10).expect_commit_failure_containing_error("Bad fee range");
     w.set_limits(pool, 1_000, 10, big, big, 0, 501).expect_commit_failure_containing_error("Bad fee range");
+    w.set_limits_floor(pool, 1_000, 10, big, big, dec!(-1), dec!(0), 0, 0).expect_commit_failure_containing_error("Negative floor");
+    w.set_limits_floor(pool, 1_000, 10, dec!(100), big, dec!(101), dec!(0), 0, 0).expect_commit_failure_containing_error("Floor above cap");
 
     // Budget 10% per 10 epochs, caps 15k, fee 10..100 bps.
     let r = w.set_limits(pool, 1_000, 10, dec!(15_000), dec!(15_000), 10, 100);
@@ -527,11 +544,15 @@ fn operator_limits_within_and_across_windows() {
     // its cap; lowering is allowed whatever the caps.
     w.advance(10);
     w.rebalance(pool, dec!(5_001), dec!(4_750)).expect_commit_failure_containing_error("Above the operator's reserve cap");
-    w.owner_call_deposit(pool, dec!(0), dec!(6_000)); // owner pushes B to 16,250, over the cap
+    // Owner deposits at the curve's (and anchor's) price, pushing both sides over the caps. Owner
+    // deposits never move the anchor.
+    let anchor_before = w.status(pool).4;
+    w.owner_call_deposit(pool, dec!(6_000), dec!(6_150)); // (16,000, 16,400)
+    assert_eq!(w.status(pool).4, anchor_before);
     w.rebalance(pool, dec!(1), dec!(0)).expect_commit_failure_containing_error("Above the operator's reserve cap");
     w.rebalance(pool, dec!(0), dec!(-2_000)).expect_commit_failure_containing_error("Operator price-move limit"); // over budget
     w.rebalance(pool, dec!(0), dec!(-100)).expect_commit_success(); // lowering while over the cap: allowed
-    w.as_owner(pool, "withdraw", manifest_args!(dec!(0), dec!(6_000), NO_GUARD)).expect_commit_success();
+    w.as_owner(pool, "withdraw", manifest_args!(dec!(6_000), dec!(6_150), NO_GUARD)).expect_commit_success();
 
     // Emptying a side, or acting on an empty pool, is refused.
     let (ra, rb) = w.reserves(pool);
@@ -543,9 +564,12 @@ fn operator_limits_within_and_across_windows() {
 
     // The anchor: a stranger's swap moves the curve's price; an operator move at that price (even a
     // price-neutral regrow) pays the distance from the anchor, the price the operator last set.
-    w.advance(10);
+    // The owner restores the curve and states the anchor (allowance to zero; refills over a window).
     w.owner_restore(pool);
-    assert_eq!(w.status(pool).4, (dec!(10_000), dec!(10_000)));
+    w.as_owner(pool, "set_anchor", manifest_args!(dec!(1), dec!(1), Some((dec!(10_000), dec!(10_000))))).expect_commit_success();
+    assert_eq!(w.status(pool).2, dec!(0));
+    w.advance(10);
+    assert_eq!(w.status(pool).4, (dec!(1), dec!(1)));
     let (other, a) = (w.other, w.a);
     w.swap(other, pool, a, dec!(200)).expect_commit_success(); // fee is 5% now: price ~0.9621
     let (ra, rb) = w.reserves(pool);
@@ -649,15 +673,25 @@ fn revoke_and_replace_operator() {
 
     // Appointing needs a proof of the new badge (a typo or a badge the owner can't prove fails),
     // and refuses the owner badge, XRD and the pool tokens.
-    w.as_owner(pool, "set_operator", manifest_args!(Some(op1))).expect_commit_failure_containing_error("AssertAccessRuleFailed");
+    let one = Some((dec!(1), dec!(1)));
+    w.as_owner(pool, "set_operator", manifest_args!(Some(op1), one)).expect_commit_failure_containing_error("AssertAccessRuleFailed");
     let badge = w.badge;
     for bad in [badge, XRD, a, b] {
-        w.as_owner(pool, "set_operator", manifest_args!(Some(bad))).expect_commit_failure_containing_error("Bad operator badge");
+        w.as_owner(pool, "set_operator", manifest_args!(Some(bad), one)).expect_commit_failure_containing_error("Bad operator badge");
+    }
+    // Appointing without stating the anchor price is refused; so is a non-positive anchor.
+    for anchor in [None, Some((dec!(0), dec!(1))), Some((dec!(1), dec!(-1)))] {
+        let m = ManifestBuilder::new().lock_fee_from_faucet()
+            .create_proof_from_account_of_amount(owner.account, badge, dec!(1))
+            .create_proof_from_account_of_amount(bot.account, op1, dec!(1))
+            .call_method(pool, "set_operator", manifest_args!(Some(op1), anchor)).build();
+        let r = w.run(&[owner, bot], m);
+        r.expect_commit_failure_containing_error(if anchor.is_none() { "State the anchor price" } else { "Bad anchor" });
     }
     // A stranger, even holding the operator badge's look-alike, can't appoint.
     let m = ManifestBuilder::new().lock_fee_from_faucet()
         .create_proof_from_account_of_amount(bot.account, op1, dec!(1))
-        .call_method(pool, "set_operator", manifest_args!(Some(op1))).build();
+        .call_method(pool, "set_operator", manifest_args!(Some(op1), one)).build();
     w.run(&[bot], m).expect_commit_failure();
     let r = w.appoint(pool, bot, op1);
     let ev: Vec<OperatorEv> = w.events(&r, "OwnerPoolOperatorEvent");
@@ -676,7 +710,7 @@ fn revoke_and_replace_operator() {
 
     // Revoke: every operator right goes at once.
     w.set_limits(pool, 1_000, 1, dec!(20_000), dec!(20_000), 0, 100).expect_commit_success();
-    w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>)).expect_commit_success();
+    w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>, NO_GUARD)).expect_commit_success();
     assert_eq!(w.status(pool).0, None);
     w.advance(1);
     w.rebalance(pool, dec!(1), dec!(1)).expect_commit_failure();
@@ -731,7 +765,7 @@ fn owner_path_works_with_operator_key_lost() {
     w.swap(other, pool, a, dec!(1)).expect_commit_success();
 
     // Key lost: from here the bot never signs again. The owner revokes without its badge.
-    w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>)).expect_commit_success();
+    w.as_owner(pool, "set_operator", manifest_args!(None::<ResourceAddress>, NO_GUARD)).expect_commit_success();
     // Owner moves inventory without limits (budget, caps and empty sides do not apply to him).
     w.as_owner(pool, "owner_rebalance", manifest_args!(dec!(10_000), dec!(-5_000), NO_GUARD)).expect_commit_success();
     let (ra, rb) = w.reserves(pool);
