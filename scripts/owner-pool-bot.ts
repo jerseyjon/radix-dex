@@ -16,6 +16,12 @@
 //                            file:<path> (JSON {"price": n, "at": iso|ms} or a bare number) as synthetic venues for drills.
 //                            (--sources is accepted as an alias.) --quote-size <xrd> (1000) --small-fraction <f> (0.1)
 //                            --min-impact <bps> (10) --max-round-trip <f> (0.1) --min-venues <n> (1)
+//                            --max-venue-fee <f> (0.01): a venue whose own swap fee (estimated from its quotes) is over this is excluded
+//                            The bot REFUSES to start if a venue is the operated pool or any OwnerPool component (checked on ledger).
+//   --venue-hold <s>         the set of live venues changed: no rebalance for this long (900; restarts on another change;
+//                            kept in the state file); the fee may widen meanwhile, not narrow
+//   --exclude-venues a,b     TEST/DRILL ONLY: treat these venues as dropped. --exclude-venues-file <path>: the same, names
+//                            read from the file (comma/whitespace separated) on every tick, so a venue can be dropped mid-run
 //   --watch-sources a,b      WATCH ONLY, never traded on: coingecko (default). Alert when it is more than
 //                            --watch-max-deviation <f> (0.15) from the on-ledger reference; --no-watch to skip
 //   --max-disagreement <f>   live venues further apart than this (0.04): hold (no rebalance) and widen the fee by
@@ -41,10 +47,10 @@
 // Keys: the operator key is loaded from --key (default data/stokenet-owner-pool-operator.key) and never
 // printed. The bot holds no owner key and cannot do anything only the owner may do.
 import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { makePriceSources, makeVenues, readSource, readVenueSource, type PriceSource, type VenueSource } from './owner-pool-sources.ts';
+import { assertReferenceExcludesOwnerPools, makePriceSources, makeVenues, readSource, readVenueSource, type PriceSource, type VenueSource } from './owner-pool-sources.ts';
 import {
   AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, anchorCheck, buildTransaction,
-  calibrateScale, decideRebalance, feeDecision, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
+  calibrateScale, decideRebalance, feeDecision, venueSetHold, type VenueHoldState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
   ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
   ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, submitAndWait,
   txAllowance, volatilityBps, type Ed25519Key, type VenueReference, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
@@ -83,6 +89,10 @@ const cfg = {
   smallQuoteFraction: num('small-fraction', D.smallQuoteFraction),
   minImpactBps: num('min-impact', D.minImpactBps),
   maxRoundTrip: num('max-round-trip', D.maxRoundTrip),
+  maxVenueFee: num('max-venue-fee', D.maxVenueFee),
+  venueHoldSec: num('venue-hold', D.venueHoldSec),
+  excludeVenues: (opt('exclude-venues') ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+  excludeVenuesFile: opt('exclude-venues-file'),
   disagreeFeeFactor: num('disagree-fee-factor', D.disagreeFeeFactor),
   watchMaxDeviation: num('watch-max-deviation', D.coingeckoMaxDeviation),
   spendWindowSec: num('spend-window', D.spendWindowSec),
@@ -160,6 +170,8 @@ interface BotState {
   spends?: { at: number; cost: number; txid: string }[];
   /** The last fee change that failed (preview or send): not retried at once. */
   lastFeeFailure?: { feeBps: number; at: number };
+  /** The live venue set last seen and the venue-set hold (survives a restart). */
+  venueHold?: VenueHoldState;
 }
 const loadState = (): BotState => {
   const fresh: BotState = { history: [], txTimes: [], pause: { pausedByBot: false }, consecutiveFailures: 0 };
@@ -207,6 +219,21 @@ const venues: VenueSource[] = makeVenues(cfg.venues, mainnetGw, { sizeXrd: cfg.q
 const watchSources: PriceSource[] = makePriceSources(cfg.watchSources, mainnetGw);
 /** The watch comparison makes sense only when every venue is a real one (synthetic venues are in pool units). */
 const watchComparable = cfg.venues.every((v) => !v.startsWith('fixed:') && !v.startsWith('file:'));
+// HARD GUARD: the reference must never contain the pool the bot operates, nor any OwnerPool component.
+try {
+  const g = await assertReferenceExcludesOwnerPools(mainnetGw, cfg.venues, cfg.pool);
+  log({ event: 'venue-guard', ok: true, checked: g.checked });
+} catch (e) {
+  log({ event: 'refused', reason: String((e as Error)?.message ?? e) });
+  unlock();
+  process.exit(2);
+}
+/** Venues excluded for a test or drill: the flag, plus the file's names (re-read each tick). */
+function excludedVenues(): string[] {
+  let fromFile: string[] = [];
+  if (cfg.excludeVenuesFile && existsSync(cfg.excludeVenuesFile)) fromFile = readFileSync(cfg.excludeVenuesFile, 'utf8').split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+  return [...new Set([...cfg.excludeVenues, ...fromFile])];
+}
 
 // ------------------------------------------------------------------ ledger reads
 
@@ -313,12 +340,21 @@ async function tick(): Promise<void> {
 
   // 1. Reference: on-ledger venues only. Watch sources (CoinGecko) are read beside them, never used.
   const [quotes, watch] = await Promise.all([Promise.all(venues.map(readVenueSource)), Promise.all(watchSources.map(readSource))]);
-  const vref: VenueReference = aggregateVenues(quotes, now, { minVenues: cfg.minVenues, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement, maxRoundTrip: cfg.maxRoundTrip, minImpactBps: cfg.minImpactBps });
+  const exclude = excludedVenues();
+  const vref: VenueReference = aggregateVenues(quotes, now, { minVenues: cfg.minVenues, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement, maxRoundTrip: cfg.maxRoundTrip, minImpactBps: cfg.minImpactBps, maxVenueFee: cfg.maxVenueFee, exclude });
+  if (exclude.length) line.testExcluded = exclude;
+  // Venue-set hold: a change in which venues are live (any rule) holds the position for --venue-hold.
+  const vh = venueSetHold(state.venueHold ?? {}, vref.venues.filter((v) => v.used).map((v) => v.venue), now, cfg.venueHoldSec * 1000);
+  state.venueHold = vh.state;
+  const holdMsg = vh.holding ? `venue-set hold (${vh.state.holdReason}) for ${Math.round(vh.remainingMs / 1000)} s more` : undefined;
+  line.venueSet = { live: vh.state.liveSet, ...(vh.changed ? { changed: { removed: vh.removed, added: vh.added } } : {}), ...(vh.holding ? { holdUntil: new Date(vh.state.holdUntil!).toISOString(), remainingSec: Math.round(vh.remainingMs / 1000), reason: vh.state.holdReason } : {}), ...(vh.expired ? { holdEnded: true } : {}) };
+  if (vh.started) await alert('venue-hold', `VENUE SET CHANGED (${vh.state.holdReason}): holding position (no rebalance) for ${Math.round(cfg.venueHoldSec / 60)} min; the fee may widen, not narrow. Live now: ${vh.state.liveSet!.join(',') || 'none'}.`, line);
+  if (vh.expired) alerts.limiter.clear('venue-hold');
   const ref = vref.status === 'ok' ? { ok: true as const, price: vref.price } : { ok: false as const, reason: vref.reason };
   const r6 = (x: number | undefined) => (x === undefined ? null : Number(x.toPrecision(6)));
   line.reference = {
     status: vref.status, price: vref.price ?? null, disagreement: vref.disagreement === undefined ? null : round(vref.disagreement, 5), live: vref.live, reason: vref.reason,
-    venues: vref.venues.map((v) => ({ venue: v.venue, used: v.used, mid: r6(v.mid), roundTrip: r6(v.roundTrip), impact: r6(v.impact), depth: r6(v.depth), weight: r6(v.weight), ...(v.dropped ? { dropped: v.dropped } : {}) })),
+    venues: vref.venues.map((v) => ({ venue: v.venue, used: v.used, mid: r6(v.mid), fee: r6(v.fee), roundTrip: r6(v.roundTrip), impact: r6(v.impact), depth: r6(v.depth), weight: r6(v.weight), ...(v.dropped ? { dropped: v.dropped } : {}) })),
   };
   if (vref.live === 1) line.referenceWarning = `only ONE live venue (${vref.venues.find((v) => v.used)!.venue}): its price is not checked against another venue`;
   const watchLines = watch.map((w) => {
@@ -420,8 +456,14 @@ async function tick(): Promise<void> {
   if (!ownerAnchorNow) { line.decision = 'owner anchor unknown: no rebalance, no fee change'; return void log(line); }
   if (vref.status === 'disagree') {
     // Hold the position (no rebalance) and widen the fee: the venues do not agree where the price is.
-    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, vref.disagreement, actions, line) : undefined;
+    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, vref.disagreement, actions, line, holdMsg) : undefined;
     line.decision = `HOLD: ${vref.reason}${fr ? `; ${fr}` : ''}`;
+    return void log(line);
+  }
+  if (holdMsg && ref.ok) {
+    // The venue set changed: hold the position (no rebalance) until the hold ends; the fee may widen, not narrow.
+    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, undefined, actions, line, holdMsg) : undefined;
+    line.decision = `HOLD: ${holdMsg}: no rebalance${fr ? `; ${fr}` : ''}`;
     return void log(line);
   }
   if (!ref.ok || !target) { line.decision = `no reference (${ref.ok ? 'no target' : ref.reason}): no rebalance, no fee change`; return void log(line); }
@@ -470,10 +512,10 @@ const round = (x: number, d: number) => Math.round(x * 10 ** d) / 10 ** d;
  * disagree), clamped to the owner's operator range (logged when clamped), with hysteresis; a change that
  * failed is not retried at once. Returns a short summary.
  */
-async function feeStep(now: number, feeNow: number, s: NonNullable<OwnerPoolState['split']>, behind: boolean, disagreement: number | undefined, actions: Sent[], line: Record<string, unknown>): Promise<string> {
+async function feeStep(now: number, feeNow: number, s: NonNullable<OwnerPoolState['split']>, behind: boolean, disagreement: number | undefined, actions: Sent[], line: Record<string, unknown>, noNarrow?: string): Promise<string> {
   const volBps = volatilityBps(state.history, now, cfg.volWindowSec * 1000, cfg.intervalSec * 1000);
   const ft = feeTargetDetail({ volBps, behind, disagreement, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, cfg });
-  const fd = feeDecision({ currentFeeBps: feeNow, targetFeeBps: ft.feeBps, lastChangeAt: state.lastFeeChangeAt, now, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, lastFailure: state.lastFeeFailure, cfg: { minFeeChangeBps: cfg.minFeeChangeBps, widenIntervalMs: cfg.widenIntervalSec * 1000, narrowIntervalMs: cfg.narrowIntervalSec * 1000 } });
+  const fd = feeDecision({ currentFeeBps: feeNow, targetFeeBps: ft.feeBps, lastChangeAt: state.lastFeeChangeAt, now, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, lastFailure: state.lastFeeFailure, noNarrow, cfg: { minFeeChangeBps: cfg.minFeeChangeBps, widenIntervalMs: cfg.widenIntervalSec * 1000, narrowIntervalMs: cfg.narrowIntervalSec * 1000 } });
   line.fee = {
     current: feeNow, target: ft.feeBps, rule: ft.rawBps, ...(ft.clamped ? { clamped: `${ft.clamped} of the operator range ${s.limits.minFeeBps}-${s.limits.maxFeeBps} bps` } : {}),
     volBps: round(volBps, 2), behind, ...(disagreement !== undefined ? { disagreement: round(disagreement, 5) } : {}), decision: fd.reason,

@@ -7,7 +7,7 @@
 // - WATCH sources (`makePriceSources`): CoinGecko and the old single-number readings. Watch only: they
 //   are compared with the reference and alerted on, never traded on.
 import { readFileSync, statSync } from 'node:fs';
-import { Gateway, NETWORKS, Quoter, filterAllowedPools, listCaviarNine, type Pool, type PriceSample, type VenueQuote } from '../packages/core/src/index.ts';
+import { Gateway, NETWORKS, OWNER_POOL_BLUEPRINT, OWNER_POOL_PACKAGES, Quoter, filterAllowedPools, listCaviarNine, referenceVenueProblems, type Pool, type PriceSample, type VenueQuote } from '../packages/core/src/index.ts';
 
 const MAINNET_XRD = NETWORKS.mainnet.xrd;
 const HUSDC = 'resource_rdx1thxj9m87sn5cc9ehgp9qxp6vzeqxtce90xm5cp33373tclyp4et4gv';
@@ -107,6 +107,22 @@ const VENUE_POOLS: Record<string, { venue: Pool['venue']; address: string; note:
   defiplaza: { venue: 'defiplaza', address: 'component_rdx1crj9ne37kf0tw2efc3dsl03pzg3qavkhauyu6nvz8z05qrdp009jt0', note: 'DefiPlaza PlazaPair hUSDC/XRD' },
 };
 export const VENUE_NAMES = Object.keys(VENUE_POOLS);
+
+/**
+ * HARD GUARD, run at start-up by the bot and the watcher: no reference venue may be the operated pool or
+ * ANY OwnerPool component (blueprint `OwnerPool`, or a component of a package in OWNER_POOL_PACKAGES on
+ * any network), checked on ledger from each venue's entity details. Throws with every problem found.
+ * Synthetic venues (fixed:, file:) have no address and are not checked.
+ */
+export async function assertReferenceExcludesOwnerPools(gw: Gateway, names: string[], operatedPool: string): Promise<{ checked: { name: string; address: string; blueprint?: string }[] }> {
+  const venues = names.filter((n) => VENUE_POOLS[n]).map((n) => ({ name: n, address: VENUE_POOLS[n]!.address }));
+  if (!venues.length) return { checked: [] };
+  const raw: any[] = await gw.entityDetails([...new Set(venues.map((v) => v.address))]);
+  const details = raw.map((d) => ({ address: String(d?.address), blueprint_name: d?.details?.blueprint_name, package_address: d?.details?.package_address }));
+  const problems = referenceVenueProblems({ operatedPool, venues, details, ownerPoolPackages: Object.values(OWNER_POOL_PACKAGES).flat(), ownerPoolBlueprint: OWNER_POOL_BLUEPRINT });
+  if (problems.length) throw new Error(`reference venues refused: ${problems.join('; ')}`);
+  return { checked: venues.map((v) => ({ ...v, blueprint: details.find((d) => d.address === v.address)?.blueprint_name })) };
+}
 
 /**
  * One venue, quoted by previews (free, nothing signed): sell `sizeXrd` XRD (the bid) and sell hUSDC

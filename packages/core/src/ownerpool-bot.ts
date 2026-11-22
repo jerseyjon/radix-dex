@@ -30,6 +30,10 @@ export const OWNER_POOL_BOT_DEFAULTS = {
   minImpactBps: 10,
   /** A venue whose round trip (ask / bid - 1) at the quote size is wider than this does not bound the price: dropped. */
   maxRoundTrip: 0.1,
+  /** A venue whose own swap fee (estimated from its quotes, `readVenue`) is over this is excluded (owner, 22 Nov 2026). */
+  maxVenueFee: 0.01,
+  /** The set of live venues changed: no rebalance for this long (restarts on another change; persisted). */
+  venueHoldSec: 900,
   /** While the venues disagree: fee + this fraction of the disagreement (in bps), inside the operator range. */
   disagreeFeeFactor: 0.5,
   /** CoinGecko (watch only) this far from the on-ledger reference: alert. Never affects a trade. */
@@ -153,6 +157,8 @@ export interface VenueReading {
   impact?: number;
   /** quote size / max(impact, floor), in A: the reserve of a constant-product pool with the same impact. */
   depth?: number;
+  /** The venue's own one-way swap fee, estimated from its quotes (`venueFee`). */
+  fee?: number;
   weight?: number;
   used: boolean;
   dropped?: string;
@@ -163,14 +169,31 @@ export type VenueReference =
   | { status: 'ok' | 'disagree'; price: number; disagreement: number; live: number; venues: VenueReading[]; reason: string }
   | { status: 'none'; price?: undefined; disagreement?: undefined; live: 0; venues: VenueReading[]; reason: string };
 
-/** The fee-free midpoint, round trip, impact and depth of one venue's quotes (no health checks). */
-export function readVenue(q: VenueQuote, minImpact: number): Required<Pick<VenueReading, 'mid' | 'roundTrip' | 'impact' | 'depth'>> {
+/**
+ * A venue's own one-way swap fee, read from its quotes (no fee table, no venue-specific state): the
+ * one-way cost at a size, c = 1 - sqrt(bid / ask) (half the round trip, geometrically: fee plus impact
+ * one way), is measured at the small size and the quote size and extrapolated linearly to size zero,
+ * where the impact vanishes and only the fee is left: fee = c(small) - (c(size) - c(small)) * small /
+ * (size - small). Exact for a pure proportional fee; for a constant-product pool the impact is linear
+ * in size to first order, so it is removed. On the 22 Nov 2026 quotes: Ociswap basic 3.000% (its
+ * `input_fee_rate` is 0.03), Ociswap precision 0.052% (0.05%), CaviarNine 0.081%, DefiPlaza 10.6% (its
+ * asymmetric pricing, not a fee field, but it is what a trader pays at zero size). Never below 0.
+ */
+export function venueFee(q: Pick<VenueQuote, 'sizeA' | 'smallA' | 'bid' | 'ask' | 'bidSmall' | 'askSmall'>): number {
+  const c = (bid: number, ask: number) => 1 - Math.sqrt(bid / ask);
+  const cBig = c(q.bid, q.ask), cSmall = c(q.bidSmall, q.askSmall);
+  if (!(q.sizeA > q.smallA)) return Math.max(0, cSmall);
+  return Math.max(0, cSmall - (cBig - cSmall) * q.smallA / (q.sizeA - q.smallA));
+}
+
+/** The fee-free midpoint, round trip, impact, depth and own fee of one venue's quotes (no health checks). */
+export function readVenue(q: VenueQuote, minImpact: number): Required<Pick<VenueReading, 'mid' | 'roundTrip' | 'impact' | 'depth' | 'fee'>> {
   const mid = Math.sqrt(q.bid * q.ask);
   const roundTrip = q.ask / q.bid - 1;
   // Selling more gets a worse (lower) bid, buying more a worse (higher) ask.
   const impact = Math.max(0, ((q.bidSmall / q.bid - 1) + (q.ask / q.askSmall - 1)) / 2);
   const depth = q.sizeA / Math.max(impact, minImpact);
-  return { mid, roundTrip, impact, depth };
+  return { mid, roundTrip, impact, depth, fee: venueFee(q) };
 }
 
 /**
@@ -178,12 +201,17 @@ export function readVenue(q: VenueQuote, minImpact: number): Required<Pick<Venue
  * fee, `readVenue`) is weighted by its depth; the reference is the weighted geometric mean.
  * Dropped: a venue whose quotes failed or are unusable, older than `maxAgeMs` (or in the future), or
  * whose round trip at the quote size is wider than `maxRoundTrip` (its two quotes then bound the
- * price too loosely to be a reference). With fewer than `minVenues` live: none. When the highest and
+ * price too loosely to be a reference), or whose own swap fee (`venueFee`, from its quotes) is over
+ * `maxVenueFee` (default 1%; exactly at it is kept): a high-fee pool's price can sit up to its fee away
+ * from the market before anyone arbitrages it. Venues named in `exclude` are dropped too (drills).
+ * With fewer than `minVenues` live: none. When the highest and
  * lowest live midpoint differ by more than `maxDisagreement`: disagree (the price is reported for
  * the logs and the fee, never traded on).
  */
-export function aggregateVenues(quotes: VenueQuote[], nowMs: number, o: { minVenues: number; maxAgeMs: number; maxDisagreement: number; maxRoundTrip: number; minImpactBps: number }): VenueReference {
+export function aggregateVenues(quotes: VenueQuote[], nowMs: number, o: { minVenues: number; maxAgeMs: number; maxDisagreement: number; maxRoundTrip: number; minImpactBps: number; maxVenueFee?: number; exclude?: string[] }): VenueReference {
+  const maxFee = o.maxVenueFee ?? OWNER_POOL_BOT_DEFAULTS.maxVenueFee;
   const venues: VenueReading[] = quotes.map((q) => {
+    if (o.exclude?.includes(q.venue)) return { venue: q.venue, used: false, dropped: 'excluded by --exclude-venues (TEST)' };
     if (q.error) return { venue: q.venue, used: false, dropped: q.error };
     const vals = [q.bid, q.ask, q.bidSmall, q.askSmall, q.sizeA];
     if (!vals.every((v) => Number.isFinite(v) && v > 0)) return { venue: q.venue, used: false, dropped: 'quotes unusable' };
@@ -191,6 +219,7 @@ export function aggregateVenues(quotes: VenueQuote[], nowMs: number, o: { minVen
     const r = readVenue(q, o.minImpactBps / 10_000);
     if (!(r.roundTrip >= -1e-9)) return { venue: q.venue, ...r, used: false, dropped: `ask below bid (round trip ${(r.roundTrip * 100).toFixed(2)}%)` };
     if (r.roundTrip > o.maxRoundTrip) return { venue: q.venue, ...r, used: false, dropped: `round trip ${(r.roundTrip * 100).toFixed(2)}% > ${(o.maxRoundTrip * 100).toFixed(1)}%` };
+    if (r.fee > maxFee + 1e-9) return { venue: q.venue, ...r, used: false, dropped: `fee ${(r.fee * 100).toFixed(3)}% > ${(maxFee * 100).toFixed(2)}% (estimated from its quotes)` };
     return { venue: q.venue, ...r, used: true };
   });
   const live = venues.filter((v) => v.used);
@@ -207,6 +236,74 @@ export function aggregateVenues(quotes: VenueQuote[], nowMs: number, o: { minVen
     return { status: 'disagree', price, disagreement, live: live.length, venues, reason: `venues disagree by ${(disagreement * 100).toFixed(2)}% (bound ${(o.maxDisagreement * 100).toFixed(1)}%): hold and widen` };
   }
   return { status: 'ok', price, disagreement, live: live.length, venues, reason: `${live.length} live venue(s)${one}` };
+}
+
+// ------------------------------------------------------------------ venue-set hold
+
+/** Persisted in the bot's state file: the live venue set last seen, and the hold it started. */
+export interface VenueHoldState {
+  /** Sorted names of the venues live on the last tick; undefined before the first tick. */
+  liveSet?: string[];
+  holdUntil?: number;
+  holdStartedAt?: number;
+  holdReason?: string;
+}
+
+/**
+ * The owner's rule (22 Nov 2026): when the set of live venues changes (a venue drops out or comes back,
+ * by a failed or part-filled quote, the round-trip rule or the fee rule), the reference can jump with
+ * no market move, so the bot holds its position for `holdMs`: no rebalance. Another change during the
+ * hold restarts it. The first tick ever (no set known) only records the set. The state is persisted by
+ * the caller, so a restart neither skips a hold nor misses a change made while it was down.
+ */
+export function venueSetHold(prev: VenueHoldState, live: string[], now: number, holdMs: number): {
+  state: VenueHoldState; changed: boolean; started: boolean; holding: boolean; expired: boolean; added: string[]; removed: string[]; remainingMs: number;
+} {
+  const set = [...new Set(live)].sort();
+  const before = prev.liveSet;
+  const added = before ? set.filter((v) => !before.includes(v)) : [];
+  const removed = before ? before.filter((v) => !set.includes(v)) : [];
+  const changed = !!before && (added.length > 0 || removed.length > 0);
+  const st: VenueHoldState = { ...prev, liveSet: set };
+  let started = false;
+  if (changed) {
+    started = !(prev.holdUntil !== undefined && now < prev.holdUntil);
+    st.holdUntil = now + holdMs;
+    st.holdStartedAt = now;
+    st.holdReason = [removed.length ? `dropped ${removed.join(',')}` : '', added.length ? `back ${added.join(',')}` : ''].filter(Boolean).join('; ');
+  }
+  const holding = st.holdUntil !== undefined && now < st.holdUntil;
+  const expired = !holding && st.holdUntil !== undefined;
+  if (expired) { st.holdUntil = undefined; st.holdStartedAt = undefined; st.holdReason = undefined; }
+  return { state: st, changed, started, holding, expired, added, removed, remainingMs: holding ? st.holdUntil! - now : 0 };
+}
+
+// ------------------------------------------------------------------ reference must not contain our own pool
+
+/**
+ * Hard guard, checked at start-up: no reference venue may be the pool the bot operates, nor ANY
+ * OwnerPool component (blueprint `OwnerPool`, or a component of a package in `ownerPoolPackages`).
+ * An OwnerPool's price is set by its owner/operator, so following it would be following ourselves.
+ * `details` are the Gateway's entity details of the venue addresses; a venue the Gateway did not
+ * describe is refused too (it cannot be shown not to be one). Returns the problems; empty = fine.
+ */
+export function referenceVenueProblems(o: {
+  operatedPool: string;
+  venues: { name: string; address: string }[];
+  details: { address: string; blueprint_name?: string; package_address?: string }[];
+  ownerPoolPackages: string[];
+  ownerPoolBlueprint?: string;
+}): string[] {
+  const bp = o.ownerPoolBlueprint ?? 'OwnerPool';
+  const out: string[] = [];
+  for (const v of o.venues) {
+    if (v.address === o.operatedPool) { out.push(`venue ${v.name} IS the operated pool ${v.address}`); continue; }
+    const d = o.details.find((x) => x.address === v.address);
+    if (!d) { out.push(`venue ${v.name} (${v.address}): no entity details from the Gateway, cannot show it is not an OwnerPool`); continue; }
+    if (d.blueprint_name === bp) out.push(`venue ${v.name} (${v.address}) is an ${bp} component`);
+    else if (d.package_address && o.ownerPoolPackages.includes(d.package_address)) out.push(`venue ${v.name} (${v.address}) is a component of OwnerPool package ${d.package_address}`);
+  }
+  return out;
 }
 
 /**
@@ -503,7 +600,7 @@ export function feeTargetDetail(o: { volBps: number; behind: boolean; disagreeme
  * change was at least `widenIntervalMs` ago to widen (protection: soon) or `narrowIntervalMs` ago to
  * narrow (calm must last). The operator has fee power only when the owner's range is not a single value.
  */
-export function feeDecision(o: { currentFeeBps: number; targetFeeBps: number; lastChangeAt?: number; now: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'minFeeChangeBps' | 'widenIntervalMs' | 'narrowIntervalMs'>; lastFailure?: { feeBps: number; at: number } }): { action: 'set'; feeBps: number; reason: string } | { action: 'none'; reason: string } {
+export function feeDecision(o: { currentFeeBps: number; targetFeeBps: number; lastChangeAt?: number; now: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'minFeeChangeBps' | 'widenIntervalMs' | 'narrowIntervalMs'>; lastFailure?: { feeBps: number; at: number }; noNarrow?: string }): { action: 'set'; feeBps: number; reason: string } | { action: 'none'; reason: string } {
   if (o.minFeeBps >= o.maxFeeBps) return { action: 'none', reason: 'the operator has no fee range' };
   const diff = o.targetFeeBps - o.currentFeeBps;
   // Already at the edge of the range and the target is clamped there: nothing to do, whatever minFeeChange says.
@@ -512,6 +609,8 @@ export function feeDecision(o: { currentFeeBps: number; targetFeeBps: number; la
   if (o.lastFailure && o.lastFailure.feeBps === o.targetFeeBps && o.now - o.lastFailure.at < o.cfg.narrowIntervalMs) {
     return { action: 'none', reason: `fee change to ${o.targetFeeBps} bps failed ${Math.round((o.now - o.lastFailure.at) / 1000)} s ago: not retried before ${Math.round(o.cfg.narrowIntervalMs / 1000)} s` };
   }
+  // During a venue-set hold the fee may widen (protection) but not narrow (the new reference is not trusted yet).
+  if (diff < 0 && o.noNarrow) return { action: 'none', reason: `narrow to ${o.targetFeeBps} bps held: ${o.noNarrow}` };
   if (Math.abs(diff) < o.cfg.minFeeChangeBps) return { action: 'none', reason: `fee ${o.currentFeeBps} bps within ${o.cfg.minFeeChangeBps} bps of target ${o.targetFeeBps}` };
   const wait = diff > 0 ? o.cfg.widenIntervalMs : o.cfg.narrowIntervalMs;
   const since = o.lastChangeAt === undefined ? Infinity : o.now - o.lastChangeAt;

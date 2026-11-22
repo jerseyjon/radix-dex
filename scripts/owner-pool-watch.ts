@@ -13,7 +13,8 @@
 //                            allowance available at the window's start (the bot's own cap; catches "half, then half")
 //   --max-anchor-drift <f>   owner anchor vs reference (default 0.05); --max-pool-drift <f> pool vs reference (default 0.03)
 //   --venues a,b,c --quote-size <xrd> --scale auto|<n> --max-disagreement <f> --max-age <s>   reference, as the bot's
-//                            (on-ledger venues; drift checked only while they agree);
+//                            (on-ledger venues; drift checked only while they agree); --max-venue-fee <f> (0.01) as the bot's;
+//                            refuses to start if a venue is the watched pool or any OwnerPool component
 //                            --scale auto takes the bot's calibration from --bot-state, else calibrates to the owner anchor
 //   --bot-sent-log <path>    the bot's sent log (default data/owner-pool-bot-sent.jsonl): operator actions not in it are flagged
 //   --bot-state <path>       the bot's state file (default data/owner-pool-bot-state.json), read only, for the scale
@@ -26,7 +27,7 @@ import {
   driftFindings, findOwnerAnchor, lastOwnerAnchor, readOwnerPoolTransactions, readOwnerPools, watchTransaction,
   type NetworkName, type OwnerAnchorStatement, type WatchFinding, type WatchState,
 } from '../packages/core/src/index.ts';
-import { makeVenues, readVenueSource } from './owner-pool-sources.ts';
+import { assertReferenceExcludesOwnerPools, makeVenues, readVenueSource } from './owner-pool-sources.ts';
 
 const argv = process.argv.slice(2);
 const flag = (n: string) => argv.includes(`--${n}`);
@@ -59,6 +60,7 @@ const cfg = {
   minVenues: num('min-venues', BD.minVenues),
   maxSourceAgeSec: num('max-age', BD.maxSourceAgeSec),
   maxDisagreement: num('max-disagreement', BD.maxDisagreement),
+  maxVenueFee: num('max-venue-fee', BD.maxVenueFee),
   botSentLog: opt('bot-sent-log') ?? 'data/owner-pool-bot-sent.jsonl',
   botState: opt('bot-state') ?? 'data/owner-pool-bot-state.json',
   alertUrl: opt('alert-url') ?? process.env.OWNER_POOL_BOT_ALERT_URL ?? undefined,
@@ -71,6 +73,11 @@ const gw = new Gateway(NETWORKS[NETWORK]);
 const mainnetGw = new Gateway(NETWORKS.mainnet);
 const venues = makeVenues(cfg.venues, mainnetGw, { sizeXrd: cfg.quoteSizeXrd, smallFraction: BD.smallQuoteFraction });
 const log = (o: Record<string, unknown>) => console.log(JSON.stringify({ t: new Date().toISOString(), ...o }));
+// Same hard guard as the bot: the reference never contains the watched pool or any OwnerPool component.
+try { await assertReferenceExcludesOwnerPools(mainnetGw, cfg.venues, cfg.pool); } catch (e) {
+  log({ event: 'refused', reason: String((e as Error)?.message ?? e) });
+  process.exit(2);
+}
 
 interface State {
   next?: number;
@@ -155,7 +162,7 @@ async function tick(): Promise<void> {
 
   // Reference and drift (live state only).
   const quotes = await Promise.all(venues.map(readVenueSource));
-  const vref = aggregateVenues(quotes, now, { minVenues: cfg.minVenues, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement, maxRoundTrip: BD.maxRoundTrip, minImpactBps: BD.minImpactBps });
+  const vref = aggregateVenues(quotes, now, { minVenues: cfg.minVenues, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement, maxRoundTrip: BD.maxRoundTrip, minImpactBps: BD.minImpactBps, maxVenueFee: cfg.maxVenueFee });
   const ref = vref.status === 'ok' ? { ok: true as const, price: vref.price, disagreement: vref.disagreement } : { ok: false as const, reason: vref.reason };
   let scale: number | undefined, scaleFrom = 'flag';
   if (cfg.scale !== 'auto') scale = Number(cfg.scale);

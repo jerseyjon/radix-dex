@@ -4,7 +4,9 @@
 // reference, the disagreement, and CoinGecko's distance from the reference. docs/owner-pool-bot.md.
 //
 //   tsx scripts/owner-pool-venues.ts [--venues a,b,c] [--sizes 1000[,3000...]] [--interval <s>] [--count <n>]
-//                                    [--max-round-trip <f>] [--min-impact <bps>] [--max-disagreement <f>]
+//                                    [--max-round-trip <f>] [--min-impact <bps>] [--max-disagreement <f>] [--max-venue-fee <f>]
+// Each line also carries every venue's own fee estimated from its quotes (`venueFee`) and, with the fee rule
+// applied, the venue set and whether it changed since the previous sample (the bot would start its hold).
 import { Gateway, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, aggregateVenues, watchPriceCheck } from '../packages/core/src/index.ts';
 import { VENUE_NAMES, makePriceSources, makeVenues, readSource, readVenueSource } from './owner-pool-sources.ts';
 
@@ -14,12 +16,13 @@ const num = (n: string, d: number) => (opt(n) === undefined ? d : Number(opt(n))
 const venues = (opt('venues') ?? VENUE_NAMES.join(',')).split(',').map((s) => s.trim()).filter(Boolean);
 const sizes = (opt('sizes') ?? String(D.quoteSizeXrd)).split(',').map(Number).filter((x) => x > 0);
 const intervalSec = num('interval', 60), count = num('count', 1);
-const o = { minVenues: D.minVenues, maxAgeMs: D.maxSourceAgeSec * 1000, maxDisagreement: num('max-disagreement', D.maxDisagreement), maxRoundTrip: num('max-round-trip', D.maxRoundTrip), minImpactBps: num('min-impact', D.minImpactBps) };
+const o = { minVenues: D.minVenues, maxAgeMs: D.maxSourceAgeSec * 1000, maxDisagreement: num('max-disagreement', D.maxDisagreement), maxRoundTrip: num('max-round-trip', D.maxRoundTrip), minImpactBps: num('min-impact', D.minImpactBps), maxVenueFee: num('max-venue-fee', D.maxVenueFee) };
 
 const gw = new Gateway(NETWORKS.mainnet);
 const bySize = sizes.map((s) => ({ size: s, sources: makeVenues(venues, gw, { sizeXrd: s, smallFraction: D.smallQuoteFraction }) }));
 const [cg] = makePriceSources(['coingecko'], gw);
 const r6 = (x: number | undefined) => (x === undefined ? null : Number(x.toPrecision(6)));
+const lastSet = new Map<number, string>();
 
 let stopping = false;
 process.on('SIGINT', () => { stopping = true; });
@@ -31,9 +34,13 @@ for (let i = 0; i < count && !stopping; i++) {
     const quotes = await Promise.all(sources.map(readVenueSource));
     const ref = aggregateVenues(quotes, Date.now(), o);
     const w = watchPriceCheck(ref.price, watch.error ? undefined : watch.price, D.coingeckoMaxDeviation);
+    const set = ref.venues.filter((v) => v.used).map((v) => v.venue).sort().join(',');
+    const setChanged = lastSet.has(size) && lastSet.get(size) !== set;
+    lastSet.set(size, set);
     console.log(JSON.stringify({
       t: new Date().toISOString(), sizeXrd: size, status: ref.status, reference: r6(ref.price), disagreement: ref.disagreement === undefined ? null : r6(ref.disagreement), live: ref.live, reason: ref.reason,
-      venues: ref.venues.map((v, k) => ({ venue: v.venue, used: v.used, mid: r6(v.mid), bid: r6(quotes[k]!.bid), ask: r6(quotes[k]!.ask), roundTrip: r6(v.roundTrip), impact: r6(v.impact), depth: r6(v.depth), weight: r6(v.weight), ...(v.dropped ? { dropped: v.dropped } : {}) })),
+      liveSet: set, setChanged,
+      venues: ref.venues.map((v, k) => ({ venue: v.venue, used: v.used, mid: r6(v.mid), fee: r6(v.fee), bid: r6(quotes[k]!.bid), ask: r6(quotes[k]!.ask), roundTrip: r6(v.roundTrip), impact: r6(v.impact), depth: r6(v.depth), weight: r6(v.weight), ...(v.dropped ? { dropped: v.dropped } : {}) })),
       coingecko: watch.error ? { error: watch.error } : { price: watch.price, ageSec: Math.round((Date.now() - watch.at) / 1000), deviation: r6(w.deviation), alarm: w.alarm },
     }));
   }

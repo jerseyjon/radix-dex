@@ -12,7 +12,9 @@ import {
 } from '../src/index.ts';
 
 const NOW = Date.parse('2026-11-22T20:10:00Z');
-const o = { minVenues: D.minVenues, maxAgeMs: D.maxSourceAgeSec * 1000, maxDisagreement: D.maxDisagreement, maxRoundTrip: D.maxRoundTrip, minImpactBps: D.minImpactBps };
+// The 1% venue-fee rule is OFF in this file (maxVenueFee 1) so these tests keep exercising the weighting with
+// all three live venues; the fee rule has its own tests in ownerpool-venue-rules.test.ts.
+const o = { minVenues: D.minVenues, maxAgeMs: D.maxSourceAgeSec * 1000, maxDisagreement: D.maxDisagreement, maxRoundTrip: D.maxRoundTrip, minImpactBps: D.minImpactBps, maxVenueFee: 1 };
 const near = (a: number, b: number, tol: number, m = '') => assert.ok(Math.abs(a - b) <= tol, `${m} ${a} not within ${tol} of ${b}`);
 
 /** Real quotes, 22 Nov 2026 20:09 UTC, 1,000 XRD (small = 100 XRD). */
