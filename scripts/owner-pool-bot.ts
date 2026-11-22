@@ -15,7 +15,13 @@
 //                            fixed:<price>, file:<path> (JSON {"price": n, "at": iso|ms} or a bare number)
 //   --scale auto|<n>         pool target = reference * scale; auto: calibrated once so the first healthy
 //                            reference maps to the owner anchor (kept in the state file)
-//   --owner-anchor A:B       the anchor the OWNER stated (default 1250:1); the bot stops beyond --max-anchor-distance
+//   --owner-anchor A:B       FALLBACK only: the owner's anchor is read from the ledger (the pool's last
+//                            OwnerPoolAnchorEvent); this flag is used only when the ledger cannot say. With
+//                            neither, the bot does not rebalance. --anchor-recheck <s> (default 300)
+//   --alert-url <url>        POST a short text alert there (ntfy-style); env OWNER_POOL_BOT_ALERT_URL; none if unset
+//   --alert-interval <s>     one alert per condition per interval (default 3600); --alert-behind-ticks <n> (default 10)
+//   --sent-log <path>        every submitted txid is appended here before submission (default data/owner-pool-bot-sent.jsonl),
+//                            so the watcher (scripts/owner-pool-watch.ts) can tell the bot's operator actions from anyone else's
 //   --interval <s> --min-sources <n> --max-age <s> --max-disagreement <f> --pause-after <s> --resume-after <s>
 //   --dead-band <bps> --spend-fraction <f> --reserve-fraction <f> --min-move <bps> --side balanced|remove|add
 //   --target-depth <n> --max-anchor-distance <f> --base-fee <bps> --vol-multiplier <f> --behind-fee <bps>
@@ -26,12 +32,13 @@
 //
 // Keys: the operator key is loaded from --key (default data/stokenet-owner-pool-operator.key) and never
 // printed. The bot holds no owner key and cannot do anything only the owner may do.
-import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { makePriceSources, readSource, type PriceSource } from './owner-pool-sources.ts';
 import {
-  Decimal, Gateway, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, Quoter, accountOf, addr, aggregateReference, anchorCheck, buildTransaction,
-  calibrateScale, decideRebalance, feeDecision, feeTarget, keyFromHex, listCaviarNine, ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
+  AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, aggregateReference, anchorCheck, buildTransaction,
+  calibrateScale, decideRebalance, feeDecision, feeTarget, keyFromHex, ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
   ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, submitAndWait,
-  txAllowance, volatilityBps, type Ed25519Key, type NetworkName, type OwnerPoolState, type PauseState, type PriceSample, type RebalanceSide,
+  txAllowance, volatilityBps, type Ed25519Key, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
 } from '../packages/core/src/index.ts';
 
 // ------------------------------------------------------------------ arguments
@@ -87,14 +94,19 @@ const cfg = {
   feeControl: !flag('no-fee'),
   sources: (opt('sources') ?? 'ociswap,caviarnine,coingecko').split(',').map((s) => s.trim()).filter(Boolean),
   scale: opt('scale') ?? 'auto',
-  ownerAnchor: (opt('owner-anchor') ?? '1250:1').split(':') as [string, string],
+  ownerAnchorFlag: opt('owner-anchor') !== undefined ? parseAnchorFlag(opt('owner-anchor')!) : undefined,
+  anchorRecheckSec: num('anchor-recheck', D.anchorRecheckSec),
+  alertUrl: opt('alert-url') ?? process.env.OWNER_POOL_BOT_ALERT_URL ?? undefined,
+  alertIntervalSec: num('alert-interval', D.alertIntervalSec),
+  alertBehindTicks: num('alert-behind-ticks', D.alertBehindTicks),
+  alertErrorTicks: num('alert-error-ticks', D.alertErrorTicks),
+  sentLog: opt('sent-log') ?? 'data/owner-pool-bot-sent.jsonl',
   statePath: opt('state') ?? 'data/owner-pool-bot-state.json',
   keyPath: opt('key') ?? 'data/stokenet-owner-pool-operator.key',
   badge: opt('badge') ?? 'resource_tdx_2_1tkfvg8qudhzmp4fj8z5jlw3wnlsm6cghhwvcfmekwyz73xnwl2c24q',
   pool: opt('pool') ?? 'component_tdx_2_1cz95qapuv8wtewsjv7zdlvf2nuffjvqntt6yy8ynsva7xsfw0a24qk',
 };
 if (!['balanced', 'remove', 'add'].includes(cfg.side)) throw new Error('--side must be balanced, remove or add');
-if (cfg.ownerAnchor.length !== 2 || !(Number(cfg.ownerAnchor[0]) > 0 && Number(cfg.ownerAnchor[1]) > 0)) throw new Error('--owner-anchor must be A:B with both positive');
 if (!(cfg.spendFraction > 0 && cfg.spendFraction <= 1) || cfg.reserveFraction < 0 || cfg.reserveFraction >= 1) throw new Error('bad --spend-fraction / --reserve-fraction');
 
 const net = NETWORKS[NETWORK];
@@ -103,6 +115,8 @@ const gw = new Gateway(net);
 const mainnetGw = new Gateway(NETWORKS.mainnet);
 
 const log = (o: Record<string, unknown>) => console.log(JSON.stringify({ t: new Date().toISOString(), ...o }));
+// The alert URL may hold a private topic: it is never logged, only whether one is set.
+const redactedCfg = () => ({ ...cfg, keyPath: undefined, alertUrl: cfg.alertUrl ? '(set)' : undefined });
 
 // ------------------------------------------------------------------ state file
 
@@ -116,6 +130,12 @@ interface BotState {
   consecutiveFailures: number;
   haltedUntil?: number;
   lastTx?: { at: string; type: string; txid: string; status: string };
+  /** The owner's last anchor statement read from the ledger, and how far the search has got. */
+  ownerAnchor?: { statement?: OwnerAnchorStatement; complete: boolean; scannedTo: number; checkedAt: number; error?: string };
+  /** Consecutive ticks on which the bot could not close the gap. */
+  behindTicks?: number;
+  /** Alert rate limiter: last alert time per condition. */
+  alertLast?: Record<string, number>;
 }
 const loadState = (): BotState => {
   const fresh: BotState = { history: [], txTimes: [], pause: { pausedByBot: false }, consecutiveFailures: 0 };
@@ -123,6 +143,16 @@ const loadState = (): BotState => {
   return { ...fresh, ...JSON.parse(readFileSync(cfg.statePath, 'utf8')) };
 };
 const state = loadState();
+const alerts = new AlertSink(cfg.alertUrl, { intervalMs: cfg.alertIntervalSec * 1000, last: state.alertLast, prefix: `[owner-pool-bot ${NETWORK}${SEND ? '' : ' dry-run'}] ` });
+state.alertLast = alerts.limiter.last;
+/** Raise an alert (rate-limited per key); the outcome goes into the tick's log line, never the URL. */
+async function alert(key: string, text: string, into?: Record<string, unknown>): Promise<void> {
+  const r = await alerts.alert(key, text);
+  state.alertLast = alerts.limiter.last;
+  const rec = { key, sent: r.sent, ...(r.suppressed ? { suppressed: true } : {}), ...(r.error ? { error: r.error } : {}), ...(alerts.enabled ? {} : { noUrl: true }) };
+  if (into) ((into.alerts ??= []) as unknown[]).push(rec);
+  else log({ event: 'alert', ...rec, text: r.text });
+}
 const saveState = () => {
   const tmp = `${cfg.statePath}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 1) + '\n');
@@ -142,108 +172,7 @@ const unlock = () => { try { unlinkSync(lockPath); } catch { /* gone */ } };
 
 // ------------------------------------------------------------------ price sources (mainnet, read-only)
 
-const MAINNET_XRD = NETWORKS.mainnet.xrd;
-const HUSDC = 'resource_rdx1thxj9m87sn5cc9ehgp9qxp6vzeqxtce90xm5cp33373tclyp4et4gv';
-/** Ociswap BasicPool XRD/hUSDC (constant product) and the native pool that holds its funds. */
-const OCI_COMPONENT = 'component_rdx1cpqg9y55tv8652k32cznhmu8rz3jgtw57vdg460ld2sy650zpfh5fr';
-/** CaviarNine QuantaSwap XRD/hUSDC (also in CAVIARNINE_POOLS). */
-const C9_COMPONENT = 'component_rdx1cqelumvmmgwths34k9pp0htd2ykwq7d70m0r389etwh39ul3j5tyj5';
-
-interface PriceSource { name: string; read(): Promise<PriceSample> }
-
-/** Ociswap XRD/hUSDC basic pool, from the ledger: hUSDC reserve / XRD reserve (the curve's mid price, no fee). */
-const ociswapSource = (): PriceSource => ({
-  name: 'ociswap-xrd-husdc-ledger',
-  async read() {
-    const c = await mainnetGw.post('/state/entity/details', { addresses: [OCI_COMPONENT] });
-    const fields: any[] = c?.items?.[0]?.details?.state?.fields ?? [];
-    const f = (n: string) => fields.find((x) => x?.field_name === n)?.value;
-    if (c?.items?.[0]?.details?.blueprint_name !== 'BasicPool' || f('x_address') !== MAINNET_XRD || f('y_address') !== HUSDC) throw new Error('Ociswap pool is not XRD/hUSDC BasicPool');
-    const pool = String(f('liquidity_pool'));
-    const j = await mainnetGw.post('/state/entity/details', { addresses: [pool], aggregation_level: 'Global' });
-    const items: any[] = j?.items?.[0]?.fungible_resources?.items ?? [];
-    const bal = (r: string) => Number(items.find((i) => i?.resource_address === r)?.amount);
-    const x = bal(MAINNET_XRD), y = bal(HUSDC);
-    if (!(x > 0 && y > 0)) throw new Error('Ociswap pool reserves unreadable');
-    return { source: this.name, price: y / x, at: Date.parse(j.ledger_state.proposer_round_timestamp) };
-  },
-});
-
-/**
- * CaviarNine XRD/hUSDC, through the project's own Quoter: previews of a small sell each way on
- * mainnet (free, nothing signed); the mid is the geometric mean of the two prices, so the venue fee
- * cancels out. Its active bin is ~5% wide, so the bin bounds alone are too coarse.
- */
-const caviarNineSource = (): PriceSource => {
-  const quoter = new Quoter(mainnetGw);
-  return {
-    name: 'caviarnine-xrd-husdc-quoter',
-    async read() {
-      const { pools } = await listCaviarNine(mainnetGw, { addresses: [C9_COMPONENT] });
-      const pool = pools[0];
-      if (!pool || !pool.tokens.includes(MAINNET_XRD) || !pool.tokens.includes(HUSDC)) throw new Error('CaviarNine XRD/hUSDC pool unreadable');
-      const at = Date.now();
-      const [sellXrd, sellUsd] = await Promise.all([quoter.simulate([pool], MAINNET_XRD, '100'), quoter.simulate([pool], HUSDC, '0.08')]);
-      if (!sellXrd || !sellUsd) throw new Error(`CaviarNine preview failed: ${quoter.lastFailure ?? 'no quote'}`);
-      const bid = Number(sellXrd.buyAmount) / Number(sellXrd.sellAmount); // hUSDC per XRD when selling XRD
-      const ask = Number(sellUsd.sellAmount) / Number(sellUsd.buyAmount); // hUSDC per XRD when buying XRD
-      if (!(bid > 0 && ask > 0)) throw new Error('CaviarNine quotes unusable');
-      return { source: this.name, price: Math.sqrt(bid * ask), at };
-    },
-  };
-};
-
-/** CoinGecko simple price (keyless, off-ledger): XRD in USD, with its own last-updated time. */
-const coingeckoSource = (): PriceSource => ({
-  name: 'coingecko-xrd-usd',
-  async read() {
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=radix&vs_currencies=usd&include_last_updated_at=true', { signal: AbortSignal.timeout(15_000), headers: { accept: 'application/json' } });
-    if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
-    const j: any = await res.json();
-    const price = Number(j?.radix?.usd), at = Number(j?.radix?.last_updated_at) * 1000;
-    if (!(price > 0) || !(at > 0)) throw new Error('CoinGecko response unusable');
-    return { source: this.name, price, at };
-  },
-});
-
-/** A fixed price, always fresh: tests and drills only. */
-const fixedSource = (price: number, i: number): PriceSource => ({
-  name: `fixed#${i}`,
-  async read() { return { source: this.name, price, at: Date.now() }; },
-});
-
-/** A price kept in a file (JSON {"price": n, "at": iso|ms} or a bare number, then the file's mtime is its time). */
-const fileSource = (path: string): PriceSource => ({
-  name: `file:${path}`,
-  async read() {
-    const text = readFileSync(path, 'utf8').trim();
-    let price: number, at: number;
-    if (text.startsWith('{')) {
-      const j = JSON.parse(text);
-      price = Number(j.price);
-      at = j.at === undefined ? statSync(path).mtimeMs : typeof j.at === 'number' ? j.at : Date.parse(j.at);
-    } else { price = Number(text); at = statSync(path).mtimeMs; }
-    if (!(price > 0) || !Number.isFinite(at)) throw new Error('price file unusable');
-    return { source: this.name, price, at };
-  },
-});
-
-const sources: PriceSource[] = cfg.sources.map((s, i) => {
-  if (s === 'ociswap') return ociswapSource();
-  if (s === 'caviarnine') return caviarNineSource();
-  if (s === 'coingecko') return coingeckoSource();
-  if (s.startsWith('fixed:')) { const p = Number(s.slice(6)); if (!(p > 0)) throw new Error(`bad ${s}`); return fixedSource(p, i); }
-  if (s.startsWith('file:')) return fileSource(s.slice(5));
-  throw new Error(`Unknown price source ${s}`);
-});
-
-const readSource = async (s: PriceSource): Promise<PriceSample> => {
-  try {
-    return await Promise.race([s.read(), new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timed out after 30 s')), 30_000))]);
-  } catch (e) {
-    return { source: s.name, price: NaN, at: 0, error: String((e as Error)?.message ?? e).slice(0, 200) };
-  }
-};
+const sources: PriceSource[] = makePriceSources(cfg.sources, mainnetGw);
 
 // ------------------------------------------------------------------ ledger reads
 
@@ -286,10 +215,15 @@ async function execute(type: string, manifest: string): Promise<Sent> {
   if (!pv.ok || !SEND) return { type, preview, sent: false };
   state.txTimes = [...state.txTimes.filter((t) => now - t < 3_600_000), now];
   saveState();
+  // Recorded BEFORE submission: an operator action on ledger that is not in this file was not ours.
+  appendFileSync(cfg.sentLog, JSON.stringify({ at: new Date().toISOString(), txid: tx.intentHashId, type, pool: cfg.pool, network: NETWORK }) + '\n');
   const out = await submitAndWait(gw, tx, 180_000);
   const ok = out.status === 'CommittedSuccess';
   state.consecutiveFailures = ok ? 0 : state.consecutiveFailures + 1;
-  if (state.consecutiveFailures >= cfg.maxConsecutiveFailures) state.haltedUntil = Date.now() + cfg.haltSec * 1000;
+  if (state.consecutiveFailures >= cfg.maxConsecutiveFailures) {
+    state.haltedUntil = Date.now() + cfg.haltSec * 1000;
+    await alert('halt', `HALTED: ${state.consecutiveFailures} failed sends in a row (last ${type} ${tx.intentHashId}: ${out.status}${'error' in out ? ' ' + out.error.slice(0, 120) : ''}). No sends until ${new Date(state.haltedUntil).toISOString()}.`);
+  }
   state.lastTx = { at: new Date().toISOString(), type, txid: tx.intentHashId, status: out.status };
   saveState();
   return { type, preview, sent: true, txid: tx.intentHashId, status: out.status, ...('error' in out ? { error: out.error.slice(0, 300) } : {}) };
@@ -301,6 +235,35 @@ async function rebalanceEvent(txid: string): Promise<{ cost?: string; allowance?
   const ev = (j.transaction?.receipt?.events ?? []).find((e: any) => e.name === 'OwnerPoolRebalanceEvent');
   const field = (n: string) => ev?.data?.fields?.find((x: any) => x.field_name === n)?.value;
   return { cost: field('cost'), allowance: field('allowance') };
+}
+
+// ------------------------------------------------------------------ the owner's anchor (ledger)
+
+/**
+ * The owner's last anchor statement, cached in the state file and re-read from the ledger every
+ * --anchor-recheck seconds (incrementally: only transactions after the last one searched).
+ */
+async function ownerAnchor(now: number, line: Record<string, unknown>): Promise<OwnerAnchorSource> {
+  const c = state.ownerAnchor;
+  if (!c || !c.complete || now - c.checkedAt >= cfg.anchorRecheckSec * 1000) {
+    try {
+      const r = c && c.scannedTo > 0
+        ? await refreshOwnerAnchor(gw, cfg.pool, c.statement, c.scannedTo)
+        : await findOwnerAnchor(gw, cfg.pool);
+      const prev = c?.statement;
+      state.ownerAnchor = { statement: r.statement, complete: r.complete, scannedTo: r.newest, checkedAt: now };
+      if (r.statement && prev && r.statement.stateVersion !== prev.stateVersion) {
+        line.ownerAnchorChanged = { from: prev.anchor, to: r.statement.anchor, txid: r.statement.txid };
+        await alert('anchor-restated', `Owner restated the anchor: ${prev.anchor.join(':')} -> ${r.statement.anchor.join(':')} (${r.statement.txid}). Allowance restarts from zero.`, line);
+      }
+    } catch (e) {
+      const msg = String((e as Error)?.message ?? e).slice(0, 200);
+      // Keep what was known (it was the ledger's answer at the last check); record the failure.
+      state.ownerAnchor = c ? { ...c, error: msg } : { complete: false, scannedTo: 0, checkedAt: 0, error: msg };
+    }
+  }
+  const k = state.ownerAnchor!;
+  return resolveOwnerAnchor({ ledger: k.statement, ledgerComplete: k.complete, ledgerError: k.statement ? undefined : k.error, flag: cfg.ownerAnchorFlag });
 }
 
 // ------------------------------------------------------------------ one tick
@@ -340,13 +303,20 @@ async function tick(): Promise<void> {
   state.targetDepth ??= cfg.targetDepth ?? Math.sqrt(Number(pool.reserveA) * Number(pool.reserveB));
   const targetDepth = cfg.targetDepth ?? state.targetDepth;
 
-  // 3. Map the reference onto the pool.
+  // 3. The owner's anchor (ledger first), then map the reference onto the pool.
+  const oa = await ownerAnchor(now, line);
+  const ownerAnchorNow = oa.source === 'none' ? undefined : oa.anchor;
+  line.ownerAnchorSource = oa.source === 'ledger'
+    ? { source: 'ledger', anchor: oa.anchor, txid: oa.txid, stateVersion: oa.stateVersion, ...(oa.flagMismatch ? { warning: `--owner-anchor ${oa.flagMismatch.join(':')} differs from the ledger's; the ledger is used` } : {}) }
+    : { source: oa.source, reason: oa.reason, ...(oa.source === 'flag' ? { anchor: oa.anchor } : {}) };
+  if (oa.source === 'ledger') alerts.limiter.clear('anchor-unknown');
+  else await alert('anchor-unknown', `Owner anchor ${oa.source === 'flag' ? `taken from --owner-anchor ${oa.anchor.join(':')}` : 'UNKNOWN: not rebalancing'}: ${oa.reason}`, line);
   let scale: number | undefined;
   if (cfg.scale !== 'auto') scale = Number(cfg.scale);
-  else if (state.calibration && state.calibration.anchor.join(':') === cfg.ownerAnchor.join(':')) scale = state.calibration.scale;
-  else if (ref.ok) {
-    scale = calibrateScale(ref.price, cfg.ownerAnchor);
-    state.calibration = { reference: ref.price, scale, at: new Date(now).toISOString(), anchor: cfg.ownerAnchor };
+  else if (ownerAnchorNow && state.calibration && state.calibration.anchor.join(':') === ownerAnchorNow.join(':')) scale = state.calibration.scale;
+  else if (ref.ok && ownerAnchorNow) {
+    scale = calibrateScale(ref.price, ownerAnchorNow);
+    state.calibration = { reference: ref.price, scale, at: new Date(now).toISOString(), anchor: ownerAnchorNow };
     line.calibrated = state.calibration;
   }
   if (scale !== undefined && !(scale > 0)) throw new Error(`--scale must be positive or auto, not ${cfg.scale}`);
@@ -358,9 +328,16 @@ async function tick(): Promise<void> {
 
   // 4. The owner's anchor: how far may the bot follow?
   const stoppedForAnchor = state.pause.pausedByBot && /anchor/.test(state.pause.pauseReason ?? '');
-  const anchor = target ? anchorCheck(target, cfg.ownerAnchor, { maxDistance: cfg.maxAnchorDistance, resumeFactor: cfg.anchorResumeFactor, stopped: stoppedForAnchor }) : { ok: true, distance: NaN };
-  line.ownerAnchor = { anchor: cfg.ownerAnchor, distance: Number.isNaN(anchor.distance) ? null : round(anchor.distance, 5), ok: anchor.ok };
-  if (!anchor.ok) line.ownerMustAct = `reference maps to ${target} B per A, ${(anchor.distance * 100).toFixed(2)}% from the owner's anchor ${cfg.ownerAnchor.join(':')} (limit ${(cfg.maxAnchorDistance * 100).toFixed(1)}%): the bot stops following. The OWNER must restate the anchor (set_anchor) from the market; the bot cannot and must not.`;
+  // Unknown anchor: no distance can be measured, so no anchor stop either; the rebalance is refused below.
+  const anchor = target && ownerAnchorNow ? anchorCheck(target, ownerAnchorNow, { maxDistance: cfg.maxAnchorDistance, resumeFactor: cfg.anchorResumeFactor, stopped: stoppedForAnchor }) : { ok: true, distance: NaN };
+  line.ownerAnchor = { anchor: ownerAnchorNow ?? null, distance: Number.isNaN(anchor.distance) ? null : round(anchor.distance, 5), ok: anchor.ok };
+  if (!anchor.ok) {
+    line.ownerMustAct = `reference maps to ${target} B per A, ${(anchor.distance * 100).toFixed(2)}% from the owner's anchor ${ownerAnchorNow!.join(':')} (limit ${(cfg.maxAnchorDistance * 100).toFixed(1)}%): the bot stops following. The OWNER must restate the anchor (set_anchor) from the market; the bot cannot and must not.`;
+    await alert('anchor-stop', `ANCHOR STOP: ${line.ownerMustAct}`, line);
+  } else alerts.limiter.clear('anchor-stop');
+  if (!ref.ok && state.pause.unhealthySince !== undefined && now - state.pause.unhealthySince >= cfg.pauseAfterSec * 1000) {
+    await alert('sources-unhealthy', `Price sources unhealthy for ${Math.round((now - state.pause.unhealthySince) / 60_000)} min (${ref.reason}).`, line);
+  } else if (ref.ok) alerts.limiter.clear('sources-unhealthy');
 
   const isOperator = st.operator === cfg.badge && s.operator === cfg.badge;
   if (!isOperator) {
@@ -381,12 +358,16 @@ async function tick(): Promise<void> {
     // Keep the timers; record the pause as the bot's only if it really happened.
     state.pause = r.status === 'CommittedSuccess' ? pd.state : { ...pd.state, pausedByBot: state.pause.pausedByBot, pauseReason: state.pause.pauseReason };
     line.decision = `${pd.action}: ${pd.reason}`;
+    const outcome = r.sent ? `${r.status} ${r.txid}` : r.skipped ?? (r.preview.ok ? 'previewed ok, not sent (dry run)' : `PREVIEW FAILED: ${r.preview.error ?? ''}`);
+    alerts.limiter.clear(pd.action === 'pause' ? 'pool-unpause' : 'pool-pause');
+    await alert(`pool-${pd.action}`, `Bot ${pd.action === 'pause' ? 'PAUSED' : 'RESUMED'} the pool (operator pause ${pd.action === 'pause' ? 'on' : 'off'}): ${pd.reason}. ${outcome}`, line);
     return void log(line);
   }
   state.pause = pd.state;
   if (s.ownerPaused) { line.decision = 'owner pause on: nothing to do (only the owner reopens)'; return void log(line); }
   if (s.operatorPaused) { line.decision = 'operator pause on: no rebalance or fee change'; return void log(line); }
   if (!ref.ok || !target) { line.decision = `no reference (${ref.ok ? 'no target' : ref.reason}): no rebalance`; return void log(line); }
+  if (!ownerAnchorNow) { line.decision = 'owner anchor unknown: no rebalance, no fee change'; return void log(line); }
   if (!anchor.ok) { line.decision = 'beyond the owner anchor distance: not following'; return void log(line); }
 
   // 6. Rebalance.
@@ -407,6 +388,12 @@ async function tick(): Promise<void> {
       line.after = { event: ev, price: new Decimal(after.reserveB).div(after.reserveA).toNumber(), reserveA: after.reserveA, reserveB: after.reserveB, gapBps: round(priceDistance(new Decimal(after.reserveB).div(after.reserveA).toNumber(), target) * 10_000, 2) };
     } else if (!r.sent && !r.preview.ok) behind = true;
   } else line.rebalance = { action: 'none', reason: dec.reason, allowance: dec.allowance, spendable: dec.spendable };
+
+  state.behindTicks = behind ? (state.behindTicks ?? 0) + 1 : 0;
+  line.behindTicks = state.behindTicks;
+  if (state.behindTicks >= cfg.alertBehindTicks) {
+    await alert('behind', `Bot BEHIND for ${state.behindTicks} ticks: pool ${round(price, 9)} vs target ${round(target, 9)} (gap ${round(priceDistance(price, target) * 10_000, 1)} bps; ${dec.action === 'none' ? dec.reason : 'clipped move'}).`, line);
+  } else if (state.behindTicks === 0) alerts.limiter.clear('behind');
 
   // 7. Fee.
   if (cfg.feeControl) {
@@ -435,16 +422,20 @@ process.on('SIGINT', () => stop('SIGINT'));
 process.on('SIGTERM', () => stop('SIGTERM'));
 const sleep = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); wake = () => { clearTimeout(t); r(); }; });
 
-log({ event: 'start', mode: SEND ? 'send' : 'dry-run', network: NETWORK, pool: cfg.pool, operatorAccount, badge: cfg.badge, sources: sources.map((s) => s.name), config: { ...cfg, keyPath: undefined } });
+log({ event: 'start', mode: SEND ? 'send' : 'dry-run', network: NETWORK, pool: cfg.pool, operatorAccount, badge: cfg.badge, sources: sources.map((s) => s.name), config: redactedCfg() });
+if (!ONCE) await alert('start', `Bot started (pid ${process.pid}) on ${cfg.pool.slice(0, 24)}...: sources ${cfg.sources.join(',')}, disagreement bound ${(cfg.maxDisagreement * 100).toFixed(1)}%.`);
 let errors = 0;
 try {
   while (!stopping) {
     try {
       await tick();
+      if (errors >= cfg.alertErrorTicks) alerts.limiter.clear('tick-errors');
       errors = 0;
     } catch (e) {
       errors++;
-      log({ event: 'error', tick: tickNo, consecutiveErrors: errors, message: String((e as Error)?.message ?? e).slice(0, 400) });
+      const message = String((e as Error)?.message ?? e).slice(0, 400);
+      log({ event: 'error', tick: tickNo, consecutiveErrors: errors, message });
+      if (errors >= cfg.alertErrorTicks) await alert('tick-errors', `Bot ticks failing: ${errors} in a row (backing off). Last: ${message.slice(0, 200)}`);
       if (ONCE) process.exitCode = 1;
     }
     saveState();
@@ -454,6 +445,7 @@ try {
     await sleep(delay);
   }
 } finally {
+  if (!ONCE) await alert('stop', `Bot stopped after ${tickNo} ticks${stopping ? '' : ' (unexpectedly)'}.`);
   saveState();
   unlock();
   log({ event: 'stopped', ticks: tickNo });

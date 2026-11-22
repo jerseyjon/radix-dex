@@ -50,6 +50,12 @@ export const OWNER_POOL_BOT_DEFAULTS = {
   haltSec: 3600,
   feeLockXrd: '5',
   historyKeepSec: 6 * 3600,
+  /** Re-read the owner's anchor statement from the ledger this often. */
+  anchorRecheckSec: 300,
+  /** Alerts: one per condition per interval; "behind" after this many ticks in a row; tick errors after this many. */
+  alertIntervalSec: 3600,
+  alertBehindTicks: 10,
+  alertErrorTicks: 3,
 };
 
 export type RebalanceSide = 'balanced' | 'remove' | 'add';
@@ -343,4 +349,43 @@ export function feeDecision(o: { currentFeeBps: number; targetFeeBps: number; la
 /** Transactions still allowed in the hour before `now`, given the send times (ms) so far. */
 export function txAllowance(sentAt: number[], now: number, maxPerHour: number): number {
   return Math.max(0, maxPerHour - sentAt.filter((t) => now - t < 3_600_000 && t <= now).length);
+}
+
+// ------------------------------------------------------------------ the owner's anchor
+
+export type OwnerAnchorSource =
+  | { source: 'ledger'; anchor: [string, string]; txid: string; stateVersion: number; at: number; flagMismatch?: [string, string] }
+  | { source: 'flag'; anchor: [string, string]; reason: string }
+  | { source: 'none'; reason: string };
+
+/**
+ * Which anchor the bot measures its distance from. The ledger's last owner statement (the most recent
+ * `OwnerPoolAnchorEvent`, see ownerpool-events.ts) whenever it is known; the `--owner-anchor` flag only
+ * when the ledger cannot say (no statement found, search incomplete, or the Gateway failed before any
+ * answer) AND the flag was given explicitly; otherwise none, and the bot must not rebalance.
+ * A flag that disagrees with the ledger is reported, never used.
+ */
+export function resolveOwnerAnchor(o: {
+  ledger?: { anchor: [string, string]; txid: string; stateVersion: number; at: number };
+  /** The ledger search reached the pool's first event (or found a statement): its answer is final. */
+  ledgerComplete: boolean;
+  ledgerError?: string;
+  flag?: [string, string];
+}): OwnerAnchorSource {
+  if (o.ledger && o.ledgerComplete) {
+    const mismatch = o.flag && priceDistance(anchorPrice(o.flag), anchorPrice(o.ledger.anchor)) > 1e-9 ? o.flag : undefined;
+    return { source: 'ledger', ...o.ledger, ...(mismatch ? { flagMismatch: mismatch } : {}) };
+  }
+  const why = o.ledgerError ? `ledger lookup failed: ${o.ledgerError}`
+    : !o.ledgerComplete ? 'ledger search incomplete'
+    : 'the pool has no owner anchor statement on ledger';
+  if (o.flag) return { source: 'flag', anchor: o.flag, reason: `${why}; using --owner-anchor` };
+  return { source: 'none', reason: `${why}; no --owner-anchor given: the bot will not rebalance` };
+}
+
+/** Parse "A:B" (both positive) or throw. */
+export function parseAnchorFlag(s: string): [string, string] {
+  const p = s.split(':');
+  if (p.length !== 2 || !(Number(p[0]) > 0 && Number(p[1]) > 0)) throw new Error('--owner-anchor must be A:B with both positive');
+  return [p[0]!.trim(), p[1]!.trim()];
 }
