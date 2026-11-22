@@ -6,6 +6,7 @@ export * from './ownerpool.ts';
 export * from './ownerpool-ops.ts';
 export * from './ownerpool-bot.ts';
 export * from './ownerpool-events.ts';
+export * from './ownerpool-watch.ts';
 export * from './alerts.ts';
 export * from './quote.ts';
 export * from './markets.ts';
