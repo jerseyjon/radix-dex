@@ -101,7 +101,7 @@ export class Gateway {
    */
   async swapsAt(component: string, base: string, quote: string, limit = 30, holders: string[] = [component]): Promise<LedgerSwap[]> {
     const j = await this.post('/stream/transactions', {
-      affected_global_entities_filter: [component], order: 'desc', limit_per_page: Math.min(limit, 100), opt_ins: { balance_changes: true },
+      affected_global_entities_filter: [component], order: 'desc', limit_per_page: Math.min(limit, 100), opt_ins: { balance_changes: true, receipt_events: true },
     });
     return (j?.items ?? []).flatMap((t: any) => swapsInTransaction(t, base, quote, new Set(holders)));
   }
@@ -269,9 +269,16 @@ export interface LedgerSwap { txid: string; time: number; side: 'buy' | 'sell'; 
  * Any other component is ignored: an aggregator or arbitrage contract passing both tokens through
  * on a longer route is not a trade in this market. Adding or removing liquidity moves both the
  * same way and is ignored. Without `holders`, every non-account entity counts (old behaviour).
+ *
+ * A transaction in which a holder's liquidity changed (its receipt events, when present, include a
+ * liquidity event from a holder) is left out whole: liquidity taken out and put back at another
+ * ratio or range in one transaction (a concentrated position moved, a zap, a pool repriced) nets
+ * to opposite moves that are not a trade, and any real swap inside it cannot be told apart from
+ * the net figures. Missing such a swap on the tape is better than showing one that never happened.
  */
 export function swapsInTransaction(t: any, base: string, quote: string, holders?: Set<string>): LedgerSwap[] {
   if (t?.transaction_status !== 'CommittedSuccess' || typeof t.intent_hash !== 'string') return [];
+  if (changesLiquidity(t, holders)) return [];
   const time = Math.floor(Date.parse(t.confirmed_at ?? t.round_timestamp) / 1000);
   const net = new Map<string, { b: number; q: number }>();
   for (const c of t.balance_changes?.fungible_balance_changes ?? []) {
@@ -289,5 +296,22 @@ export function swapsInTransaction(t: any, base: string, quote: string, holders?
     out.push({ txid: t.intent_hash, time, side: b > 0 ? 'sell' : 'buy', price: Math.abs(q / b), size: Math.abs(b), entity });
   }
   return out;
+}
+
+/**
+ * Liquidity events of the pools we read: Ociswap precision pools and DefiPlaza pairs (Add/RemoveLiquidityEvent),
+ * native pools behind Ociswap basic pools and DefiPlaza pairs (Contribution/RedemptionEvent), and the
+ * test pool used on Stokenet (LiquidityEvent).
+ */
+const LIQUIDITY_EVENT = /^(AddLiquidity|RemoveLiquidity|Liquidity|Contribution|Redemption)Event$/;
+
+/** Whether one of `holders` (any non-account entity without them) emitted a liquidity event in the transaction. */
+function changesLiquidity(t: any, holders?: Set<string>): boolean {
+  for (const e of t?.receipt?.events ?? []) {
+    const emitter = e?.emitter?.entity?.entity_address;
+    if (typeof e?.name !== 'string' || typeof emitter !== 'string' || !LIQUIDITY_EVENT.test(e.name)) continue;
+    if (holders ? holders.has(emitter) : !emitter.startsWith('account_')) return true;
+  }
+  return false;
 }
 

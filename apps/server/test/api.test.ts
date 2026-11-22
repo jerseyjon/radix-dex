@@ -229,6 +229,29 @@ test('only a market pool\'s own holdings count as a trade, not a component passi
   assert.deepEqual(swapsInTransaction(tx, net.xrd, TUSD, new Set(['component_pool', 'pool_native'])).map((s) => s.entity), ['pool_native']);
 });
 
+test('a transaction that takes liquidity out and puts it back at another ratio is not a trade', () => {
+  const ch = (entity_address: string, resource_address: string, balance_change: string) => ({ entity_address, resource_address, balance_change });
+  const ev = (name: string, entity_address: string) => ({ name, emitter: { type: 'Method', entity: { entity_address }, object_module_id: 'Main' } });
+  // As in the Stokenet repricing: remove, swap, add, in one transaction. The net moves look like a 1,016,460 XRD sell.
+  const tx = { transaction_status: 'CommittedSuccess', intent_hash: 'tx', confirmed_at: '2026-11-21T22:00:00.000Z',
+    balance_changes: { fungible_balance_changes: [
+      ch('account_a', net.xrd, '-1016460.88'), ch('account_a', TUSD, '1571.89'),
+      ch('component_pool', net.xrd, '1016460.88'), ch('component_pool', TUSD, '-1571.89'),
+    ] },
+    receipt: { events: [ev('LiquidityEvent', 'component_pool'), ev('SwapEvent', 'component_pool'), ev('LiquidityEvent', 'component_pool')] } };
+  const holders = new Set(['component_pool']);
+  assert.deepEqual(swapsInTransaction(tx, net.xrd, TUSD, holders), []);
+  assert.deepEqual(swapsInTransaction(tx, net.xrd, TUSD), [], 'without holders too');
+  // Each pool kind's liquidity events are recognised: Ociswap precision and DefiPlaza, and native pools.
+  for (const name of ['AddLiquidityEvent', 'RemoveLiquidityEvent', 'ContributionEvent', 'RedemptionEvent']) {
+    assert.deepEqual(swapsInTransaction({ ...tx, receipt: { events: [ev(name, 'component_pool')] } }, net.xrd, TUSD, holders), [], name);
+  }
+  // A plain swap is still read, and liquidity moved in some other pool does not hide it.
+  const swap = { ...tx, receipt: { events: [ev('SwapEvent', 'component_pool'), ev('ContributionEvent', 'pool_elsewhere')] } };
+  assert.equal(swapsInTransaction(swap, net.xrd, TUSD, holders).length, 1);
+  assert.equal(swapsInTransaction({ ...tx, receipt: undefined }, net.xrd, TUSD, holders).length, 1, 'no events opted in: as before');
+});
+
 test('an order whose key is already cancelled in the registry is refused at submission', async () => {
   const registry = await accountOf(keyFromHex(randomBytes(32).toString('hex')), net.networkId);
   const app2 = await createApp(loadConfig({ DEX_NETWORK: 'stokenet', DEX_DATA_DIR: ':memory:', DEX_SOLVER_BADGE: BADGE, DEX_REGISTRY: registry }));
