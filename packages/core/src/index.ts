@@ -4,6 +4,7 @@ export * from './manifest.ts';
 export * from './venues.ts';
 export * from './ownerpool.ts';
 export * from './ownerpool-ops.ts';
+export * from './ownerpool-bot.ts';
 export * from './quote.ts';
 export * from './markets.ts';
 export * from './orders.ts';

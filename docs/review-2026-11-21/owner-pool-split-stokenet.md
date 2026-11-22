@@ -61,3 +61,6 @@ after the restore; non-owner deposit; swap_with_minimum above the quote; set_fee
 - Stokenet epochs were about 10 minutes during the run (24806 -> 24809 in ~30 min): the operator's
   allowance refills 0.000417 per epoch at the defaults, so a fresh appointment waited 3 epochs for
   the first 0.1% move.
+
+Operator builders proven later (operator_set_fee, set_operator_paused; set_anchor and withdraw_inventory
+previewed) and the market-making bot: `docs/owner-pool-bot.md`.

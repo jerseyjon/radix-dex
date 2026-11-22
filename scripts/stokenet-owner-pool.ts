@@ -29,6 +29,9 @@
 //             account; the pool quotes again.
 //   quotes    compare the ledger's `quote` (by preview) with the TypeScript copy, many sizes both ways.
 //   gas       measure the preview fee of withdraw + swap_with_minimum + deposit_batch.
+//   builders  the builders the bot needs, on ledger: operator_set_fee 40 then 30 and set_operator_paused
+//             true then false (operator key, sent with --send); set_anchor and withdraw_inventory (owner,
+//             preview only), plus their refusals with the operator badge.
 //   status    print the pool's state.
 //
 // Every manifest is built by code (packages/core/src/ownerpool-ops.ts for the pool calls) and previewed
@@ -49,7 +52,8 @@ import {
   Decimal, Gateway, NETWORKS, OwnerPoolQuoteError, Quoter, accountOf, addr, buildTransaction, dec, fromAttos, keyFromHex, ownerPoolAllowanceNow,
   ownerPoolAnchorDistance, ownerPoolDepositInventoryManifest, ownerPoolDepositManifest, ownerPoolOwnerRebalanceManifest, ownerPoolPlanRebalance,
   ownerPoolQuote, ownerPoolRebalanceManifest, ownerPoolSetFeeManifest, ownerPoolSetOperatorLimitsManifest, ownerPoolSetOperatorManifest,
-  ownerPoolSetPausedManifest, ownerPoolSuggestedLimits, ownerPoolSwapInstruction, ownerPoolWithdrawManifest, readOwnerPools, submitAndWait, toAttos,
+  ownerPoolOperatorSetFeeManifest, ownerPoolSetAnchorManifest, ownerPoolSetOperatorPausedManifest, ownerPoolSetPausedManifest, ownerPoolSuggestedLimits,
+  ownerPoolSwapInstruction, ownerPoolWithdrawInventoryManifest, ownerPoolWithdrawManifest, readOwnerPools, submitAndWait, toAttos,
   toHex, type Ed25519Key, type OwnerPoolSigner, type OwnerPoolState, type Pool,
 } from '../packages/core/src/index.ts';
 
@@ -565,6 +569,47 @@ if (step === 'gas') {
   state.gas = { at: new Date().toISOString(), shape: 'withdraw + swap_with_minimum + deposit_batch, V1 preview with free credit', min: Math.min(...vals), max: Math.max(...vals), samples: fees, referenceRadixdexPool: ref.ok ? ref.feeXrd : null };
   save();
   console.log(`min ${Math.min(...vals)} max ${Math.max(...vals)} XRD`);
+}
+
+// ====================================================================== builders
+// The operator/owner builders the bot relies on that were not yet proven on ledger: operator_set_fee
+// and set_operator_paused (sent: harmless and reversed at once), set_anchor and withdraw_inventory
+// (owner, PREVIEW ONLY: the anchor is not changed and nothing leaves the inventory).
+if (step === 'builders') {
+  if (!state.txids.restore) throw new Error('run restore first');
+  const op = operatorSigner(state.operatorBadge2);
+  let p = await pool(); show(p);
+  const fee = (bps: number) => ownerPoolOperatorSetFeeManifest({ pool: state.pool, operator: op, feeLockXrd: '10', feeBps: bps });
+  await run('operator_set_fee 101 (outside the 10-100 range: must fail)', fee(101), operatorKey, { fail: /Fee outside the operator's range/, previewOnly: true });
+  if (!state.txids.operatorSetFee40) {
+    record('operatorSetFee40', await run('operator_set_fee 40', fee(40), operatorKey));
+    if (send) { p = await pool(); console.log(`  fee now ${p.feeBps} bps`); if (p.feeBps !== 40) throw new Error('fee not 40'); }
+  }
+  if (!state.txids.operatorSetFee30) {
+    record('operatorSetFee30', await run('operator_set_fee 30 (back)', fee(30), operatorKey));
+    if (send) { p = await pool(); console.log(`  fee now ${p.feeBps} bps`); if (p.feeBps !== 30) throw new Error('fee not back at 30'); }
+  }
+  const opPause = (v: boolean) => ownerPoolSetOperatorPausedManifest({ pool: state.pool, signer: op, paused: v, feeLockXrd: '10' });
+  if (!state.txids.operatorPause) {
+    record('operatorPause', await run('set_operator_paused(true) by the operator', opPause(true), operatorKey));
+    if (send) {
+      p = await pool();
+      const lq = await ledgerQuote(XRD, '10'), tq = localQuote(p, XRD, '10');
+      console.log(`  owner pause ${p.split!.ownerPaused}, operator pause ${p.split!.operatorPaused}; ledger quote: ${lq.ok ? lq.out : lq.error.slice(-40)}; local: ${tq.ok ? tq.out : tq.error}`);
+      if (!p.split!.operatorPaused || p.split!.ownerPaused || lq.ok || tq.ok) throw new Error('operator pause not seen');
+    }
+  }
+  if (!state.txids.operatorUnpause) {
+    record('operatorUnpause', await run('set_operator_paused(false) by the operator', opPause(false), operatorKey));
+    if (send) { p = await pool(); if (p.paused) throw new Error('still paused'); console.log('  pool open again'); }
+  }
+  p = await pool();
+  // Owner, preview only. set_anchor restating the anchor already on ledger, guarded by the reserves seen.
+  await run('set_anchor (owner, preview only, same anchor as on ledger)', ownerPoolSetAnchorManifest({ pool: state.pool, owner: ownerSigner(), feeLockXrd: '20', anchor: p.split!.anchor, expected: reservesOf(p) }), ownerKey, { previewOnly: true });
+  await run('set_anchor with the operator badge (owner only: must be refused)', ownerPoolSetAnchorManifest({ pool: state.pool, owner: op, feeLockXrd: '10', anchor: p.split!.anchor }), operatorKey, { fail: /Unauthorized|AssertAccessRuleFailed|auth/i, previewOnly: true });
+  await run('withdraw_inventory 1 XRD + 0.000001 TEUR (owner, preview only)', ownerPoolWithdrawInventoryManifest({ pool: state.pool, owner: ownerSigner(), feeLockXrd: '20', amountA: '1', amountB: '0.000001' }), ownerKey, { previewOnly: true });
+  await run('withdraw_inventory with the operator badge (must be refused)', ownerPoolWithdrawInventoryManifest({ pool: state.pool, owner: op, feeLockXrd: '10', amountA: '1', amountB: '0', to: operator }), operatorKey, { fail: /Unauthorized|AssertAccessRuleFailed|auth/i, previewOnly: true });
+  show(await pool());
 }
 
 if (step === 'status') {
