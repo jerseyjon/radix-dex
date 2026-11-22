@@ -1,4 +1,5 @@
-//! PROPOSAL ONLY (pool audit, 22 Nov 2026). Not in the published package; using it needs a new package.
+//! From the pool audit (22 Nov 2026); the owner approved it with a 5% fee cap. Not yet published:
+//! using it needs a new package.
 //!
 //! `OwnerPool`: a constant-product pool whose liquidity belongs to one owner. Built for the owner's
 //! stated use: he is the only liquidity provider and a market-making bot will manage the pool.
@@ -15,8 +16,9 @@
 //! * `swap_with_minimum` lets a caller who does not use manifest assertions protect himself.
 use scrypto::prelude::*;
 
-/// Hard cap on the swap fee, in basis points (1%). Fixed in code.
-pub const OWNER_POOL_MAX_FEE_BPS: u16 = 100;
+/// Hard cap on the swap fee, in basis points (5%). Fixed in code; `instantiate`,
+/// `instantiate_with_liquidity` and `set_fee` all refuse anything above it.
+pub const OWNER_POOL_MAX_FEE_BPS: u16 = 500;
 
 #[derive(ScryptoSbor, ScryptoEvent)]
 pub struct OwnerPoolSwapEvent {
@@ -209,8 +211,13 @@ mod owner_pool {
         }
 
         /// Owner: take out any amounts. Never paused, never locked.
+        /// A zero amount does not touch its vault, so if a token's issuer freezes one vault the
+        /// owner can still take the other token out.
         pub fn withdraw(&mut self, amount_a: Decimal, amount_b: Decimal) -> (FungibleBucket, FungibleBucket) {
-            let out = (self.vault_a.take(amount_a), self.vault_b.take(amount_b));
+            let take = |vault: &mut FungibleVault, resource: ResourceAddress, amount: Decimal| {
+                if amount == Decimal::ZERO { FungibleBucket::new(resource) } else { vault.take(amount) }
+            };
+            let out = (take(&mut self.vault_a, self.resource_a, amount_a), take(&mut self.vault_b, self.resource_b, amount_b));
             self.liquidity_event(-amount_a, -amount_b);
             out
         }

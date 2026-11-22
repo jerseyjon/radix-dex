@@ -188,7 +188,7 @@ pre-seeding, re-seeding an emptied pool, overflow, events, owner powers beyond t
 tokens, and an upper bound on what a swap pays. All of these are now in `tests/pool_audit.rs`.
 
 Results on this branch (`cargo test --release`): `lib.rs` 17 passed; `pool_audit.rs` 11 passed;
-`owner_pool_proposal.rs` 4 passed. The `finding_*` tests pass when the weakness is present.
+`owner_pool_proposal.rs` 15 passed (4 at first; 11 added on 22 Nov after the owner approved the pool). The `finding_*` tests pass when the weakness is present.
 
 ## Build provenance
 
@@ -242,20 +242,25 @@ So yes, with the F2/F3 rules he can ignore outside deposits.
 
 ### 3. Proposal: `OwnerPool` (separate commit; needs a new package)
 
-`scrypto/dex-contracts/src/owner_pool.rs`, tests in `tests/owner_pool_proposal.rs` (4 pass). Not
-in the published package and not used by anything. It is a proposal for the owner to decide on.
+`scrypto/dex-contracts/src/owner_pool.rs`, tests in `tests/owner_pool_proposal.rs` (15 pass). Not
+in the published package and not used by anything. **Decided 22 Nov: the owner approved it, with
+the fee cap raised from the proposed 1% to 5%.** The 1% had no written reasoning; it was copied from
+the published `Pool`'s `MAX_FEE_BPS` and the order book's maker-fee cap. No maths depends on it.
 
 - **Owner-only liquidity.** `deposit` and `withdraw`/`withdraw_all` require the owner badge. There
   are no pool units at all, so F2, F3 and the share-rounding questions disappear; withdrawal is by
   badge and is never locked or paused.
 - **Seeded at birth.** `instantiate_with_liquidity(a, b, fee, badge)` funds the pool in the creating
   transaction.
-- **Adjustable fee within a cap.** `set_fee` (owner), hard-capped at 1% in code.
+- **Adjustable fee within a cap.** `set_fee` (owner), hard-capped at 5% (500 bps) in code; the
+  same cap is checked at instantiation.
 - **Pause for swaps only.** `set_paused` (owner); withdrawals always work.
 - **Price moves for the bot.** `deposit` accepts either token alone at any ratio, so the bot can
   shift the price by adding or removing one side, instead of trading against itself.
 - **Robust accounting.** Reserves are the vault balances, so a recall loses only what is recalled
-  (F1); products are formed after dividing (F4).
+  (F1); products are formed after dividing (F4). A zero amount in `withdraw` does not touch its
+  vault, so if an issuer freezes one vault the other token can still be withdrawn (fixed 22 Nov;
+  before, `take(0)` on the frozen vault failed the whole call).
 - **`swap_with_minimum`** for callers who cannot add manifest assertions; `swap(bucket)` keeps the
   shape the exchange's manifests already use.
 - **Events:** swaps (with reserves after), deposits/withdrawals (with reserves after), fee and pause
