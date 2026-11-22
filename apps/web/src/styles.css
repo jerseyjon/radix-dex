@@ -239,6 +239,8 @@ a.book-row { color: inherit; text-decoration: none; }
 .book-mid { display: flex; align-items: center; justify-content: space-between; padding: 0 var(--s3); height: 36px; flex: none;
   border-block: 1px solid var(--line); background: var(--bg); font-size: var(--fs-lg); }
 .book-mid strong { font-weight: 600; }
+.mid-pick { margin-left: calc(-1 * var(--s2)); padding: 2px var(--s2); border-radius: var(--r-sm); color: inherit; font-size: inherit; }
+.mid-pick:hover { background: var(--surface-3); }
 
 /* ---------- Order form ---------- */
 .form { padding: var(--s3); gap: 10px; }
