@@ -14,8 +14,10 @@ only part of what the contract would allow.
 
 1. **Reads the reference price** from the on-ledger venues of the SAME pair only: each is quoted both
    ways at a realistic size, its fee-free midpoint taken, and the venues combined weighted by depth
-   (see "Reference price" below). CoinGecko is read beside them, WATCH ONLY: it never sets a price or
-   a trade; it only raises an alert when it is more than 15% from the reference.
+   (see "Reference price" below). Venues whose own swap fee is over 1% are excluded. CoinGecko is read
+   beside them, WATCH ONLY: it never sets a price or a trade; it only raises an alert when it is more
+   than 15% from the reference. If the SET of live venues changed since the last tick, it starts a
+   15-minute hold (no rebalance; see "Venue-set hold").
 2. **Reads the pool** from the ledger, vault by vault (reserves, inventory, fee, both pauses, limits,
    stored allowance, the anchor on ledger), and the contract's own `operator_status` by preview. The
    allowance is computed locally too, and the two are compared on every tick.
@@ -29,6 +31,7 @@ only part of what the contract would allow.
    minutes of a healthy reference.
 6. **Hold and widen.** While the live venues disagree by more than 4% it does NOT rebalance (it holds
    its position) and widens the fee by half the disagreement, inside the owner's operator fee range.
+   While a venue-set hold runs it does not rebalance either; the fee may widen, not narrow.
 7. **Rebalance.** If the pool price is further from the target than the dead band, it moves the curve
    toward the target by a one-sided move between inventory and reserves, as large as fits in half of
    the allowance (keeping a reserve) AND inside the rolling cap (at most 60% of the allowance in any 10
@@ -111,7 +114,8 @@ it for a mainnet pool needs the owner's explicit go-ahead and a code change.
 State lives in `data/owner-pool-bot-state.json` (`--state`; `data/` is gitignored): the reference
 history (6 h, for volatility), the scale calibration, the target depth, the time of the last fee
 change, the send times of the last hour, the pause bookkeeping, the failure counter, the owner's
-anchor statement read from the ledger, the "behind" counter and the alert rate limiter. A lock file
+anchor statement read from the ledger, the "behind" counter, the alert rate limiter, and the live
+venue set with any running venue-set hold. A lock file
 next to it stops a second bot from running on the same state.
 
 ## Reference price
@@ -148,6 +152,23 @@ Ociswap XRD/hUSDC $0.000831, CaviarNine $0.000854 and CoinGecko $0.000800, were 
   (CaviarNine, 1.3 bps) cannot by that one quote show it is more than 1,000x the quote size deep, and
   CaviarNine in fact fails at 5,000 XRD (its hUSDC side held under 1 hUSDC on 22 Nov). Venues are
   combined by the depth-weighted GEOMETRIC mean of their midpoints.
+- **A venue whose own swap fee is over 1% is excluded** (`--max-venue-fee`, default 0.01; owner's
+  decision, 22 Nov 2026). Exactly 1% is kept. The fee is determined from the venue's own
+  QUOTES, the same previews the midpoint comes from, not from a fee table or a venue-specific state
+  field (so it covers every venue type, follows a venue that changes its fee, and needs no extra
+  reads): the one-way cost at a size is `c = 1 - sqrt(bid / ask)` (fee plus impact, one way); it is
+  measured at the small size and the quote size and extrapolated linearly to size zero, where impact
+  vanishes: `fee = c(small) - (c(size) - c(small)) * small / (size - small)` (`venueFee`). Exact for a
+  pure proportional fee; for a constant-product pool the impact is linear in size to first order, so
+  it drops out (unit tests: within 0.02 bps at 800k XRD deep, 0.1 bps at 100k, for fees 0-3%). On the
+  22 Nov quotes it reads Ociswap basic 3.000% (its `input_fee_rate` is 0.03), Ociswap precision
+  0.052% (0.05%), CaviarNine 0.081%, DefiPlaza 10.1-10.6% (its asymmetric pricing, which is what a
+  trader pays at zero size; DefiPlaza fails the round-trip rule first anyway). Each venue's estimate is
+  in every tick's log line (`fee`), and an excluded venue carries
+  `dropped: "fee 3.000% > 1.00% (estimated from its quotes)"`. Why: a pool with a 3% fee can sit up to
+  3% from the market before arbitrage pays, and on 22 Nov Ociswap basic sat ~3% below the other two
+  (which agreed to 0.12%), taking ~85% of the weight. If the rule leaves no venue live, the reference is
+  "none": unhealthy, no trade (and the 10-minute pause rule applies).
 - **A venue whose round trip at the quote size (`ask / bid - 1`) is wider than 10% is dropped**
   (`--max-round-trip`): its two quotes then bound the price too loosely to be a reference, and for an
   asymmetric pricer the geometric mean is not its mid. On 22 Nov this drops DefiPlaza (round trip 25%,
@@ -168,6 +189,47 @@ Ociswap XRD/hUSDC $0.000831, CaviarNine $0.000854 and CoinGecko $0.000800, were 
   price is compared with the on-ledger reference (both USD per XRD, before any `--scale`), and an alert
   `watch-coingecko-xrd-usd` fires when they are more than 15% apart (`--watch-max-deviation`). It never
   enters the reference, the fee or the pause; the comparison is skipped for synthetic venues.
+- **Frozen on-ledger pools are accepted as the reference** (owner's decision, 22 Nov 2026): the bot
+  follows the on-ledger pools, also when nobody trades them and their price stands still while the
+  wider market moves. No code tries to detect that; the CoinGecko 15% watch alarm is the stale-pool
+  signal, for a human to act on.
+- **The reference can never contain the pool the bot operates, nor any OwnerPool** (hard guard, start-up).
+  The owner will add OwnerPools of his own on mainnet, which the DEX router quotes; an OwnerPool's
+  price is set by its owner/operator, so taking one as the reference would be following ourselves. At
+  start the bot (and the watcher) read every reference venue's entity details from the Gateway and
+  REFUSE TO RUN (`event: refused`, exit 2) if a venue's address is the operated pool, its blueprint is
+  `OwnerPool`, its package is any package in `OWNER_POOL_PACKAGES` (any network), or the Gateway does
+  not describe it. The start log line `venue-guard` lists each venue checked with its blueprint
+  (BasicPool, PrecisionPool, QuantaSwap, PlazaPair on 22 Nov). Code: `referenceVenueProblems`
+  (pure, tested) and `assertReferenceExcludesOwnerPools` (`scripts/owner-pool-sources.ts`).
+
+### Venue-set hold
+
+Owner's decision, 22 Nov 2026, after CaviarNine ran out of hUSDC at 21:09, dropped out, and the
+reference jumped 2% with no market move. **When the set of live venues changes** (a venue drops out or
+comes back, for any reason: a failed or part-filled quote, staleness, the round-trip rule, the fee
+rule, or `--exclude-venues`), **the bot holds its position for 15 minutes** (`--venue-hold`, default
+900 s): no rebalance. Another change during the hold restarts it from that change. Code:
+`venueSetHold` (pure, tested).
+
+- **Fee during the hold: widening is allowed, narrowing is not.** A wider fee only protects the pool
+  while the reference may have jumped; narrowing would trust the new reference before the hold has
+  passed. The fee rule (hysteresis included) runs as usual with narrowing blocked
+  (`narrow to N bps held: venue-set hold ...`).
+- **Persisted:** the live set last seen and the hold's end are in the state file (`venueHold`), so a
+  restart neither skips a running hold nor misses a change made while the bot was down (a venue lost
+  during the downtime starts a hold on the first tick). A fresh state file has no previous set: the
+  first tick only records it.
+- **Alert** `venue-hold` once when a hold starts (rate-limited like the other keys); a restart of a
+  running hold is not a new start, and the key is cleared when the hold ends, so the next hold alerts.
+- Each tick's log line has `venueSet: { live, changed?: {removed, added}, holdUntil?, remainingSec?, reason? }`
+  and the decision reads `HOLD: venue-set hold (dropped caviarnine) for N s more: no rebalance`.
+- Pause control is unaffected (a hold is not "unhealthy"). The "behind" counter is not advanced while
+  holding. A disagreement (>4%) during a hold is handled as before (hold and widen), with narrowing
+  also blocked.
+- `--exclude-venues a,b` and `--exclude-venues-file <path>` (names re-read every tick) are for TESTS
+  and drills only: the named venues are dropped (`excluded by --exclude-venues (TEST)`), which changes
+  the set and starts a hold.
 
 Code: `aggregateVenues`, `readVenue`, `watchPriceCheck` in `packages/core/src/ownerpool-bot.ts` (pure,
 tested in `packages/core/test/ownerpool-reference.test.ts`); the quoting in `scripts/owner-pool-sources.ts`.
@@ -197,6 +259,8 @@ fix it.
 | venues (`--venues`) | ociswap, ociswap-precision, caviarnine, defiplaza | every on-ledger pool of the same pair (owner's decision): prices someone can actually trade at, in the pair's own unit |
 | quote size (`--quote-size`) | 1,000 XRD (small quote: 0.1 of it) | about ten times the bot's typical move; the largest round size every venue still fills both ways (see "Why 1,000 XRD") |
 | impact floor (`--min-impact`) | 10 bps | one quote cannot show a pool more than 1,000x the quote size deep; stops a concentrated pool with a thin side from taking all the weight |
+| max venue fee (`--max-venue-fee`) | 1% (exactly 1% kept) | the owner's decision: a pool can sit up to its own fee from the market before arbitrage pays; Ociswap basic (3%) sat 3% below the two low-fee venues. Estimated from the quotes (above) |
+| venue-set hold (`--venue-hold`) | 900 s, restarts on another change | the owner's decision: a venue arriving or leaving moves the reference by up to the venues' spread with no market move; 15 minutes lets a blinking venue settle, and is the same order as the pause/resume timers |
 | max round trip (`--max-round-trip`) | 10% | wider than that, bid and ask bound the price too loosely to be a reference (DefiPlaza: 25%); Ociswap basic's 3% fee each way (6.5%) still counts |
 | live venues needed (`--min-venues`) | 1 | the owner's decision; a single live venue is logged as such on every tick |
 | max quote age (`--max-age`) | 300 s | a quote is made in the tick; only a hung read is older |
@@ -276,6 +340,7 @@ timeout); an alert that could not be delivered is retried on the next occurrence
 | `anchor-unknown` | the owner's anchor cannot be read from the ledger (and whether the flag is used instead) |
 | `halt` | `--max-failures` sends failed in a row: sending stops for `--halt` seconds |
 | `reference-unhealthy` | the on-ledger reference has been unusable (no live venue, or the venues more than 4% apart) for longer than `--pause-after` |
+| `venue-hold` | the set of live venues changed: holding position for `--venue-hold` (which venues dropped / came back) |
 | `watch-coingecko-xrd-usd` | CoinGecko is more than `--watch-max-deviation` (15%) from the on-ledger reference. Information only: trading is not affected |
 | `behind` | the bot could not close the gap for `--alert-behind-ticks` ticks in a row |
 | `tick-errors` | `--alert-error-ticks` ticks in a row failed (Gateway down, ...) |
@@ -342,6 +407,9 @@ What it flagged on the Stokenet history (replay, 22 Nov 2026): see "Soak test" b
 |---|---|
 | a venue's quote fails, part-fills, times out (45 s) or goes stale, or its round trip is over 10% | the venue is dropped for the tick; none left: no rebalance, no fee change; 10 min of that: operator pause |
 | only one venue is live | it is used; the log line says `only ONE live venue` |
+| a venue's own fee (from its quotes) is over 1% | excluded every tick it is; logged with the estimate |
+| the set of live venues changes | hold: no rebalance for 15 min (restarts on another change; survives a restart); fee may widen, not narrow; alert `venue-hold` |
+| a reference venue is the operated pool or any OwnerPool | the bot (and the watcher) refuse to start |
 | the live venues disagree by more than 4% | HOLD: no rebalance; fee widened by half the disagreement (inside the operator range); 10 min: operator pause; resumes after 15 min of agreement |
 | CoinGecko is more than 15% from the reference, or fails | alert (`watch-...`) only; trading unaffected |
 | two moves inside 10 minutes would spend over 60% of the allowance | the second is clipped to the room left, or waits |
@@ -538,6 +606,73 @@ TEUR, price 0.00079852 TEUR per XRD (0.18% below the owner's 1250:1 anchor), inv
 1.010387 TEUR, fee 30 bps, owner and operator pauses off, operator badge 2 appointed, owner anchor still
 1250:1, allowance 0.00443. The bot at its defaults would set the fee to 100 again on its first tick.
 
+## Soak 5 on Stokenet (22 Nov 2026, 22:20-23:13 UTC, code c79d6ec): venue-fee rule and venue-set hold
+
+`--send`, defaults (now with the 1% venue-fee rule and the 15-minute venue-set hold), `--scale auto`
+with a fresh state file (`data/soak/state5.json`; calibrated on the first tick: reference 0.000823585
+-> the owner's 1250:1 anchor, scale 0.97136), alerts to a local listener on 127.0.0.1, the watcher live
+alongside. Script `data/soak/run5.sh`; logs `run5a-default.log`, `run5b1-test-fee5.log`,
+`run5b2-test-fee5.log`, `run5c-default.log`, `watch5.log`, `alerts5.jsonl`, `phases5.txt`,
+`balances5.txt` (all in `data/soak/`, gitignored).
+
+All evening CaviarNine could not quote at all (its hUSDC side still ~0.045 hUSDC since 21:09), DefiPlaza
+failed the round-trip rule (23.7-23.9%), and the fee rule excluded Ociswap basic on every tick (its fee
+read from the quotes: 3.0001%). So the live set never changed by itself: Ociswap precision alone
+(fee read 0.0525%; one live venue, flagged as such on each tick). The change was therefore forced, in a
+clearly labelled test phase that lets Ociswap basic back in with `--max-venue-fee 0.05`:
+
+| Phase | Settings | Time | Ticks | Sent |
+|---|---|---|---|---|
+| A | defaults | 22:20-22:30 | 10 | 2 |
+| B1 | **TEST ONLY `--max-venue-fee 0.05`**: Ociswap basic back in | 22:30-22:37 | 7 | 0 |
+| B2 | the same, **bot restarted mid-hold** | 22:37-22:52 | 15 | 2 |
+| C | defaults: Ociswap basic excluded again | 22:52-23:13 | 21 | 0 |
+
+1. **A.** Tick 1: gap 18.5 bps (above the 15 bps band at fee 30): SENT rebalance
+   `txid_tdx_2_1zmsw9ehyclk…` (remove 36.52 XRD to inventory, cost 0.001852) and `operator_set_fee(100)`
+   `txid_tdx_2_1m0dwhgxmsaf…`. Then nothing to do (pool on target).
+2. **B1: the set changes, the hold starts.** Tick 1: `venueSet.changed: {added: [ociswap]}`, reference
+   0.000823585 -> 0.000801317 (Ociswap basic takes 85% of the weight; venues 3.28% apart, inside 4%), gap
+   **277.9 bps**, decision `HOLD: venue-set hold (back ociswap) for 900 s more: no rebalance`; alert
+   `venue-hold` delivered. No transaction for the whole of B1.
+3. **B2: the hold survives a restart.** Restarted at 22:37:20; the first tick read the hold from the
+   state file: `holdUntil 22:45:20` unchanged, "480 s more"; still no rebalance at 277.9 bps. **The hold
+   ended at 22:45:20 and the next tick (22:45:35) SENT a rebalance** `txid_tdx_2_1lrypjhff6pzt…`
+   (remove 0.059558 TEUR to inventory, cost 0.003789 = half the 0.007578 allowance, gap 278 -> 239 bps),
+   then at 22:46:40 `txid_tdx_2_1mxxvssflklw…` (remove 0.011903 TEUR, cost 0.000758, the rolling-cap room, gap 239 -> 231
+   bps); then the window was full. So on ledger: the set changed at 22:30:20, the first rebalance came
+   15 min 15 s later, nothing in between.
+4. **C: the reverse change.** Tick 1: `changed: {removed: [ociswap]}`, a new hold until 23:07:22, alert
+   `venue-hold` delivered again (the key had been cleared when the B hold ended). The reference went
+   back to 0.000823585: gap 45.5 bps, which is inside the dead band at fee 100 (50 bps), so after the
+   hold there was nothing to do: this hold blocked no transaction (fee 100 is the target and the top of
+   the range, so no fee change either way).
+
+**Figures:** 53 ticks, 4 transactions sent (3 rebalances, 1 fee change), all `CommittedSuccess`; no
+preview failure, no tick error, no halt. Allowance spent 0.006399. Network fees: operator account
+186.4800 -> 184.5545 XRD (1.9255 XRD for 4). Alerts delivered: bot `start`/`stop` x4 each,
+`venue-hold` x2; watcher `fee-change` (30 -> 100). No `pool-drift`, `not-bot`, `large-spend` or
+`window-spend`. The venue guard at each start listed the four venues as BasicPool, PrecisionPool,
+QuantaSwap and PlazaPair (no OwnerPool).
+
+**Venue gap after the fee rule.** `scripts/owner-pool-venues.ts` every 60 s, 22:19-22:44 (26 samples at
+1,000 XRD, `data/soak/venues5.log`): one live venue every time (Ociswap precision, 0.000823585, not a
+single change), so tonight's gap is 0 by construction: there was nothing to compare it with. The last
+time two low-fee venues were live together (Soak 4 phase A, 20:17-21:08, 50 ticks), Ociswap precision
+and CaviarNine were **0.115% apart on every tick** (0.03% on the two ticks of phase B at 21:08-21:09).
+CoinGecko was 10.3-11.3% from the precision-only reference in these samples (watch limit 15%).
+
+After the soak (23:14), with the bot stopped: seven test swaps by the test account (alice, not the
+owner or the operator) for the markout record (see "Markout"), and one `--once --send --dead-band 10000
+--base-fee 30 --vol-multiplier 0 --narrow-interval 0` with a fresh state file that set the fee back to
+30 bps (`txid_tdx_2_1w2tukl59x66gag9dcq7483rd55f5d0xyy923lcv87va6n690d3pqwmz43k`, 0.375 XRD).
+
+**Pool left at** (state version 34888730): reserves 19,717.700 XRD / 15.714268 TEUR, price 0.00079696
+TEUR per XRD (0.38% below the owner's 1250:1 anchor), inventory 1,330.372 XRD / 1.081848 TEUR, **fee 30
+bps, owner and operator pauses off**, operator badge 2 appointed, owner anchor 1250:1, allowance
+0.00303 (stored). Operator account 184.1792 XRD. The bot at its defaults would set the fee to 100 again
+on its first tick.
+
 ## Not done, not tested, open
 
 - **The on-ledger venues barely move, so the reference barely moves.** Between trades a pool's
@@ -551,13 +686,16 @@ TEUR, price 0.00079852 TEUR per XRD (0.18% below the owner's 1250:1 anchor), inv
   is the owner's call.
 - **Thin venues come and go.** CaviarNine held under 1 hUSDC on its bid side all evening and from 21:09
   could not quote even 100 XRD; when it dropped out, the reference jumped from 0.000815 to 0.000799
-  (-2.0%) because the remaining weight was mostly Ociswap basic. A venue's arrival or departure moves the
-  reference by up to the venues' spread (3%) even when no price moved. Not done: smoothing, or a
-  "venue set changed" rule.
-- **4% headroom is thin.** The live venues sat 3.1% apart all evening (Ociswap basic at 0.000801 vs
-  CaviarNine and Ociswap precision at 0.000825-0.000826); one trade on the thinner venues could push it
-  past 4% and the bot would hold (and, after 10 minutes, pause) until someone trades it back. During
-  the first soak's last hour the same pair (Ociswap basic reserve ratio vs CaviarNine) was 6.6% apart.
+  (-2.0%) because the remaining weight was mostly Ociswap basic. Now handled by the 1% fee rule (Ociswap
+  basic is out, so the remaining venues agree to ~0.1%) and the 15-minute venue-set hold. A venue that
+  blinks (one failed quote) costs a 15-minute hold each time; how often that happens on mainnet is not
+  yet measured beyond the runs below.
+- **4% headroom.** Before the fee rule the live venues sat 3.1% apart (Ociswap basic vs the other two).
+  With Ociswap basic excluded the two low-fee venues were 0.115% apart when both were live (Soak 4);
+  but from 21:09 CaviarNine could not quote at all and Ociswap precision has been the ONLY live venue
+  (all of Soak 5): the reference then has nothing to be checked against, and if precision fails too
+  there is no reference (no trade; pause after 10 minutes). On mainnet XRD/hUSDC that is one thin
+  concentrated pool carrying the whole reference.
 - **Depth weighting is from one pair of sizes.** A concentrated pool (CaviarNine) shows almost no
   impact up to the edge of its liquidity and then fails; the 10 bps impact floor stops it taking all
   the weight but is a judgement, not a measurement. Not tried: depth measured at several sizes, or from
