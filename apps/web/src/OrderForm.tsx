@@ -302,6 +302,8 @@ export function OrderForm(props: {
           <div><dt>Moves into the order book</dt><dd>{sellAmount ? `${fmtAmount(sellAmount)} ${sellTok.symbol}` : '—'}</dd></div>
           <div><dt>You receive, as it fills</dt><dd>{limitGross ? `${fmtAmount(Number(limitGross) * (1 - book.makerFeeBps / 10_000))} ${buyTok.symbol}` : '—'}</dd></div>
           {bookPrice && !bookPrice.ok && <div><dt>Price</dt><dd className="warn">{bookPrice.reason}</dd></div>}
+          {/* The exchange only spends and earns XRD, so it never buys from book orders in a pair without XRD. */}
+          {at === 'hop' && <div><dt>Note</dt><dd className="warn">Neither token is XRD, so the exchange does not buy from this order itself or route market orders to it: it fills only when someone buys from the order book contract directly.</dd></div>}
           <div><dt>Fee</dt><dd>{book.makerFeeBps > 0 ? pct(book.makerFeeBps) : 'None'}, plus the network fee to place it (about 0.8 XRD)</dd></div>
           <div><dt>Right now</dt><dd className={fillsNow ? 'up' : ''}>{fillsNow === undefined ? '—' : fillsNow ? 'Would fill straight away, at your price' : `Would wait: the market pays ${fmtAmount(quote!.buyAmount)} ${buyTok.symbol} for this size`}</dd></div>
           {fillsNow && quote && limitGross && (
