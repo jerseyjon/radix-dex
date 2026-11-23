@@ -6,7 +6,10 @@
 //   tsx scripts/owner-pool-bot.ts [--once] [--send] [options]
 //
 // DRY RUN by default: reads, decides, PREVIEWS every transaction it would send, logs, sends nothing.
-// `--send` submits, and only on Stokenet (hard-coded below). Every transaction is built by code
+// `--send` submits. It needs an alert URL whose start alert is delivered (any network). On MAINNET it
+// also needs every condition of the review's guard (`sendGuardProblems` in packages/core/src/ownerpool-guard.ts):
+// --scale 1, explicit --pool/--badge/--key/--state/--sent-log, no test inputs, the pool in the committed
+// MAINNET_SEND_POOLS (empty), OWNER_POOL_PACKAGES.mainnet filled, and --mainnet-live. Every transaction is built by code
 // (packages/core/src/ownerpool-ops.ts), previewed in the same tick (exact notarised transaction, real
 // signature, no free credit) and sent only if that preview succeeded.
 //
@@ -33,28 +36,37 @@
 //                            --disagree-fee-factor <f> (0.5) x the disagreement; pause if it lasts --pause-after
 //   --spend-window <s> --max-window-spend <f>   rolling cap: at most 60% of the allowance in any 10 minutes
 //   --scale auto|<n>         pool target = reference * scale; auto: calibrated once so the first healthy
-//                            reference maps to the owner anchor (kept in the state file)
+//                            reference maps to the owner anchor (kept in the state file). MAINNET: only 1 (the default there)
+//   --reference-median <n>   the target is the median of the last n healthy references (3; no target until n are in)
+//   --anchor-strikes <n>     the anchor stop pauses the pool only after n ticks in a row beyond the distance (2)
+//   --max-gateway-lag <s>    the mainnet Gateway's ledger more than this behind: no venue counts (120)
+//   --tx-validity <s>        a transaction is valid for 2 epochs and this long on the ledger clock (120)
+//   --max-races <n>          "Reserves moved" failures (a swap raced a rebalance) in a row before a halt (10); they never count toward --max-failures
+//   --heartbeat <path>       written every tick (default data/heartbeat/owner-pool-bot-<network>.json); deploy/owner-pool-heartbeat.timer checks it
+//   --mainnet-live           the separate acknowledgement that a mainnet --send run trades real funds
 //   --owner-anchor A:B       FALLBACK only: the owner's anchor is read from the ledger (the pool's last
 //                            OwnerPoolAnchorEvent); this flag is used only when the ledger cannot say. With
 //                            neither, the bot does not rebalance. --anchor-recheck <s> (default 300)
 //   --alert-url <url>        POST a short text alert there (ntfy-style); env OWNER_POOL_BOT_ALERT_URL; none if unset
 //   --alert-interval <s>     one alert per condition per interval (default 3600); --alert-behind-ticks <n> (default 10)
-//   --sent-log <path>        every submitted txid is appended here before submission (default data/owner-pool-bot-sent.jsonl),
+//   --sent-log <path>        every submitted txid is appended here before submission (Stokenet default data/owner-pool-bot-sent.jsonl),
 //                            so the watcher (scripts/owner-pool-watch.ts) can tell the bot's operator actions from anyone else's
 //   --interval <s> --max-age <s> --pause-after <s> --resume-after <s>
 //   --dead-band <bps> --spend-fraction <f> --reserve-fraction <f> --min-move <bps> --side balanced|remove|add
 //   --target-depth <n> --max-anchor-distance <f> --base-fee <bps> --vol-multiplier <f> --behind-fee <bps>
 //   --min-fee-change <bps> --widen-interval <s> --narrow-interval <s> --max-tx-per-hour <n> --fee-lock <xrd>
 //   --no-fee                 never touch the fee
-//   --state <path>           state file (default data/owner-pool-bot-state.json; data/ is gitignored)
-//   --key <path> --badge <resource> --pool <component> --network stokenet
+//   --state <path>           state file (Stokenet default data/owner-pool-bot-stokenet-state.json; data/ is gitignored); it carries
+//                            its identity (network, pool, badge, operator account) and is refused for any other
+//   --key <path> --badge <resource> --pool <component> --network stokenet   (no defaults on mainnet: all required)
 //   --gateway-url <url>      the Gateway for the operated network (default: the network's public one); e.g. your own
 //                            Gateway, or for TESTS a local fault proxy (scripts/gateway-fault-proxy.ts)
 //   --mainnet-gateway-url <url>   the mainnet Gateway the venues are READ from (default: the public one); same uses
 //
 // Keys: the operator key is loaded from --key (default data/stokenet-owner-pool-operator.key) and never
 // printed. The bot holds no owner key and cannot do anything only the owner may do.
-import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { acquireLock, loadJsonWithBackup, saveJsonDurable, writeHeartbeat } from '../packages/core/src/ownerpool-files.ts';
 import { assertReferenceExcludesOwnerPools, makePriceSources, makeVenues, readSource, readVenueSource, type PriceSource, type VenueSource } from './owner-pool-sources.ts';
 import {
   AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, anchorCheck, buildTransaction,
@@ -62,31 +74,44 @@ import {
   ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
   ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, trySubmitAndWait,
   txAllowance, volatilityBps, type Ed25519Key, type VenueReference, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
+  MAINNET_SEND_POOLS, COINGECKO_BRAKE_DEFAULTS, coingeckoBrake, type BrakeState, OWNER_POOL_REFERENCE_PAIRS, REFERENCE_MEDIAN_N, anchorStrike, flagRangeProblems, isProtectiveSend, lockFileName, medianReference, optValue, pairProblem,
+  pendingGate, recordSendOutcomeV2, resolveScale, sendGuardProblems, stampLedgerTime, stateIdentityProblem, targetDepthUpdate, txWindow, type PendingTx, type StateIdentity,
 } from '../packages/core/src/index.ts';
 
 // ------------------------------------------------------------------ arguments
 
 const argv = process.argv.slice(2);
 const flag = (n: string) => argv.includes(`--${n}`);
-const opt = (n: string): string | undefined => { const i = argv.indexOf(`--${n}`); return i >= 0 ? argv[i + 1] : undefined; };
+/** Argument errors are collected and refused together (exit 2), never thrown (L-2). */
+const argErrors: string[] = [];
+const opt = (n: string): string | undefined => { try { return optValue(argv, n); } catch (e) { argErrors.push(String((e as Error).message)); return undefined; } };
 const num = (n: string, d: number): number => {
   const v = opt(n);
   if (v === undefined) return d;
   const x = Number(v);
-  if (!Number.isFinite(x)) throw new Error(`--${n} must be a number, not ${v}`);
+  if (!Number.isFinite(x)) { argErrors.push(`--${n} must be a number, not ${v}`); return d; }
   return x;
 };
+const log = (o: Record<string, unknown>) => console.log(JSON.stringify({ t: new Date().toISOString(), ...o }));
+/** A condition found on a tick that must stop the bot rather than be retried (a pool that is not the reference pair). */
+class FatalError extends Error {}
 
 const SEND = flag('send');
 const ONCE = flag('once');
 const NETWORK = (opt('network') ?? 'stokenet') as NetworkName;
 if (!NETWORKS[NETWORK]) throw new Error(`Unknown network ${NETWORK}`);
-// HARD GUARD. Sending is Stokenet-only for now: running this against a mainnet pool needs the owner's
-// explicit go-ahead (and a code change here), not a flag.
-if (SEND && NETWORK !== 'stokenet') {
-  console.error(JSON.stringify({ t: new Date().toISOString(), event: 'refused', reason: `--send is only allowed on stokenet (asked for ${NETWORK}); mainnet needs the owner's explicit go-ahead` }));
-  process.exit(2);
-}
+const MAINNET = NETWORK === 'mainnet';
+
+/** Stokenet test pool defaults. Mainnet has NONE: pool, badge, key, state and sent log must be given (H-3). */
+const STOKENET_DEFAULTS = {
+  pool: 'component_tdx_2_1cz95qapuv8wtewsjv7zdlvf2nuffjvqntt6yy8ynsva7xsfw0a24qk',
+  badge: 'resource_tdx_2_1tkfvg8qudhzmp4fj8z5jlw3wnlsm6cghhwvcfmekwyz73xnwl2c24q',
+  key: 'data/stokenet-owner-pool-operator.key',
+  state: 'data/owner-pool-bot-stokenet-state.json',
+  sentLog: 'data/owner-pool-bot-sent.jsonl',
+};
+const given = { pool: opt('pool'), badge: opt('badge'), key: opt('key'), state: opt('state'), sentLog: opt('sent-log') };
+const pick = (k: keyof typeof given): string => given[k] ?? (MAINNET ? '' : STOKENET_DEFAULTS[k]);
 
 const cfg = {
   intervalSec: num('interval', D.intervalSec),
@@ -118,6 +143,8 @@ const cfg = {
   targetDepth: opt('target-depth') !== undefined ? num('target-depth', 0) : undefined,
   maxAnchorDistance: num('max-anchor-distance', D.maxAnchorDistance),
   anchorResumeFactor: num('anchor-resume-factor', D.anchorResumeFactor),
+  anchorStrikes: num('anchor-strikes', 2),
+  referenceMedianN: num('reference-median', REFERENCE_MEDIAN_N),
   baseFeeBps: num('base-fee', D.baseFeeBps),
   volMultiplier: num('vol-multiplier', D.volMultiplier),
   volWindowSec: num('vol-window', D.volWindowSec),
@@ -127,51 +154,125 @@ const cfg = {
   narrowIntervalSec: num('narrow-interval', D.narrowIntervalSec),
   maxTxPerHour: num('max-tx-per-hour', D.maxTxPerHour),
   maxConsecutiveFailures: num('max-failures', D.maxConsecutiveFailures),
+  maxRaceFailures: num('max-races', 10),
   haltSec: num('halt', D.haltSec),
+  maxGatewayLagSec: num('max-gateway-lag', 120),
+  txValiditySec: num('tx-validity', 120),
   feeLockXrd: opt('fee-lock') ?? D.feeLockXrd,
   feeControl: !flag('no-fee'),
   venues: (opt('venues') ?? opt('sources') ?? 'ociswap,ociswap-precision,caviarnine,defiplaza').split(',').map((s) => s.trim()).filter(Boolean),
   watchSources: flag('no-watch') ? [] : (opt('watch-sources') ?? 'coingecko').split(',').map((s) => s.trim()).filter(Boolean),
-  scale: opt('scale') ?? 'auto',
-  ownerAnchorFlag: opt('owner-anchor') !== undefined ? parseAnchorFlag(opt('owner-anchor')!) : undefined,
+  scaleFlag: opt('scale'),
+  ownerAnchorFlag: ((v) => { if (v === undefined) return undefined; try { return parseAnchorFlag(v); } catch (e) { argErrors.push(String((e as Error).message)); return undefined; } })(opt('owner-anchor')),
   anchorRecheckSec: num('anchor-recheck', D.anchorRecheckSec),
-  alertUrl: opt('alert-url') ?? process.env.OWNER_POOL_BOT_ALERT_URL ?? undefined,
+  alertUrl: opt('alert-url') ?? (process.env.OWNER_POOL_BOT_ALERT_URL || undefined),
   alertIntervalSec: num('alert-interval', D.alertIntervalSec),
   alertBehindTicks: num('alert-behind-ticks', D.alertBehindTicks),
   alertErrorTicks: num('alert-error-ticks', D.alertErrorTicks),
-  sentLog: opt('sent-log') ?? 'data/owner-pool-bot-sent.jsonl',
-  statePath: opt('state') ?? 'data/owner-pool-bot-state.json',
-  keyPath: opt('key') ?? 'data/stokenet-owner-pool-operator.key',
-  badge: opt('badge') ?? 'resource_tdx_2_1tkfvg8qudhzmp4fj8z5jlw3wnlsm6cghhwvcfmekwyz73xnwl2c24q',
-  pool: opt('pool') ?? 'component_tdx_2_1cz95qapuv8wtewsjv7zdlvf2nuffjvqntt6yy8ynsva7xsfw0a24qk',
+  sentLog: pick('sentLog'),
+  statePath: pick('state'),
+  keyPath: pick('key'),
+  badge: pick('badge'),
+  pool: pick('pool'),
+  heartbeatPath: opt('heartbeat') ?? `data/heartbeat/owner-pool-bot-${NETWORK}.json`,
+  mainnetLive: flag('mainnet-live'),
+  brakeMaxDeviation: num('brake-max-deviation', COINGECKO_BRAKE_DEFAULTS.maxDeviation),
+  brakeWarmupDeviation: num('brake-warmup-deviation', COINGECKO_BRAKE_DEFAULTS.warmupDeviation),
+  brakeMinReadings: num('brake-min-readings', COINGECKO_BRAKE_DEFAULTS.minReadings),
+  brakeSampleSec: num('brake-sample', COINGECKO_BRAKE_DEFAULTS.sampleMs / 1000),
 };
-if (!['balanced', 'remove', 'add'].includes(cfg.side)) throw new Error('--side must be balanced, remove or add');
-if (!(cfg.spendFraction > 0 && cfg.spendFraction <= 1) || cfg.reserveFraction < 0 || cfg.reserveFraction >= 1) throw new Error('bad --spend-fraction / --reserve-fraction');
-if (!(cfg.maxWindowSpendShare > 0 && cfg.maxWindowSpendShare <= 1) || !(cfg.spendWindowSec > 0)) throw new Error('bad --max-window-spend / --spend-window');
-if (!(Number.isInteger(cfg.confirmTicks) && cfg.confirmTicks >= 1)) throw new Error('--confirm-ticks must be a whole number >= 1');
-if (!(cfg.singleVenueSizeFactor > 0 && cfg.singleVenueSizeFactor <= 1) || !(cfg.singleVenueFeeAddBps >= 0)) throw new Error('bad --single-venue-size-factor (0-1] / --single-venue-fee-add (>= 0)');
-if (!(cfg.quoteSizeXrd > 0) || !(cfg.smallQuoteFraction > 0 && cfg.smallQuoteFraction < 1)) throw new Error('bad --quote-size / --small-fraction');
+
+// Start-up alerts go out before the state exists: their own sink (start and refusals are never rate-limited).
+const startAlerts = new AlertSink(cfg.alertUrl, { intervalMs: 1, prefix: `[owner-pool-bot ${NETWORK}${SEND ? '' : ' dry-run'}] ` });
+/** Refuse to run: log, alert (a start-up failure must be seen, M-5), exit 2 (systemd does not restart it). */
+async function refuse(reason: string, problems?: string[]): Promise<never> {
+  log({ event: 'refused', reason, ...(problems ? { problems } : {}) });
+  const r = await startAlerts.alert('start-refused', `REFUSED TO START: ${reason}${problems ? ': ' + problems.join(' | ') : ''}`.slice(0, 900), Date.now(), { force: true });
+  log({ event: 'alert', key: 'start-refused', sent: r.sent, ...(r.error ? { error: r.error } : {}), ...(startAlerts.enabled ? {} : { noUrl: true }) });
+  process.exit(2);
+}
+
+// ---- static checks, before any key, lock or state is touched
+const sc = resolveScale(NETWORK, cfg.scaleFlag);
+if (!sc.ok) await refuse(sc.reason);
+const SCALE = (sc as { scale: 'auto' | number }).scale;
+{
+  const problems: string[] = [...argErrors];
+  if (!['balanced', 'remove', 'add'].includes(cfg.side)) problems.push('--side must be balanced, remove or add');
+  if (cfg.reserveFraction >= 1) problems.push('--reserve-fraction must be below 1');
+  problems.push(...flagRangeProblems({
+    intervalSec: cfg.intervalSec, minVenues: cfg.minVenues, maxSourceAgeSec: cfg.maxSourceAgeSec, maxDisagreement: cfg.maxDisagreement, quoteSizeXrd: cfg.quoteSizeXrd,
+    smallQuoteFraction: cfg.smallQuoteFraction, minImpactBps: cfg.minImpactBps, maxRoundTrip: cfg.maxRoundTrip, maxVenueFee: cfg.maxVenueFee, venueHoldSec: cfg.venueHoldSec,
+    confirmTicks: cfg.confirmTicks, singleVenueFeeAddBps: cfg.singleVenueFeeAddBps, singleVenueSizeFactor: cfg.singleVenueSizeFactor, disagreeFeeFactor: cfg.disagreeFeeFactor,
+    watchMaxDeviation: cfg.watchMaxDeviation, spendWindowSec: cfg.spendWindowSec, maxWindowSpendShare: cfg.maxWindowSpendShare, pauseAfterSec: cfg.pauseAfterSec,
+    resumeAfterSec: cfg.resumeAfterSec, deadBandBps: cfg.deadBandBps, spendFraction: cfg.spendFraction, reserveFraction: cfg.reserveFraction, minMoveBps: cfg.minMoveBps,
+    targetDepth: cfg.targetDepth, maxAnchorDistance: cfg.maxAnchorDistance, anchorResumeFactor: cfg.anchorResumeFactor, anchorStrikes: cfg.anchorStrikes,
+    referenceMedianN: cfg.referenceMedianN, baseFeeBps: cfg.baseFeeBps, volMultiplier: cfg.volMultiplier, volWindowSec: cfg.volWindowSec, behindFeeBps: cfg.behindFeeBps,
+    minFeeChangeBps: cfg.minFeeChangeBps, widenIntervalSec: cfg.widenIntervalSec, narrowIntervalSec: cfg.narrowIntervalSec, maxTxPerHour: cfg.maxTxPerHour,
+    maxConsecutiveFailures: cfg.maxConsecutiveFailures, maxRaceFailures: cfg.maxRaceFailures, haltSec: cfg.haltSec, anchorRecheckSec: cfg.anchorRecheckSec,
+    alertIntervalSec: cfg.alertIntervalSec, alertBehindTicks: cfg.alertBehindTicks, alertErrorTicks: cfg.alertErrorTicks, maxGatewayLagSec: cfg.maxGatewayLagSec, txValiditySec: cfg.txValiditySec,
+    brakeMaxDeviation: cfg.brakeMaxDeviation, brakeWarmupDeviation: cfg.brakeWarmupDeviation, brakeMinReadings: cfg.brakeMinReadings, brakeSampleSec: cfg.brakeSampleSec,
+  }, NETWORK));
+  if (MAINNET) {
+    const missing = (Object.keys(given) as (keyof typeof given)[]).filter((k) => !given[k]).map((k) => `--${k === 'sentLog' ? 'sent-log' : k}`);
+    if (missing.length) problems.push(`${missing.join(', ')} must be given explicitly on mainnet: there are no mainnet defaults (H-3)`);
+  }
+  // The send guard (M-6 everywhere; the review's seven conditions plus the runbook's on mainnet).
+  for (const p of sendGuardProblems({
+    network: NETWORK, send: SEND, scaleFlag: cfg.scaleFlag, explicit: { pool: !!given.pool, badge: !!given.badge, key: !!given.key, state: !!given.state, sentLog: !!given.sentLog },
+    venues: cfg.venues, excludeVenues: cfg.excludeVenues.length > 0 || !!cfg.excludeVenuesFile, ownerAnchorFlag: !!cfg.ownerAnchorFlag, alertUrl: cfg.alertUrl, ack: cfg.mainnetLive,
+    pool: cfg.pool, mainnetPackages: OWNER_POOL_PACKAGES.mainnet ?? [], sendPools: MAINNET_SEND_POOLS, coingecko: cfg.watchSources.includes('coingecko'),
+  })) if (!problems.includes(p)) problems.push(p);
+  if (problems.length) await refuse(`${problems.length} start-up condition(s) not met${SEND && MAINNET ? ' for mainnet --send' : ''}`, problems);
+}
 
 const net = NETWORKS[NETWORK];
 const gw = new Gateway(net, { url: opt('gateway-url') });
 /** Mainnet is only READ, for prices: entity details and free previews. Nothing is ever signed for it. */
 const mainnetGw = new Gateway(NETWORKS.mainnet, { url: opt('mainnet-gateway-url') });
 
-const log = (o: Record<string, unknown>) => console.log(JSON.stringify({ t: new Date().toISOString(), ...o }));
 // The alert URL may hold a private topic: it is never logged, only whether one is set.
 const redactedCfg = () => ({ ...cfg, keyPath: undefined, alertUrl: cfg.alertUrl ? '(set)' : undefined });
+
+// ------------------------------------------------------------------ the operator key (identity of the state)
+
+let operatorKey!: Ed25519Key;
+try { operatorKey = keyFromHex(readFileSync(cfg.keyPath, 'utf8').trim()); } catch (e) { await refuse(`operator key ${cfg.keyPath} unreadable (${String((e as NodeJS.ErrnoException)?.code ?? 'error')})`); }
+const operatorAccount = await accountOf(operatorKey, net.networkId);
+const signer = { account: operatorAccount, badge: cfg.badge };
+const identity: StateIdentity = { network: NETWORK, pool: cfg.pool, badge: cfg.badge, operatorAccount };
+
+// ------------------------------------------------------------------ lock (one bot per pool, L-1)
+
+let unlock = () => {};
+try {
+  const l = acquireLock(`data/locks/${lockFileName('owner-pool-bot', NETWORK, cfg.pool)}`, 'owner-pool-bot');
+  unlock = l.release;
+  if (l.replacedStale) log({ event: 'lock', replacedStale: l.replacedStale });
+} catch (e) { await refuse(String((e as Error)?.message ?? e)); }
 
 // ------------------------------------------------------------------ state file
 
 interface BotState {
+  /** Whose state this is (H-3): refused for any other network, pool, badge or operator account. */
+  identity?: StateIdentity;
   history: { at: number; price: number }[];
   calibration?: { reference: number; scale: number; at: string; anchor: [string, string] };
-  targetDepth?: number;
+  /** The depth --side balanced steers toward, and the state version it was taken at (L-4). */
+  depth?: { depth: number; afterStateVersion: number };
+  /** The newest owner reserve change seen in the pool's events (deposit, withdrawal, owner rebalance). */
+  ownerReserveChange?: number;
   lastFeeChangeAt?: number;
   txTimes: number[];
   pause: PauseState;
   consecutiveFailures: number;
+  /** "Reserves moved" failures in a row (M-2): never toward the halt, their own limit. */
+  consecutiveRaces?: number;
   haltedUntil?: number;
+  /** A sent transaction whose final status was not known yet (M-3): no new send until it is resolved. */
+  pending?: PendingTx;
+  /** Ticks in a row beyond the owner's anchor distance (H-2: the pause needs --anchor-strikes of them). */
+  anchorStrikes?: number;
   lastTx?: { at: string; type: string; txid: string; status: string };
   /** The owner's last anchor statement read from the ledger, and how far the search has got. */
   ownerAnchor?: { statement?: OwnerAnchorStatement; complete: boolean; scannedTo: number; checkedAt: number; error?: string };
@@ -189,13 +290,21 @@ interface BotState {
   venueConfirm?: VenueConfirmState;
   /** The current single-venue episode (survives a restart, so its alert is not repeated). */
   singleVenue?: SingleVenueState;
+  /** The CoinGecko brake: the rolling ratio reference / CoinGecko and the current episode (H-2). */
+  brake?: BrakeState;
 }
-const loadState = (): BotState => {
-  const fresh: BotState = { history: [], txTimes: [], pause: { pausedByBot: false }, consecutiveFailures: 0 };
-  if (!existsSync(cfg.statePath)) return fresh;
-  return { ...fresh, ...JSON.parse(readFileSync(cfg.statePath, 'utf8')) };
-};
-const state = loadState();
+let state!: BotState;
+{
+  const fresh: BotState = { identity, history: [], txTimes: [], pause: { pausedByBot: false }, consecutiveFailures: 0 };
+  let loaded: { data?: BotState; recovered?: string } = {};
+  try { loaded = loadJsonWithBackup<BotState>(cfg.statePath); } catch (e) { unlock(); await refuse(String((e as Error)?.message ?? e)); }
+  if (loaded.recovered) log({ event: 'state-recovered', note: loaded.recovered });
+  if (loaded.data) {
+    const why = stateIdentityProblem(loaded.data.identity, identity);
+    if (why) { unlock(); await refuse(`${cfg.statePath}: ${why}`); }
+  }
+  state = { ...fresh, ...(loaded.data ?? {}) };
+}
 const alerts = new AlertSink(cfg.alertUrl, { intervalMs: cfg.alertIntervalSec * 1000, last: state.alertLast, prefix: `[owner-pool-bot ${NETWORK}${SEND ? '' : ' dry-run'}] ` });
 state.alertLast = alerts.limiter.last;
 /** Raise an alert (rate-limited per key); the outcome goes into the tick's log line, never the URL. */
@@ -206,27 +315,20 @@ async function alert(key: string, text: string, into?: Record<string, unknown>, 
   if (into) ((into.alerts ??= []) as unknown[]).push(rec);
   else log({ event: 'alert', ...rec, text: r.text });
 }
-async function forceAlert(key: string, text: string): Promise<void> {
+async function forceAlert(key: string, text: string): Promise<{ sent: boolean }> {
   const r = await alerts.alert(key, text, Date.now(), { force: true });
   state.alertLast = alerts.limiter.last;
   log({ event: 'alert', key, sent: r.sent, ...(r.error ? { error: r.error } : {}), ...(alerts.enabled ? {} : { noUrl: true }), text: r.text });
+  return { sent: r.sent };
 }
-const saveState = () => {
-  const tmp = `${cfg.statePath}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 1) + '\n');
-  renameSync(tmp, cfg.statePath);
+/** Temp file, fsync, keep .bak, rename (L-6). */
+const saveState = () => saveJsonDurable(cfg.statePath, state);
+let tickNo = 0;
+/** The heartbeat (M-5): written every tick, ok or not; deploy/owner-pool-heartbeat.timer alerts when it stops. */
+const beat = (ok: boolean, note?: string) => {
+  try { writeHeartbeat(cfg.heartbeatPath, { program: 'owner-pool-bot', network: NETWORK, pool: cfg.pool, pid: process.pid, at: Date.now(), tick: tickNo, ok, ...(note ? { note } : {}) }); } catch (e) { log({ event: 'heartbeat-failed', message: String((e as Error)?.message ?? e).slice(0, 200) }); }
 };
 
-// One bot per state file: a second one would double the sends.
-const lockPath = `${cfg.statePath}.lock`;
-if (existsSync(lockPath)) {
-  const pid = Number(readFileSync(lockPath, 'utf8'));
-  let alive = false;
-  try { process.kill(pid, 0); alive = true; } catch { /* stale */ }
-  if (alive && pid !== process.pid) { log({ event: 'refused', reason: `another bot (pid ${pid}) holds ${lockPath}` }); process.exit(2); }
-}
-writeFileSync(lockPath, String(process.pid));
-const unlock = () => { try { unlinkSync(lockPath); } catch { /* gone */ } };
 
 // ------------------------------------------------------------------ price sources (mainnet, read-only)
 
@@ -241,9 +343,20 @@ try {
   const g = await assertReferenceExcludesOwnerPools(mainnetGw, cfg.venues, cfg.pool);
   log({ event: 'venue-guard', ok: true, checked: g.checked });
 } catch (e) {
-  log({ event: 'refused', reason: String((e as Error)?.message ?? e) });
   unlock();
-  process.exit(2);
+  await refuse(String((e as Error)?.message ?? e));
+}
+/** The pair every operated pool must be (H-1), in the reference's orientation. */
+const referencePair = OWNER_POOL_REFERENCE_PAIRS[NETWORK]!;
+// HARD GUARD (H-1 and the package allow-list): read the pool now; refuse a pair or orientation mismatch.
+try {
+  const p0 = (await readOwnerPools(gw, [cfg.pool], OWNER_POOL_PACKAGES[NETWORK]))[0]!;
+  const why = pairProblem(p0, referencePair);
+  if (why) throw new Error(`pair check: ${why}`);
+  log({ event: 'pair-guard', ok: true, pair: referencePair.label, resourceA: p0.resourceA, resourceB: p0.resourceB, package: p0.packageAddress });
+} catch (e) {
+  unlock();
+  await refuse(String((e as Error)?.message ?? e));
 }
 /** Venues excluded for a test or drill: the flag, plus the file's names (re-read each tick). */
 function excludedVenues(): string[] {
@@ -271,47 +384,104 @@ async function operatorStatus(epoch: number): Promise<{ operator: string | null;
 
 // ------------------------------------------------------------------ sending
 
-const operatorKey: Ed25519Key = keyFromHex(readFileSync(cfg.keyPath, 'utf8').trim());
-const operatorAccount = await accountOf(operatorKey, net.networkId);
-const signer = { account: operatorAccount, badge: cfg.badge };
+type Sent = { type: string; preview: { ok: boolean; feeXrd: string; error?: string }; sent: boolean; txid?: string; status?: string; error?: string; skipped?: string; pending?: boolean };
 
-type Sent = { type: string; preview: { ok: boolean; feeXrd: string; error?: string }; sent: boolean; txid?: string; status?: string; error?: string; skipped?: string };
-
-/** Preview the exact transaction now; send it (with --send) only if the preview succeeded and the caps allow. */
-async function execute(type: string, manifest: string): Promise<Sent> {
-  const now = Date.now();
-  if (SEND && sendHalted(state, now)) {
-    return { type, preview: { ok: false, feeXrd: '0' }, sent: false, skipped: `halted after ${cfg.maxConsecutiveFailures} failed transactions until ${new Date(state.haltedUntil ?? 0).toISOString()}` };
+/** Count a final outcome toward the halt (a "Reserves moved" race has its own limit), alert a halt or a recovery. */
+async function settleOutcome(type: string, txid: string, ok: boolean, status: string, error?: string): Promise<void> {
+  const so = recordSendOutcomeV2(state, { ok, error }, Date.now(), { maxFailures: cfg.maxConsecutiveFailures, maxRaces: cfg.maxRaceFailures, haltMs: cfg.haltSec * 1000 });
+  state.consecutiveFailures = so.consecutiveFailures;
+  state.consecutiveRaces = so.consecutiveRaces;
+  state.haltedUntil = so.haltedUntil;
+  if (so.race) log({ event: 'race', txid, type, consecutiveRaces: so.consecutiveRaces, note: 'a swap landed between the read and the rebalance (Reserves moved): not counted toward the halt' });
+  if (so.recovered) {
+    // The halted run is over: the next halt must be alerted even inside the alert interval.
+    alerts.limiter.clear('halt');
+    log({ event: 'halt-recovered', txid, type });
   }
-  if (SEND && txAllowance(state.txTimes, now, cfg.maxTxPerHour) <= 0) {
+  if (so.halted) {
+    const what = so.race ? `${state.consecutiveRaces} "Reserves moved" races in a row` : `${state.consecutiveFailures} failed sends in a row`;
+    await alert('halt', `HALTED: ${what} (last ${type} ${txid}: ${status}${error ? ' ' + error.slice(0, 120) : ''}). No sends but the protective pause and fee widening until ${new Date(state.haltedUntil ?? 0).toISOString()}.`);
+  }
+  state.lastTx = { at: new Date().toISOString(), type, txid, status };
+}
+
+/**
+ * Preview the exact transaction now; send it (with --send) only if the preview succeeded and the caps
+ * allow. `protective` (the operator pause ON, a fee widen) is never blocked by the halt or the hourly cap
+ * (M-2). Nothing is sent while an earlier send is unresolved (M-3), so sends never land out of order.
+ */
+async function execute(type: string, manifest: string, o: { protective?: boolean; plannedCost?: number; reason?: string } = {}): Promise<Sent> {
+  const now = Date.now();
+  if (SEND && state.pending) {
+    return { type, preview: { ok: false, feeXrd: '0' }, sent: false, skipped: `earlier send ${state.pending.type} ${state.pending.txid} unresolved: nothing new until it commits, fails or expires (${new Date(state.pending.expiresAt * 1000).toISOString()})` };
+  }
+  if (SEND && !o.protective && sendHalted(state, now)) {
+    return { type, preview: { ok: false, feeXrd: '0' }, sent: false, skipped: `halted until ${new Date(state.haltedUntil ?? 0).toISOString()} (${state.consecutiveFailures} failures, ${state.consecutiveRaces ?? 0} races)` };
+  }
+  if (SEND && !o.protective && txAllowance(state.txTimes, now, cfg.maxTxPerHour) <= 0) {
     return { type, preview: { ok: false, feeXrd: '0' }, sent: false, skipped: `transaction cap reached (${cfg.maxTxPerHour} per hour)` };
   }
-  const { epoch } = await gw.status();
-  const tx = await buildTransaction({ manifest, window: { networkId: net.networkId, startEpoch: epoch, endEpoch: epoch + 5 }, notary: operatorKey });
+  // Short validity (M-3): 2 epochs, and --tx-validity seconds on the LEDGER's clock (the proposer timestamp bound).
+  const st = await gw.status();
+  const w = txWindow(st.epoch, st.timestamp, cfg.txValiditySec);
+  const tx = await buildTransaction({ manifest, window: { networkId: net.networkId, ...w }, notary: operatorKey });
   const pv = await gw.previewV2(tx.previewHex);
   const preview = { ok: pv.ok, feeXrd: pv.feeXrd, ...(pv.error ? { error: pv.error.slice(0, 300) } : {}) };
   if (!pv.ok || !SEND) return { type, preview, sent: false };
   state.txTimes = [...state.txTimes.filter((t) => now - t < 3_600_000), now];
+  // Unresolved until we know better: a crash during the wait leaves it pending, resolved on the next start.
+  state.pending = { txid: tx.intentHashId, type, at: now, expiresAt: w.expiresAt, ...(o.plannedCost !== undefined ? { plannedCost: o.plannedCost } : {}), ...(o.reason ? { reason: o.reason } : {}) };
   saveState();
   // Recorded BEFORE submission: an operator action on ledger that is not in this file was not ours.
   appendFileSync(cfg.sentLog, JSON.stringify({ at: new Date().toISOString(), txid: tx.intentHashId, type, pool: cfg.pool, network: NETWORK }) + '\n');
   // Never throws: a refused or unreachable submit is a FAILED SEND (counted toward the halt), not a tick error.
-  const out = await trySubmitAndWait(gw, tx, 180_000);
-  const ok = out.status === 'CommittedSuccess';
-  const so = recordSendOutcome(state, ok, Date.now(), { maxFailures: cfg.maxConsecutiveFailures, haltMs: cfg.haltSec * 1000 });
-  state.consecutiveFailures = so.consecutiveFailures;
-  state.haltedUntil = so.haltedUntil;
-  if (so.recovered) {
-    // The halted run is over: the next halt must be alerted even inside the alert interval.
-    alerts.limiter.clear('halt');
-    log({ event: 'halt-recovered', txid: tx.intentHashId, type });
+  // Wait past the validity, so a Timeout almost always means "expired"; one that is not is resolved next tick.
+  const out = await trySubmitAndWait(gw, tx, (cfg.txValiditySec + 45) * 1000);
+  const err = 'error' in out ? out.error : undefined;
+  if (out.status === 'Timeout') {
+    log({ event: 'send-unresolved', txid: tx.intentHashId, type, expiresAt: new Date(w.expiresAt * 1000).toISOString(), note: 'checked again on the next tick before anything else is sent' });
+    saveState();
+    return { type, preview, sent: true, txid: tx.intentHashId, status: out.status, pending: true, ...(err ? { error: err.slice(0, 300) } : {}) };
   }
-  if (so.halted) {
-    await alert('halt', `HALTED: ${state.consecutiveFailures} failed sends in a row (last ${type} ${tx.intentHashId}: ${out.status}${'error' in out ? ' ' + out.error.slice(0, 120) : ''}). No sends until ${new Date(state.haltedUntil ?? 0).toISOString()}.`);
-  }
-  state.lastTx = { at: new Date().toISOString(), type, txid: tx.intentHashId, status: out.status };
+  state.pending = undefined;
+  await settleOutcome(type, tx.intentHashId, out.status === 'CommittedSuccess', out.status, err);
   saveState();
-  return { type, preview, sent: true, txid: tx.intentHashId, status: out.status, ...('error' in out ? { error: out.error.slice(0, 300) } : {}) };
+  return { type, preview, sent: true, txid: tx.intentHashId, status: out.status, ...(err ? { error: err.slice(0, 300) } : {}) };
+}
+
+/**
+ * Resolve an earlier unresolved send (M-3) before anything else: committed (a rebalance's spend goes into
+ * the rolling window from its ledger event), failed, or expired on the ledger clock. Returns a log record.
+ */
+async function resolvePending(ledgerNowSec: number): Promise<Record<string, unknown> | undefined> {
+  const p = state.pending;
+  if (!p) return undefined;
+  let s: any;
+  try { s = await gw.post('/transaction/status', { intent_hash: p.txid }); } catch (e) { return { txid: p.txid, type: p.type, status: 'status read failed', error: String((e as Error)?.message ?? e).slice(0, 120) }; }
+  const st = String(s?.intent_status ?? '');
+  if (st === 'CommittedSuccess') {
+    state.pending = undefined;
+    if (p.type === 'rebalance') {
+      const ev: { cost?: string } = await rebalanceEvent(p.txid).catch(() => ({}));
+      state.spends = [...(state.spends ?? []), { at: Date.now(), cost: Number(ev.cost ?? p.plannedCost ?? 0), txid: p.txid }];
+    }
+    // A late pause is still the bot's own: it may lift it again (the pool state is read after this).
+    if (p.type === 'set_operator_paused(true)') state.pause = { ...state.pause, pausedByBot: true, pauseReason: p.reason ?? 'set by the bot (committed late)' };
+    await settleOutcome(p.type, p.txid, true, 'CommittedSuccess (late)');
+    return { txid: p.txid, type: p.type, status: 'CommittedSuccess (late)' };
+  }
+  if (st === 'CommittedFailure' || st === 'PermanentlyRejected') {
+    state.pending = undefined;
+    const error = String(s?.error_message ?? s?.intent_status_description ?? st);
+    await settleOutcome(p.type, p.txid, false, st, error);
+    return { txid: p.txid, type: p.type, status: st, error: error.slice(0, 200) };
+  }
+  if (pendingGate(p, ledgerNowSec) === 'expired') {
+    state.pending = undefined;
+    await settleOutcome(p.type, p.txid, false, 'Expired', `not committed by its proposer-timestamp bound ${new Date(p.expiresAt * 1000).toISOString()}`);
+    return { txid: p.txid, type: p.type, status: 'Expired' };
+  }
+  return { txid: p.txid, type: p.type, status: `still unresolved (${st || 'unknown'}): no send this tick` };
 }
 
 /** The ledger's OwnerPoolRebalanceEvent of a committed transaction: cost and allowance after. */
@@ -337,6 +507,8 @@ async function ownerAnchor(now: number, line: Record<string, unknown>): Promise<
         : await findOwnerAnchor(gw, cfg.pool);
       const prev = c?.statement;
       state.ownerAnchor = { statement: r.statement, complete: r.complete, scannedTo: r.newest, checkedAt: now };
+      const orc = 'ownerReserveChange' in r ? r.ownerReserveChange : undefined;
+      if (orc !== undefined) state.ownerReserveChange = Math.max(state.ownerReserveChange ?? 0, orc);
       if (r.statement && prev && r.statement.stateVersion !== prev.stateVersion) {
         line.ownerAnchorChanged = { from: prev.anchor, to: r.statement.anchor, txid: r.statement.txid };
         const a = anchorRestatedAlert(prev.anchor, r.statement.anchor, r.statement.txid);
@@ -354,7 +526,6 @@ async function ownerAnchor(now: number, line: Record<string, unknown>): Promise<
 
 // ------------------------------------------------------------------ one tick
 
-let tickNo = 0;
 async function tick(): Promise<void> {
   tickNo++;
   const now = Date.now();
@@ -363,7 +534,15 @@ async function tick(): Promise<void> {
   line.actions = actions;
 
   // 1. Reference: on-ledger venues only. Watch sources (CoinGecko) are read beside them, never used.
-  const [quotes, watch] = await Promise.all([Promise.all(venues.map(readVenueSource)), Promise.all(watchSources.map(readSource))]);
+  // M-4: the quotes are as old as the mainnet Gateway's ledger, read just before them; a lagging Gateway counts for nothing.
+  const mainnetLedgerAt = await mainnetGw.status().then((x) => Date.parse(x.timestamp), () => NaN);
+  const [rawQuotes, watch] = await Promise.all([Promise.all(venues.map(readVenueSource)), Promise.all(watchSources.map(readSource))]);
+  const synthetic = cfg.venues.every((v) => v.startsWith('fixed:') || v.startsWith('file:'));
+  const stamped = synthetic ? { quotes: rawQuotes, lagMs: 0, lagging: false } : stampLedgerTime(rawQuotes, mainnetLedgerAt, Date.now(), cfg.maxGatewayLagSec * 1000);
+  const quotes = stamped.quotes;
+  line.mainnetGateway = synthetic ? 'not used (synthetic venues)' : { lagSec: Number.isFinite(stamped.lagMs) ? Math.round(stamped.lagMs / 1000) : null, lagging: stamped.lagging };
+  if (stamped.lagging) await alert('gateway-lag', `Mainnet Gateway lagging (${Number.isFinite(stamped.lagMs) ? Math.round(stamped.lagMs / 1000) + ' s' : 'status unreadable'}; limit ${cfg.maxGatewayLagSec} s): no venue counts this tick.`, line);
+  else alerts.limiter.clear('gateway-lag');
   const exclude = excludedVenues();
   const aggOpts = { minVenues: cfg.minVenues, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement, maxRoundTrip: cfg.maxRoundTrip, minImpactBps: cfg.minImpactBps, maxVenueFee: cfg.maxVenueFee, exclude };
   const raw: VenueReference = aggregateVenues(quotes, now, aggOpts);
@@ -415,6 +594,19 @@ async function tick(): Promise<void> {
     if ('alarm' in w && w.alarm) await alert(`watch-${w.source}`, `WATCH: ${w.source} ${w.price} is ${((w.deviation ?? 0) * 100).toFixed(1)}% from the on-ledger reference ${r6(vref.price)} (limit ${(cfg.watchMaxDeviation * 100).toFixed(0)}%). Trading is NOT affected; check the venues.`, line);
     else if ('alarm' in w && w.deviation !== null) alerts.limiter.clear(`watch-${w.source}`);
   }
+  // The CoinGecko BRAKE (owner, 23 Nov 2026): CoinGecko is never a price. Only the ratio reference / CoinGecko
+  // is tracked; a ratio more than --brake-max-deviation from its 24 h median blocks rebalancing this tick.
+  const cgRead = watch.find((w) => w.source.startsWith('coingecko'));
+  const brake = coingeckoBrake(state.brake, {
+    reference: ref.ok && watchComparable && !vc.uncertain ? ref.price : undefined,
+    coingecko: cgRead ? { price: cgRead.price, at: cgRead.at, error: cgRead.error } : undefined, now,
+  }, { maxDeviation: cfg.brakeMaxDeviation, warmupDeviation: cfg.brakeWarmupDeviation, minReadings: cfg.brakeMinReadings, sampleMs: cfg.brakeSampleSec * 1000 });
+  state.brake = brake.state;
+  line.brake = { braking: brake.braking, mode: brake.mode, readings: brake.readings, threshold: brake.threshold, ratio: r6(brake.ratio), normal: r6(brake.normal), deviation: brake.deviation === undefined ? null : round(brake.deviation, 5), ...(brake.state.since ? { since: new Date(brake.state.since).toISOString() } : {}), ...(brake.state.unavailableSince ? { coingeckoUnavailableSince: new Date(brake.state.unavailableSince).toISOString() } : {}) };
+  if (brake.started) await alert('coingecko-brake', `BRAKE: reference/CoinGecko ratio ${r6(brake.ratio)} is ${((brake.deviation ?? 0) * 100).toFixed(2)}% from its normal ${r6(brake.normal)} (limit ${(brake.threshold * 100).toFixed(1)}%${brake.mode === 'warmup' ? ', warm-up' : ''}): no rebalance until it is back inside. The pool is NOT paused by this.`, line);
+  if (brake.ended) { alerts.limiter.clear('coingecko-brake'); line.brakeEnded = true; }
+  if (brake.unavailableLong) await alert('coingecko-unavailable', `CoinGecko unavailable or stale since ${new Date(brake.state.unavailableSince!).toISOString()}: the brake has no signal; trading continues on the on-ledger median and two-tick protections.`, line);
+  else if (brake.mode !== 'unavailable') alerts.limiter.clear('coingecko-unavailable');
   // Volatility history: only prices from the full confirmed set (trade or hold ticks, never uncertain,
   // disagree or none), so a one-tick jump from a partial venue set cannot raise the fee.
   const volOk = volatilityEligible({ status: vref.status, holding: vh.holding, uncertain: vc.uncertain });
@@ -424,11 +616,17 @@ async function tick(): Promise<void> {
     state.history = state.history.filter((h) => now - h.at <= D.historyKeepSec * 1000);
   }
 
-  // 2. Ledger: pool state (vault by vault) and the contract's own operator_status.
-  const { epoch } = await gw.status();
+  // 2. Ledger: first settle an earlier unresolved send (M-3), then the pool state (vault by vault) and the
+  // contract's own operator_status.
+  const { epoch, timestamp: ledgerTs } = await gw.status();
+  const pend = await resolvePending(Math.floor(Date.parse(ledgerTs) / 1000));
+  if (pend) line.pendingSend = pend;
   const pool: OwnerPoolState = (await readOwnerPools(gw, [cfg.pool], OWNER_POOL_PACKAGES[NETWORK]))[0]!;
   const s = pool.split;
   if (!s) throw new Error(`${cfg.pool} is not a split OwnerPool`);
+  // H-1 on every tick: the pool must still be the reference pair (it cannot change, but a wrong --pool cannot slip by).
+  const pairWhy = pairProblem(pool, referencePair);
+  if (pairWhy) throw new FatalError(`pair check: ${pairWhy}`);
   const st = await operatorStatus(epoch);
   const allowanceLocal = ownerPoolAllowanceNow(pool, epoch);
   const price = new Decimal(pool.reserveB).div(pool.reserveA).toNumber();
@@ -438,8 +636,11 @@ async function tick(): Promise<void> {
   };
   line.allowance = { ledger: st.allowance, local: allowanceLocal, budget: s.limits.moveBudgetBps / 10_000 };
   if (st.allowance !== allowanceLocal) line.warning = 'allowance: ledger and local copy differ (the ledger is used for nothing but this check; the plan is re-checked by preview)';
-  state.targetDepth ??= cfg.targetDepth ?? Math.sqrt(Number(pool.reserveA) * Number(pool.reserveB));
-  const targetDepth = cfg.targetDepth ?? state.targetDepth;
+  // L-4: the depth to steer toward is re-read after every owner change of the reserves (or set by --target-depth).
+  const du = targetDepthUpdate({ configured: cfg.targetDepth, saved: state.depth, ownerChangeStateVersion: state.ownerReserveChange, reserveA: Number(pool.reserveA), reserveB: Number(pool.reserveB), stateVersion: pool.stateVersion ?? 0 });
+  if (du.reset && state.depth) line.targetDepthReset = { from: state.depth.depth, to: du.depth, ownerChangeStateVersion: state.ownerReserveChange };
+  state.depth = { depth: du.depth, afterStateVersion: du.afterStateVersion };
+  const targetDepth = du.depth;
 
   // 3. The owner's anchor (ledger first), then map the reference onto the pool.
   const oa = await ownerAnchor(now, line);
@@ -449,17 +650,21 @@ async function tick(): Promise<void> {
     : { source: oa.source, reason: oa.reason, ...(oa.source === 'flag' ? { anchor: oa.anchor } : {}) };
   if (oa.source === 'ledger') alerts.limiter.clear('anchor-unknown');
   else await alert('anchor-unknown', `Owner anchor ${oa.source === 'flag' ? `taken from --owner-anchor ${oa.anchor.join(':')}` : 'UNKNOWN: not rebalancing'}: ${oa.reason}`, line);
+  // H-2: the target follows the MEDIAN of the last --reference-median healthy readings (none until that many are
+  // in), so a reading manipulated on one tick is never the target on its own.
+  const med = medianReference(state.history, now, { n: cfg.referenceMedianN, maxAgeMs: cfg.referenceMedianN * cfg.intervalSec * 3 * 1000 });
+  line.referenceMedian = { n: cfg.referenceMedianN, used: med.used, price: med.price ?? null, ...(med.reason ? { reason: med.reason } : {}) };
   let scale: number | undefined;
-  if (cfg.scale !== 'auto') scale = Number(cfg.scale);
+  if (SCALE !== 'auto') scale = SCALE;
   else if (ownerAnchorNow && state.calibration && state.calibration.anchor.join(':') === ownerAnchorNow.join(':')) scale = state.calibration.scale;
-  else if (ref.ok && ownerAnchorNow) {
-    scale = calibrateScale(ref.price, ownerAnchorNow);
-    state.calibration = { reference: ref.price, scale, at: new Date(now).toISOString(), anchor: ownerAnchorNow };
+  else if (med.price && ownerAnchorNow) {
+    // Stokenet only (resolveScale refuses auto on mainnet): the TEUR stand-in has no market of its own.
+    scale = calibrateScale(med.price, ownerAnchorNow);
+    state.calibration = { reference: med.price, scale, at: new Date(now).toISOString(), anchor: ownerAnchorNow };
     line.calibrated = state.calibration;
   }
-  if (scale !== undefined && !(scale > 0)) throw new Error(`--scale must be positive or auto, not ${cfg.scale}`);
-  // Not calibrated yet (auto, and no healthy reference so far): no target.
-  const target = ref.ok && scale ? poolTargetPrice(ref.price, scale) : undefined;
+  // Not calibrated yet (auto), or the median not warmed up: no target.
+  const target = med.price && scale ? poolTargetPrice(med.price, scale) : undefined;
   line.scale = scale ?? null;
   line.target = target ?? null;
   line.gapBps = target ? round(priceDistance(price, target) * 10_000, 2) : null;
@@ -468,11 +673,15 @@ async function tick(): Promise<void> {
   const stoppedForAnchor = state.pause.pausedByBot && /anchor/.test(state.pause.pauseReason ?? '');
   // Unknown anchor: no distance can be measured, so no anchor stop either; the rebalance is refused below.
   const anchor = target && ownerAnchorNow ? anchorCheck(target, ownerAnchorNow, { maxDistance: cfg.maxAnchorDistance, resumeFactor: cfg.anchorResumeFactor, stopped: stoppedForAnchor }) : { ok: true, distance: NaN };
-  line.ownerAnchor = { anchor: ownerAnchorNow ?? null, distance: Number.isNaN(anchor.distance) ? null : round(anchor.distance, 5), ok: anchor.ok };
-  if (!anchor.ok) {
-    line.ownerMustAct = `reference maps to ${target} B per A, ${(anchor.distance * 100).toFixed(2)}% from the owner's anchor ${ownerAnchorNow!.join(':')} (limit ${(cfg.maxAnchorDistance * 100).toFixed(1)}%): the bot stops following. The OWNER must restate the anchor (set_anchor) from the market; the bot cannot and must not.`;
+  // H-2: the bot stops FOLLOWING at once, but pauses the pool only after --anchor-strikes ticks in a row.
+  const strike = anchorStrike(state.anchorStrikes, anchor.ok, cfg.anchorStrikes);
+  state.anchorStrikes = strike.strikes;
+  const anchorPauseOk = anchor.ok || !strike.confirmed;
+  line.ownerAnchor = { anchor: ownerAnchorNow ?? null, distance: Number.isNaN(anchor.distance) ? null : round(anchor.distance, 5), ok: anchor.ok, ...(strike.strikes ? { strikes: strike.strikes, pauseAfter: cfg.anchorStrikes } : {}) };
+  if (!anchor.ok && strike.confirmed) {
+    line.ownerMustAct = `reference maps to ${target} B per A, ${(anchor.distance * 100).toFixed(2)}% from the owner's anchor ${ownerAnchorNow!.join(':')} (limit ${(cfg.maxAnchorDistance * 100).toFixed(1)}%, ${strike.strikes} ticks in a row): the bot stops following. The OWNER must restate the anchor (set_anchor) from the market; the bot cannot and must not.`;
     await alert('anchor-stop', `ANCHOR STOP: ${line.ownerMustAct}`, line);
-  } else alerts.limiter.clear('anchor-stop');
+  } else if (anchor.ok) alerts.limiter.clear('anchor-stop');
   if (!ref.ok && state.pause.unhealthySince !== undefined && now - state.pause.unhealthySince >= cfg.pauseAfterSec * 1000) {
     await alert('reference-unhealthy', `On-ledger reference unusable for ${Math.round((now - state.pause.unhealthySince) / 60_000)} min (${ref.reason}).`, line);
   } else if (ref.ok) alerts.limiter.clear('reference-unhealthy');
@@ -485,13 +694,14 @@ async function tick(): Promise<void> {
 
   // 5. Pause control.
   const pd = pauseDecision({
-    now, healthy: ref.ok, anchorOk: anchor.ok, operatorPaused: s.operatorPaused, ownerPaused: s.ownerPaused, state: state.pause,
+    now, healthy: ref.ok, anchorOk: anchorPauseOk, operatorPaused: s.operatorPaused, ownerPaused: s.ownerPaused, state: state.pause,
     pauseAfterMs: cfg.pauseAfterSec * 1000, resumeAfterMs: cfg.resumeAfterSec * 1000,
   });
   line.pause = { action: pd.action, reason: pd.reason };
   if (pd.action !== 'none') {
     const r = await execute(pd.action === 'pause' ? 'set_operator_paused(true)' : 'set_operator_paused(false)',
-      ownerPoolSetOperatorPausedManifest({ pool: cfg.pool, signer, paused: pd.action === 'pause', feeLockXrd: cfg.feeLockXrd }));
+      ownerPoolSetOperatorPausedManifest({ pool: cfg.pool, signer, paused: pd.action === 'pause', feeLockXrd: cfg.feeLockXrd }),
+      { protective: pd.action === 'pause', reason: pd.reason });
     actions.push(r);
     // Keep the timers; record the pause as the bot's only if it really happened.
     state.pause = r.status === 'CommittedSuccess' ? pd.state : { ...pd.state, pausedByBot: state.pause.pausedByBot, pauseReason: state.pause.pauseReason };
@@ -526,8 +736,16 @@ async function tick(): Promise<void> {
     line.decision = `NO REBALANCE: ${uncertainMsg}${fr ? `; ${fr}` : ''}`;
     return void log(line);
   }
-  if (gate === 'none' || !ref.ok || !target) { line.decision = `no reference (${ref.ok ? 'no target' : ref.reason}): no rebalance, no fee change`; return void log(line); }
-  if (!anchor.ok) { line.decision = 'beyond the owner anchor distance: not following'; return void log(line); }
+  if (gate === 'none' || !ref.ok || !target) { line.decision = `no reference (${ref.ok ? `no target: ${med.reason ?? 'not calibrated'}` : ref.reason}): no rebalance, no fee change`; return void log(line); }
+  if (!anchor.ok) { line.decision = `beyond the owner anchor distance: not following${strike.confirmed ? '' : ` (pause after ${cfg.anchorStrikes} ticks in a row; ${strike.strikes} so far)`}`; return void log(line); }
+  // The CoinGecko brake: it may only stop rebalancing (the fee may widen, not narrow, as in a hold). It never
+  // pauses the pool: a lasting brake only blocks rebalances (the pause rules are the reference's and the anchor's).
+  if (brake.braking) {
+    const why = `CoinGecko brake: ratio ${r6(brake.ratio)} is ${((brake.deviation ?? 0) * 100).toFixed(2)}% from its normal ${r6(brake.normal)} (limit ${(brake.threshold * 100).toFixed(1)}%)`;
+    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, undefined, actions, line, why, caution) : undefined;
+    line.decision = `BRAKE: ${why}: no rebalance${fr ? `; ${fr}` : ''}`;
+    return void log(line);
+  }
 
   // 6. Rebalance.
   state.spends = (state.spends ?? []).filter((x) => now - x.at < 86_400_000);
@@ -545,7 +763,7 @@ async function tick(): Promise<void> {
     line.rebalance = { kind: dec.kind, toReserveA: dec.toReserveA, toReserveB: dec.toReserveB, cost: dec.plan.cost, allowance: dec.allowance, spendable: dec.spendable, priceAfter: dec.priceAfter, gapAfterBps: round(dec.gapAfterBps, 2), clipped: dec.clipped };
     const r = await execute('rebalance', ownerPoolRebalanceManifest({
       pool: cfg.pool, operator: signer, toReserveA: dec.toReserveA, toReserveB: dec.toReserveB, expected: [pool.reserveA, pool.reserveB], feeLockXrd: cfg.feeLockXrd,
-    }));
+    }), { plannedCost: Number(dec.plan.cost) });
     actions.push(r);
     if (r.status === 'CommittedSuccess' && r.txid) {
       const ev: { cost?: string; allowance?: string } = await rebalanceEvent(r.txid).catch(() => ({}));
@@ -585,7 +803,8 @@ async function feeStep(now: number, feeNow: number, s: NonNullable<OwnerPoolStat
     volBps: round(volBps, 2), behind, ...(caution ? { singleVenueAddBps: caution.feeAddBps } : {}), ...(disagreement !== undefined ? { disagreement: round(disagreement, 5) } : {}), decision: fd.reason,
   };
   if (fd.action !== 'set') return `fee: ${fd.reason}`;
-  const r = await execute(`operator_set_fee(${fd.feeBps})`, ownerPoolOperatorSetFeeManifest({ pool: cfg.pool, operator: signer, feeBps: fd.feeBps, feeLockXrd: cfg.feeLockXrd }));
+  const type = `operator_set_fee(${fd.feeBps})`;
+  const r = await execute(type, ownerPoolOperatorSetFeeManifest({ pool: cfg.pool, operator: signer, feeBps: fd.feeBps, feeLockXrd: cfg.feeLockXrd }), { protective: isProtectiveSend(type, { feeFrom: feeNow, feeTo: fd.feeBps }) });
   actions.push(r);
   if (r.status === 'CommittedSuccess') { state.lastFeeChangeAt = Date.now(); state.lastFeeFailure = undefined; }
   else if (r.sent || (!r.preview.ok && !r.skipped)) state.lastFeeFailure = { feeBps: fd.feeBps, at: Date.now() };
@@ -601,14 +820,24 @@ process.on('SIGINT', () => stop('SIGINT'));
 process.on('SIGTERM', () => stop('SIGTERM'));
 const sleep = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); wake = () => { clearTimeout(t); r(); }; });
 
-log({ event: 'start', mode: SEND ? 'send' : 'dry-run', network: NETWORK, pool: cfg.pool, operatorAccount, badge: cfg.badge, gateway: opt('gateway-url') ?? 'public', mainnetGateway: opt('mainnet-gateway-url') ?? 'public', venues: venues.map((s) => s.name), watch: watchSources.map((s) => s.name), config: redactedCfg() });
-// Start and stop are never rate-limited: every restart (a crash loop included) must be seen.
-if (!ONCE) await forceAlert('start', `Bot started (pid ${process.pid}) on ${cfg.pool.slice(0, 24)}...: venues ${cfg.venues.join(',')}, quote size ${cfg.quoteSizeXrd} XRD, disagreement bound ${(cfg.maxDisagreement * 100).toFixed(1)}%.`);
+// The sent log exists from the start, so a watcher that requires it (mainnet) can tell "no sends yet" from "no log".
+try { appendFileSync(cfg.sentLog, ''); } catch (e) { unlock(); await refuse(`sent log ${cfg.sentLog} not writable (${String((e as NodeJS.ErrnoException)?.code ?? e)})`); }
+log({ event: 'start', mode: SEND ? 'send' : 'dry-run', network: NETWORK, pool: cfg.pool, operatorAccount, badge: cfg.badge, scale: SCALE, gateway: opt('gateway-url') ?? 'public', mainnetGateway: opt('mainnet-gateway-url') ?? 'public', venues: venues.map((s) => s.name), watch: watchSources.map((s) => s.name), mainnetSendPools: MAINNET_SEND_POOLS, config: redactedCfg() });
+// Start and stop are never rate-limited: every restart (a crash loop included) must be seen. With --send
+// the start alert is the test of the alert path (M-6): not delivered, no run.
+if (!ONCE || SEND) {
+  const r = await forceAlert('start', `Bot started (pid ${process.pid}, ${SEND ? 'SENDING' : 'dry run'}) on ${cfg.pool.slice(0, 24)}...: venues ${cfg.venues.join(',')}, quote size ${cfg.quoteSizeXrd} XRD, disagreement bound ${(cfg.maxDisagreement * 100).toFixed(1)}%.`);
+  if (SEND && !r.sent) { unlock(); await refuse('--send: the start alert was not delivered; fix the alert URL first (M-6)'); }
+}
+beat(true, 'started');
+/** A condition that must stop the bot (H-1 on a tick): refused, not retried. */
 let errors = 0;
+let fatal: string | undefined;
 try {
   while (!stopping) {
     let failed: unknown;
     try { await tick(); } catch (e) { failed = e ?? new Error('tick failed'); }
+    if (failed instanceof FatalError) { fatal = failed.message; break; }
     const prev = errors;
     const to = tickOutcome(errors, failed !== undefined, { intervalMs: cfg.intervalSec * 1000, alertTicks: cfg.alertErrorTicks });
     errors = to.errors;
@@ -620,13 +849,16 @@ try {
       if (ONCE) process.exitCode = 1;
     } else if (prev >= cfg.alertErrorTicks) alerts.limiter.clear('tick-errors');
     saveState();
+    beat(failed === undefined, failed === undefined ? undefined : 'tick error');
     if (ONCE || stopping) break;
     // Back off on errors: interval * 2^errors, at most 15 minutes.
     await sleep(to.delayMs);
   }
 } finally {
-  if (!ONCE) await forceAlert('stop', `Bot stopped after ${tickNo} ticks${stopping ? '' : ' (unexpectedly)'}.`);
+  if (fatal) { log({ event: 'refused', reason: fatal }); await forceAlert('stop', `Bot STOPPED itself: ${fatal}`); process.exitCode = 2; }
+  else if (!ONCE) await forceAlert('stop', `Bot stopped after ${tickNo} ticks${stopping ? '' : ' (unexpectedly)'}.`);
   saveState();
+  beat(false, fatal ? `stopped: ${fatal}` : 'stopped');
   unlock();
   log({ event: 'stopped', ticks: tickNo });
 }
