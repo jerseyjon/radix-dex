@@ -1,0 +1,24 @@
+# The read-only OwnerPool watcher, with the per-trade markout record, as a systemd USER service.
+# NOT INSTALLED. Runbook: docs/MAINNET-POOLS.md. It holds no key and sends no transaction; ideally it
+# runs on a different machine from the bot (then copy the bot's sent log there, or drop
+# --bot-sent-log and accept "not-bot" findings for every operator action).
+# Install as ~/.config/systemd/user/owner-pool-watch.service, adjust WorkingDirectory, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now owner-pool-watch
+#   npx tsx scripts/owner-pool-markout.ts --file data/owner-pool-markout-mainnet.jsonl   # the summary
+[Unit]
+Description=OwnerPool watcher and markout record (mainnet, read only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/jon/Radix/dex
+EnvironmentFile=%h/.config/radix-dex/owner-pool.env
+ExecStart=/usr/bin/env npx tsx scripts/owner-pool-watch.ts --network mainnet --pool ${OWNER_POOL} --scale 1 --state data/owner-pool-watch-mainnet-state.json --markout data/owner-pool-markout-mainnet.jsonl --bot-sent-log data/owner-pool-bot-mainnet-sent.jsonl --bot-state data/owner-pool-bot-mainnet-state.json $OWNER_POOL_WATCH_FLAGS
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+UMask=0077
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

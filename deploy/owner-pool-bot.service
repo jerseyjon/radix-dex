@@ -1,0 +1,28 @@
+# The OwnerPool market-making bot for the owner's mainnet pool, as a systemd USER service of the
+# account that owns the checkout (like radix-dex-mainnet). NOT INSTALLED. Runbook: docs/MAINNET-POOLS.md.
+# Install as ~/.config/systemd/user/owner-pool-bot.service, adjust WorkingDirectory to the checkout,
+# fill ~/.config/radix-dex/owner-pool.env (from deploy/owner-pool.env.example), then:
+#   systemctl --user daemon-reload && systemctl --user enable --now owner-pool-bot
+#   journalctl --user -u owner-pool-bot -f          # one JSON line per tick
+# DRY RUN unless OWNER_POOL_BOT_FLAGS holds --send (which the bot refuses off Stokenet today).
+# It holds the OPERATOR (hot) key only: data/mainnet-owner-pool-operator.key, mode 600. No owner key.
+# SIGTERM finishes the current tick, saves state and alerts "stopped"; exit 2 means it refused to run
+# (bad venue, --send off Stokenet, second copy): not restarted.
+[Unit]
+Description=OwnerPool market-making bot (mainnet, operator key)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/jon/Radix/dex
+EnvironmentFile=%h/.config/radix-dex/owner-pool.env
+ExecStart=/usr/bin/env npx tsx scripts/owner-pool-bot.ts --network mainnet --pool ${OWNER_POOL} --badge ${OWNER_POOL_OPERATOR_BADGE} --key data/mainnet-owner-pool-operator.key --scale 1 --base-fee 50 --state data/owner-pool-bot-mainnet-state.json --sent-log data/owner-pool-bot-mainnet-sent.jsonl $OWNER_POOL_BOT_FLAGS
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+UMask=0077
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target
