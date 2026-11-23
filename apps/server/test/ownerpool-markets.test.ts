@@ -82,6 +82,6 @@ test('DEX_OWNER_POOLS lists OwnerPools by component address, checked the same wa
   data.loadDivisibilities = async () => {};
   await data.refresh();
   assert.deepEqual(data.pools.map((p) => p.address), [GOOD]);
-  // Nothing is published on mainnet: no OwnerPool can be listed there yet.
-  assert.deepEqual(OWNER_POOL_PACKAGES.mainnet, []);
+  // Exactly the owner's package published 23 Nov 2026 is allow-listed on mainnet.
+  assert.deepEqual(OWNER_POOL_PACKAGES.mainnet, ['package_rdx1p4k62xfkcakva7wmll67zgc8udn6tsujzfs9hqq399hdzujtksdlsv']);
 });
