@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  OWNER_POOL_BOT_DEFAULTS as D, aggregateVenues, feeDecision, referenceVenueProblems, venueFee, venueSetHold,
+  OWNER_POOL_BOT_DEFAULTS as D, aggregateVenues, feeDecision, referenceVenueProblems, venueFee, venueSetHold, venueHoldAlert, AlertLimiter,
   type VenueHoldState, type VenueQuote,
 } from '../src/index.ts';
 
@@ -173,4 +173,36 @@ test('guard: the reference may never contain the operated pool or any OwnerPool 
   assert.match(run([{ name: 'y', address: 'component_rdx1renamed' }])[0]!, /component of OwnerPool package/);
   assert.match(run([{ name: 'z', address: 'component_rdx1unknown' }])[0]!, /no entity details/);
   assert.equal(run([{ name: 'ociswap', address: OCI_ADDR }, { name: 'difd', address: OTHER_OP }]).length, 1);
+});
+
+test('venue-set hold alerts: a drop starts the hold (venue-hold), the venue coming back restarts it and alerts too (venue-hold-restart), not suppressed by the drop alert', () => {
+  const lim = new AlertLimiter(3600_000);
+  const fire = (h: ReturnType<typeof venueSetHold>, at: number) => { const a = venueHoldAlert(h, D.venueHoldSec); return a && lim.allow(a.key, at) ? a : undefined; };
+  const st0 = venueSetHold({}, ['a', 'b'], NOW, HOLD).state;
+  const drop = venueSetHold(st0, ['a'], NOW + 60_000, HOLD);
+  assert.equal(drop.started, true); assert.equal(drop.restarted, false);
+  const a1 = fire(drop, NOW + 60_000);
+  assert.equal(a1?.key, 'venue-hold');
+  assert.match(a1!.text, /dropped b/);
+  // Still holding, nothing changed: no alert.
+  const same = venueSetHold(drop.state, ['a'], NOW + 120_000, HOLD);
+  assert.equal(venueHoldAlert(same, D.venueHoldSec), undefined);
+  // b comes back 2 min later: the hold restarts, and that is alerted under its own key.
+  const back = venueSetHold(same.state, ['a', 'b'], NOW + 180_000, HOLD);
+  assert.equal(back.started, false); assert.equal(back.restarted, true); assert.equal(back.holding, true);
+  const a2 = fire(back, NOW + 180_000);
+  assert.equal(a2?.key, 'venue-hold-restart');
+  assert.match(a2!.text, /AGAIN \(back b\)/);
+  // A second restart inside the alert interval is rate-limited like any other key.
+  const again = venueSetHold(back.state, ['a'], NOW + 240_000, HOLD);
+  assert.equal(again.restarted, true);
+  assert.equal(fire(again, NOW + 240_000), undefined);
+  // The hold ends; the caller clears both keys, so the next hold and its restart alert at once.
+  const end = venueSetHold(again.state, ['a'], NOW + 240_000 + HOLD, HOLD);
+  assert.equal(end.expired, true);
+  lim.clear('venue-hold'); lim.clear('venue-hold-restart');
+  const drop2 = venueSetHold(end.state, [], NOW + 300_000 + HOLD, HOLD);
+  assert.equal(fire(drop2, NOW + 300_000 + HOLD)?.key, 'venue-hold');
+  const back2 = venueSetHold(drop2.state, ['a'], NOW + 360_000 + HOLD, HOLD);
+  assert.equal(fire(back2, NOW + 360_000 + HOLD)?.key, 'venue-hold-restart');
 });

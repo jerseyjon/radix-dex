@@ -296,8 +296,12 @@ rule, or `--exclude-venues`), **the bot holds its position for 15 minutes** (`--
   restart neither skips a running hold nor misses a change made while the bot was down (a venue lost
   during the downtime starts a hold on the first tick). A fresh state file has no previous set: the
   first tick only records it.
-- **Alert** `venue-hold` once when a hold starts (rate-limited like the other keys); a restart of a
-  running hold is not a new start, and the key is cleared when the hold ends, so the next hold alerts.
+- **Alert** `venue-hold` once when a hold starts; a restart of a running hold (another venue drops, or a
+  venue comes back) alerts `venue-hold-restart` (since 23 Nov 2026; before that a venue coming back was
+  never alerted, only the drop). The restart has its own key so the start's alert, sent minutes earlier,
+  cannot suppress it; each key is rate-limited like the other keys (one per `--alert-interval`), and
+  both are cleared when the hold ends, so the next hold and its first restart alert at once. Code:
+  `venueHoldAlert` (pure, tested).
 - Each tick's log line has `venueSet: { live, changed?: {removed, added}, holdUntil?, remainingSec?, reason? }`
   and the decision reads `HOLD: venue-set hold (dropped caviarnine) for N s more: no rebalance`.
 - Pause control is unaffected (a hold is not "unhealthy"). The "behind" counter is not advanced while
@@ -420,6 +424,7 @@ timeout); an alert that could not be delivered is retried on the next occurrence
 | `reference-unhealthy` | the on-ledger reference has been unusable (no live venue, or the venues more than 4% apart) for longer than `--pause-after` |
 | `single-venue` | only one venue is confirmed live: trading cautiously (once per episode; cleared when two or more are confirmed) |
 | `venue-hold` | the set of live venues changed: holding position for `--venue-hold` (which venues dropped / came back) |
+| `venue-hold-restart` | the set changed again during a running hold (a venue dropped or came back): the hold restarts from now |
 | `watch-coingecko-xrd-usd` | CoinGecko is more than `--watch-max-deviation` (15%) from the on-ledger reference. Information only: trading is not affected |
 | `behind` | the bot could not close the gap for `--alert-behind-ticks` ticks in a row |
 | `tick-errors` | `--alert-error-ticks` ticks in a row failed (Gateway down, ...) |

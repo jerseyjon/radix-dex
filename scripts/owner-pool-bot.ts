@@ -58,7 +58,7 @@ import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, write
 import { assertReferenceExcludesOwnerPools, makePriceSources, makeVenues, readSource, readVenueSource, type PriceSource, type VenueSource } from './owner-pool-sources.ts';
 import {
   AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, anchorCheck, buildTransaction,
-  calibrateScale, decideRebalance, feeDecision, venueSetHold, venueConfirm, venueGate, volatilityEligible, singleVenueCaution, type VenueHoldState, type VenueConfirmState, type SingleVenueState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
+  calibrateScale, decideRebalance, feeDecision, venueSetHold, venueHoldAlert, venueConfirm, venueGate, volatilityEligible, singleVenueCaution, type VenueHoldState, type VenueConfirmState, type SingleVenueState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
   ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
   ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, trySubmitAndWait,
   txAllowance, volatilityBps, type Ed25519Key, type VenueReference, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
@@ -381,8 +381,9 @@ async function tick(): Promise<void> {
   state.venueHold = vh.state;
   const holdMsg = vh.holding ? `venue-set hold (${vh.state.holdReason}) for ${Math.round(vh.remainingMs / 1000)} s more` : undefined;
   line.venueSet = { live: vh.state.liveSet, ...(vh.changed ? { changed: { removed: vh.removed, added: vh.added } } : {}), ...(vh.holding ? { holdUntil: new Date(vh.state.holdUntil!).toISOString(), remainingSec: Math.round(vh.remainingMs / 1000), reason: vh.state.holdReason } : {}), ...(vh.expired ? { holdEnded: true } : {}) };
-  if (vh.started) await alert('venue-hold', `VENUE SET CHANGED (${vh.state.holdReason}): holding position (no rebalance) for ${Math.round(cfg.venueHoldSec / 60)} min; the fee may widen, not narrow. Live now: ${vh.state.liveSet!.join(',') || 'none'}.`, line);
-  if (vh.expired) alerts.limiter.clear('venue-hold');
+  const vha = venueHoldAlert(vh, cfg.venueHoldSec);
+  if (vha) await alert(vha.key, vha.text, line);
+  if (vh.expired) { alerts.limiter.clear('venue-hold'); alerts.limiter.clear('venue-hold-restart'); }
   // Single-venue caution: one confirmed venue = trade, but with a wider fee and half the sizes.
   const sv = singleVenueCaution(state.singleVenue ?? {}, vc.confirmed.length, now);
   state.singleVenue = sv.state;

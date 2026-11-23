@@ -269,7 +269,7 @@ export interface VenueHoldState {
  * the caller, so a restart neither skips a hold nor misses a change made while it was down.
  */
 export function venueSetHold(prev: VenueHoldState, live: string[], now: number, holdMs: number): {
-  state: VenueHoldState; changed: boolean; started: boolean; holding: boolean; expired: boolean; added: string[]; removed: string[]; remainingMs: number;
+  state: VenueHoldState; changed: boolean; started: boolean; restarted: boolean; holding: boolean; expired: boolean; added: string[]; removed: string[]; remainingMs: number;
 } {
   const set = [...new Set(live)].sort();
   const before = prev.liveSet;
@@ -287,7 +287,22 @@ export function venueSetHold(prev: VenueHoldState, live: string[], now: number, 
   const holding = st.holdUntil !== undefined && now < st.holdUntil;
   const expired = !holding && st.holdUntil !== undefined;
   if (expired) { st.holdUntil = undefined; st.holdStartedAt = undefined; st.holdReason = undefined; }
-  return { state: st, changed, started, holding, expired, added, removed, remainingMs: holding ? st.holdUntil! - now : 0 };
+  return { state: st, changed, started, restarted: changed && !started, holding, expired, added, removed, remainingMs: holding ? st.holdUntil! - now : 0 };
+}
+
+/**
+ * The alert for a venue-set change, if any (owner's request, 23 Nov 2026: a hold restarted by a venue
+ * coming back must be alerted too, not only the drop that started it). A new hold alerts under
+ * `venue-hold`; a restart of a running hold alerts under its own key `venue-hold-restart`, so the start's
+ * alert (sent moments earlier under `venue-hold`) cannot suppress it. Each key is rate-limited like the
+ * other keys (one alert per key per --alert-interval), and the caller clears BOTH when the hold ends.
+ */
+export function venueHoldAlert(vh: { started: boolean; restarted: boolean; state: VenueHoldState }, holdSec: number): { key: 'venue-hold' | 'venue-hold-restart'; text: string } | undefined {
+  const min = Math.round(holdSec / 60);
+  const live = vh.state.liveSet?.join(',') || 'none';
+  if (vh.started) return { key: 'venue-hold', text: `VENUE SET CHANGED (${vh.state.holdReason}): holding position (no rebalance) for ${min} min; the fee may widen, not narrow. Live now: ${live}.` };
+  if (vh.restarted) return { key: 'venue-hold-restart', text: `VENUE SET CHANGED AGAIN (${vh.state.holdReason}): the running hold restarts, no rebalance for ${min} min from now; the fee may widen, not narrow. Live now: ${live}.` };
+  return undefined;
 }
 
 // ------------------------------------------------------------------ venue confirmation (two ticks)
