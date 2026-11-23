@@ -901,6 +901,100 @@ TEUR per XRD, inventory 1,358.451 XRD / 1.081848 TEUR, **fee 30 bps, owner and o
 operator badge appointed, owner anchor 1250:1, allowance 0.02396 (stored). The bot at its defaults would
 set the fee to 100 (clamped) on its first tick.
 
+## Failure-path tests on the ledger (Stokenet, 23 Nov 2026, 10:23-11:25 UTC)
+
+Real bot and watcher, real transactions on Stokenet; mainnet only read (venue quotes by preview). Bot
+and watcher ran through `scripts/gateway-fault-proxy.ts` (127.0.0.1:18081 Stokenet, :18082 mainnet;
+mode file switched mid-run), alerts to a local listener on 127.0.0.1:18931 (`/bot`, `/watch`). Drivers
+`data/soak/run7-1.sh` ... `run7-5.sh`, logs `data/soak/run7-*.log`, phase times `data/soak/phases7.txt`,
+balances `data/soak/balances7.txt`, alerts `data/soak/alerts7.jsonl` (cases 1-2) and `alerts8.jsonl`
+(cases 3-5), watcher `data/soak/watch7.log` / `watch8.log`. TEST flags shorten intervals (`--interval`
+20-30 s, `--anchor-recheck 60`, `--narrow-interval 60`, `--venue-hold 120`). All five pass; three
+defects were found on ledger and fixed (fb747a5, cbbf2b9, 137bb51) and one more by reading the code
+(b370d44).
+
+**1. Halt after 3 failed sends (code fb747a5 + cbbf2b9; logs run7-1pre, run7-1, run7-1b). PASS.**
+- First try, before fb747a5 (`run7-1pre`): proxy `submit-503` (submission refused, nothing reaches the
+  network). Each failed submit was a THROWN tick error: alert `tick-errors` "3 in a row (backing off
+  240 s)", never a halt. Fixed: a refused submission or failing status poll is a failed send
+  (`trySubmitAndWait`).
+- `run7-1` (10:27-10:34): `submit-503` -> SubmitFailed x3 -> alert `halt` "HALTED: 3 failed sends in a
+  row" (10:28:10); halted ticks log `rebalance: halted after 3 failed transactions until ...`. Proxy
+  `submit-reject` while halted: the first send after the halt ended was Rejected (10:30:45) and halted
+  again at once, but its alert was SUPPRESSED by the rate limit. Proxy `pass`: the next send
+  CommittedSuccess (10:33:21).
+- Fixed in cbbf2b9 (the success that ends a halt clears the `halt` key; a failed or skipped rebalance
+  counts as behind). `run7-1b` (10:35-10:41): halt (10:36:08, alerted) -> pass -> `halt-recovered`
+  txid_tdx_2_157pxf6x... CommittedSuccess (10:37:54) -> `submit-503` again -> second halt ALERTED
+  (10:39:20) -> pass -> recovered with txid_tdx_2_1f8e2zm7... (10:41:05).
+
+**2. Gateway outage, full and partial (logs run7-2). PASS.**
+- Stokenet Gateway `down-503`, `down-reset`, `down-hang` for one tick each (10:42-10:45): tick `error`
+  events with back-off 40 -> 80 -> 160 s ("HTTP 503", "fetch failed", "aborted due to timeout"), no
+  send, alert `tick-errors` after 3. Proxy `pass`: normal ticks resume (10:48:36), no send needed.
+- MAINNET Gateway `down-503` (venue quotes fail; 10:49:19): first tick `gate none` (the confirmed venue
+  failed once, not dropped), second tick the venue is dropped: `no reference (only 0 live venue(s))`,
+  no rebalance, no fee change, alert `venue-hold` (10:50:01). Mainnet back: two good ticks, then
+  `HOLD: venue-set hold (back ociswap-precision)` for the (TEST) 120 s, trading resumes 10:53:12. The
+  restart of the hold by the venue coming back was NOT alerted: fixed in aa1d0da (see case 6).
+
+**3. Owner restates the anchor mid-run (logs run7-3a.log, run7-3.log = re-run). PASS after a fix.**
+Real venues, `--scale auto`, `--no-fee`, TEST `--anchor-recheck 60`, `--interval 30`.
+- Owner `set_anchor 1250:1.03` (previewed, then sent: txid_tdx_2_1l2wkx95... at 10:58:03): the drill
+  reads `operator_status` after it: **allowance 0** on ledger (was 0.00596 at the bot's last tick).
+- The bot's 10:58:30 tick still had the old anchor (target 0.000800; recheck not due): **no rebalance**
+  (ledger allowance 0.00042 = one epoch's refill, inside the 0.1 x budget reserve, spendable 0). At
+  10:59:01 (the next recheck, 58 s after commit) `ownerAnchorChanged {from 1250:1, to 1250:1.03}`,
+  alert `anchor-restated`; `--scale auto` re-calibrates to the new anchor, target 0.000824, gap 262 bps,
+  nothing spendable: behind, alert `behind` after 10 ticks (11:01:40).
+- Back to 1250:1 (txid_tdx_2_1fwr99z3... 11:01:12): allowance 0 again, picked up at 11:02:11, but the
+  bot's `anchor-restated` alert was **suppressed** (same key within the hour). Fixed in 137bb51: every
+  restatement alerts (forced). Re-run (11:04-11:10): 1250:1.03 txid_tdx_2_1uulhu4s... (allowance 0 after
+  it), picked up 11:06:09; 1250:1 txid_tdx_2_1047400r... (allowance 0.000417 after it: an epoch's
+  refill had already landed), picked up 11:09:16; **both alerted** (11:06:09, 11:09:16).
+- Watcher: `anchor-restated` finding (severity info: logged, not alerted, as designed) for all four
+  restatements, 20-30 s after each commit.
+
+**4. "Behind" alert (log run7-4). PASS.** Reference `fixed:0.000805` x2, `--scale 1`, TEST `--base-fee
+30`, default `--alert-behind-ticks 10`. The allowance was already spent (zeroed by the case 3
+restatements: 0.00042 on ledger), so the bot was behind from tick 1 (gap 25.6 bps) and widened the fee
+**30 -> 40** at once (`operator_set_fee(40)` txid_tdx_2_1gmz6pc34..., 11:11:14; watcher `fee-change` warn
+alerted). Alice then sold 300 XRD (txid_tdx_2_17uff8r9v..., 11:11:49): pool 0.0007787, **gap 337.8 bps**,
+spendable 0 (allowance 0.00083 < the 0.003 reserve). Tick 10 (11:15:53): alert `behind` "Bot BEHIND for
+10 ticks: pool 0.000778698 vs target 0.000805 (gap 337.8 bps; allowance spent (or inside the reserve):
+waiting for refill)"; later ticks suppressed by the rate limit (logged). Caveat: the behind count began
+before the trade, because the allowance was empty; the trade only widened the gap.
+
+**5. Operator limits changed by the owner and back (log run7-5). PASS.** Reference `fixed:0.000805` x2,
+default base fee 100, TEST `--narrow-interval 60`. Tick 1: fee 40 -> **100** (the range's max).
+Owner `set_operator_limits` moveBudgetBps 300 -> 150, maxFeeBps 100 -> 60 (txid_tdx_2_1jw8uf9lr...,
+11:18:17; allowance 0.00083 -> 0.00125, NOT zeroed by a limits change). Next tick (11:18:51): log
+`budget 0.015` (was 0.03), fee target clamped **100 -> 60** and sent (`operator_set_fee(60)`). Watcher
+**`limits-change` alerted** 11:19:27 "move_budget_bps 300 -> 150, max_fee_bps 100 -> 60". Back to
+300 / 100 (txid_tdx_2_1m8uew5n..., 11:21:56): next tick `budget 0.03`, fee 60 -> 100; watcher
+`limits-change` **alerted again** (11:22:30) because of b370d44 (before it, the reversal would have
+been suppressed by the per-rule limit; found by reading the code before this case ran, so the
+unfixed behaviour was not seen on ledger). Notes: the contract does NOT clamp the current fee when
+the owner lowers maxFeeBps: the pool charged 100 bps, above the new max of 60, until the bot's next tick (about half a minute later)
+moved it. A smaller budget could not visibly shrink a move here: the allowance was inside the reserve
+under both budgets, so no rebalance was possible either way; the budget change is seen in the log and
+in the reserve (0.1 x budget) only.
+
+**6. Venue-set hold restart alert (aa1d0da).** A hold restarted by another change (a venue dropped or
+came back during a running hold) now alerts `venue-hold-restart`, its own key so the start's
+`venue-hold` alert minutes earlier cannot suppress it; rate-limited like other keys, both keys cleared
+when the hold ends. Unit-tested (`venueHoldAlert`); not re-run on ledger.
+
+**Cost** (cases 3-5, 10:56-11:25): operator 178.6949 -> 176.1580 XRD (2 rebalances, 4 fee changes),
+owner 8694.6303 -> 8691.6685 (4 anchor statements, 2 limits changes, 1 fee restore), alice
+7201.0765 -> 7197.6096 (300 XRD sold and 0.236 TEUR sold back: 2.41 XRD lost to the curve and fees,
+~1.06 XRD network fees). About 6.5 XRD of network fees in all.
+
+**Pool left at** (state version 35079507): reserves 19,378.479 XRD / 15.557712 TEUR, price 0.00080284,
+inventory 1,672.003 XRD / 1.238127 TEUR, **fee 30 bps, both pauses off**, operator badge 2 appointed,
+anchor 1250:1, limits 300 bps / 72 epochs, caps 22000 / 17.6, floors 10000 / 8, fee range 10-100,
+allowance 0.00167 (refilling).
+
 ## Not done, not tested, open
 
 - **The on-ledger venues barely move, so the reference barely moves.** Between trades a pool's
@@ -938,14 +1032,13 @@ set the fee to 100 (clamped) on its first tick.
   where the watcher can read that file; run elsewhere, it needs the log shipped to it (not done). It
   classifies callers from the root manifest (methods called on the pool, badges named): a call made
   through another component, or from a subintent, is seen by its events (rebalance, config) but not
-  attributed. Drift checks need the venues to agree. `limits-change` is unit-tested and checked against
-  the real event format, but no limits change happened on ledger during the run.
+  attributed. Drift checks need the venues to agree. `limits-change` was seen on ledger on 23 Nov (case 5 of
+  the failure-path tests).
 - The bot's own sends are recorded before submission; a send whose submission then fails leaves a
   txid in the log that never reaches the ledger (harmless).
-- Not tested on ledger: a Gateway outage, the 3-failure halt, an owner anchor restatement while the bot
-  runs, the `behind` alert, a swap racing a rebalance. The first four are unit-tested as the pure
-  pieces the bot script uses (`tickOutcome`, `recordSendOutcome`/`sendHalted`, `resolveOwnerAnchor` +
-  allowance zero, `behindUpdate`), not as a full tick with a fake Gateway.
+- Not tested on ledger: a swap racing a rebalance; the `venue-hold-restart` alert (unit-tested only).
+  A Gateway outage, the 3-failure halt, an anchor restatement, the `behind` alert and a limits change
+  were run on ledger on 23 Nov (see "Failure-path tests on the ledger").
 - Only a price from the full confirmed set enters the volatility history: `trade` ticks and `hold`
   ticks (in a hold the confirmed set is the new, stable one), never `uncertain`, `disagree` or `none`
   ticks, nor a hold tick on which another confirmed venue failed. (In Soak 6, before this rule, a
