@@ -92,7 +92,7 @@ export function PairPicker({ markets, market, onSelect, showAll, onShowAll }: {
   // Anchor under the button (the phone sheet is placed by CSS instead).
   const place = useCallback(() => {
     const r = btn.current?.getBoundingClientRect();
-    if (r) setPos({ top: Math.round(r.bottom + 8), left: Math.round(Math.max(8, Math.min(r.left, window.innerWidth - 8 - 420))) });
+    if (r) setPos({ top: Math.round(r.bottom + 8), left: Math.round(Math.max(8, Math.min(r.left + 12, window.innerWidth - 8 - 420))) });
   }, []);
   useLayoutEffect(() => { if (open) place(); }, [open, place]);
   useEffect(() => {
