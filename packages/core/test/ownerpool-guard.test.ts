@@ -260,12 +260,58 @@ test('CoinGecko brake: warm-up uses the 15% alarm; then 2% from the 24 h median 
   assert.deepEqual([n.mode, n.braking, n.state.ratios.length], ['no-reference', false, 12]);
 });
 
+test('CoinGecko brake: only a move AWAY from parity brakes (owner, 23 Nov 2026); toward parity never does', async () => {
+  const { coingeckoBrake } = await import('../src/index.ts');
+  const M = 60_000;
+  // A warm state whose normal (median of 12) is `n`, then one tick at ratio `r` (CoinGecko 1, reference r).
+  const at = (n: number, r: number, c: any = {}) => {
+    let st: any = { ratios: [] };
+    for (let i = 0; i < 12; i++) st = coingeckoBrake(st, { reference: n, coingecko: { price: 1, at: i * 5 * M }, now: i * 5 * M }, c).state;
+    const t = 60 * M;
+    return coingeckoBrake(st, { reference: r, coingecko: { price: 1, at: t }, now: t }, c);
+  };
+  const f = (x: { braking: boolean; normal?: number; excess?: number; deviation?: number }) => [x.braking, Number(x.normal!.toFixed(6))];
+  // The live numbers of 23 Nov: 2.15% from the normal 0.956296, but toward parity: no brake (the old rule braked).
+  const live = at(0.956296, 0.976877);
+  assert.deepEqual(f(live), [false, 0.956296]);
+  assert.ok(live.deviation! > 0.02 && live.excess! < 0, `deviation ${live.deviation} excess ${live.excess}`);
+  // Toward parity, from either side, however far: no brake.
+  for (const [n, r] of [[0.9, 0.99], [0.9, 1], [1.1, 1.01], [1.1, 1.0], [1.04, 1.0001]] as [number, number][]) assert.equal(at(n, r).braking, false, `${n} -> ${r}`);
+  // Away from parity beyond the limit: brake (below and above parity).
+  for (const [n, r] of [[0.96, 0.93], [1.04, 1.07], [1, 0.97], [1, 1.03]] as [number, number][]) {
+    const x = at(n, r);
+    assert.deepEqual([x.braking, x.started], [true, true], `${n} -> ${r}`);
+    assert.ok(x.deviation! > 0.02, 'a brake implies the old condition too');
+  }
+  // Away within the limit: no brake (F(0.94)/F(0.96) = 1.0213 > 1.02 brakes; F(0.945)/F(0.96) = 1.0159 does not).
+  assert.equal(at(0.96, 0.945).braking, false);
+  assert.equal(at(1.04, 1.055).braking, false);
+  assert.equal(at(0.96, 0.94).braking, true);
+  // Crossing parity: brakes only if it ends further from parity, on the other side, than the normal by > the limit.
+  // Below -> above: normal 0.956 (F 1.046); 1.05 is 0.4% further: no brake; 1.075 is 2.8% further: brake.
+  assert.equal(at(0.956, 1.05).braking, false);
+  assert.ok(at(0.956, 1.05).deviation! > 0.09, 'far from the normal, yet not braked');
+  assert.equal(at(0.956, 1.075).braking, true);
+  // Above -> below: normal 1.04; 0.95 (F 1.0526) is 1.2% further: no brake; 0.92 (F 1.087) is 4.5% further: brake.
+  assert.equal(at(1.04, 0.95).braking, false);
+  assert.equal(at(1.04, 0.92).braking, true);
+  // An episode that turns toward parity ends (and one alert per episode still holds).
+  const b1 = at(0.96, 0.93);
+  const b2 = coingeckoBrake(b1.state, { reference: 0.925, coingecko: { price: 1, at: 61 * M }, now: 61 * M });
+  assert.deepEqual([b2.braking, b2.started], [true, false]);
+  const b3 = coingeckoBrake(b2.state, { reference: 0.95, coingecko: { price: 1, at: 62 * M }, now: 62 * M });
+  assert.deepEqual([b3.braking, b3.ended], [false, true]);
+  // Warm-up: the normal is parity, so the rule is the old 15% alarm, both sides.
+  assert.equal(coingeckoBrake(undefined, { reference: 0.86, coingecko: { price: 1, at: 0 }, now: 0 }).braking, true);
+  assert.equal(coingeckoBrake(undefined, { reference: 0.88, coingecko: { price: 1, at: 0 }, now: 0 }).braking, false);
+});
+
 test('CoinGecko is never a price: the brake returns no price, and the bot builds its target and history only from the venues', async () => {
   const { coingeckoBrake } = await import('../src/index.ts');
   const a = coingeckoBrake(undefined, { reference: 1, coingecko: { price: 1.01, at: 0 }, now: 0 });
   const b = coingeckoBrake(undefined, { reference: 1, coingecko: { price: 0.995, at: 0 }, now: 0 });
   // Whatever CoinGecko says, the only outputs that reach a decision are booleans.
-  for (const x of [a, b]) assert.deepEqual(Object.keys(x).sort(), ['braking', 'deviation', 'ended', 'mode', 'normal', 'ratio', 'readings', 'started', 'state', 'threshold', 'unavailableLong']);
+  for (const x of [a, b]) assert.deepEqual(Object.keys(x).sort(), ['braking', 'deviation', 'ended', 'excess', 'mode', 'normal', 'ratio', 'readings', 'started', 'state', 'threshold', 'unavailableLong']);
   // The bot's source: the target, the history and the rebalance never take a watch (CoinGecko) value.
   const src = readFileSync(new URL('../../../scripts/owner-pool-bot.ts', import.meta.url), 'utf8');
   const lines = (re: RegExp) => src.split('\n').filter((l) => re.test(l));

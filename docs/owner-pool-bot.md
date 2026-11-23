@@ -132,11 +132,31 @@ The owner's decision (23 Nov 2026): CoinGecko becomes a BRAKE, never a price sou
   On 23 Nov the ratio was about 0.972 (CoinGecko 2.8% above the one live venue): a steady premium like
   that is learned, not braked. Every healthy ratio enters the normal, braking or not, so a lasting real
   divergence is learned after about 12 h; a manipulation would have to be held that long.
-- **When it brakes.** The current ratio is more than `--brake-max-deviation` (2%) from the normal. Until
-  the normal has `--brake-min-readings` (12, one hour at the default sampling) the normal is 1 (parity)
-  and only the 15% alarm threshold (`--brake-warmup-deviation`) brakes.
+- **When it brakes: only AWAY from parity (the owner's decision, 23 Nov 2026, second change).** With
+  F(x) = max(x, 1/x), the distance of a ratio from parity (1) as a factor:
+
+      brake  iff  F(ratio) > F(normal) x (1 + limit)          limit = --brake-max-deviation (2%)
+
+  That is, the on-ledger reference has moved further from CoinGecko than usual, by more than the limit.
+  - A move TOWARD CoinGecko (F shrinking) never brakes, however large: that is the on-ledger price
+    catching up with the outside market, exactly when the bot should re-centre. The first rule (more
+    than 2% from the normal, either way) blocked this on mainnet: the ratio rose 0.956296 -> 0.976877
+    (2.15% from the normal, toward parity), the brake held, and the pool sat about 3.6% off market at
+    the maximum fee. Under this rule that tick does not brake (excess -2.1%).
+  - Crossing parity: the ratio brakes only if it ends further from parity, on the other side, than the
+    normal is, by more than the limit. Normal 0.956 (F 1.046): 1.05 does not brake (0.4% further), 1.075
+    does (2.8% further). Normal 1.04: 0.95 does not (1.2%), 0.92 does (4.5%).
+  - Within the limit away from parity: no brake (normal 0.96: 0.945 no, 0.94 yes).
+  - Since F(ratio) <= F(normal) x F(ratio / normal), every brake is also more than the limit from the
+    normal: the new rule only ever brakes LESS than the first one.
+  - Logged as `excess` = F(ratio) / F(normal) - 1 (negative: closer to parity than the normal) next to
+    `deviation` (the plain distance from the normal), e.g. `BRAKE: CoinGecko brake: ratio 0.93 is 3.23%
+    further from parity than its normal 0.96 (3.23% apart; limit 2.0%, away from parity only)`.
+  Until the normal has `--brake-min-readings` (12, one hour at the default sampling) the normal is 1
+  (parity), so the rule reduces to the old one: only a ratio beyond the 15% alarm threshold
+  (`--brake-warmup-deviation`), either side, brakes.
 - **What it does.** No rebalance on that tick; the fee step runs with narrowing blocked (it may widen),
-  as in a hold. Logged on every tick (`brake: {braking, mode, ratio, normal, deviation, threshold}`,
+  as in a hold. Logged on every tick (`brake: {braking, mode, ratio, normal, deviation, excess, threshold}`,
   decision `BRAKE: ...`); alerted once per episode (`coingecko-brake`), the key cleared when the ratio is
   back inside.
 - **It never pauses the pool.** A brake that lasts (10 minutes, an hour) only keeps blocking rebalances;
@@ -1267,7 +1287,7 @@ rebalances), alice 7107.773 -> 7029.923 (100 sold, about 22.7 bought back, fees)
   quotes drifted continuously. An executable quote is a real price, but on this pair it is often a price
   nobody is trading at: the bot will follow the pools, not the wider market. In the first soak CoinGecko
   moved 0.000786 -> 0.000810 while the pools stood still. Since 23 Nov the CoinGecko brake stops
-  rebalancing when the reference moves more than 2% against CoinGecko relative to their usual ratio, but
+  rebalancing when the reference moves more than 2% further from CoinGecko than their usual ratio, but
   nothing makes a frozen venue follow the market: a venue that stands still while CoinGecko moves 2%
   brakes the bot (no rebalance) rather than steering it.
 - **Thin venues come and go.** CaviarNine held under 1 hUSDC on its bid side all evening and from 21:09

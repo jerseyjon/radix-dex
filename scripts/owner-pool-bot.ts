@@ -578,6 +578,8 @@ async function tick(): Promise<void> {
   if (sv.ended) alerts.limiter.clear('single-venue');
   const ref = vref.status === 'ok' ? { ok: true as const, price: vref.price } : { ok: false as const, reason: vref.reason };
   const r6 = (x: number | undefined) => (x === undefined ? null : Number(x.toPrecision(6)));
+  const brakeWhy = (b: { ratio?: number; normal?: number; deviation?: number; excess?: number; threshold: number }) =>
+    `ratio ${r6(b.ratio)} is ${((b.excess ?? 0) * 100).toFixed(2)}% further from parity than its normal ${r6(b.normal)} (${((b.deviation ?? 0) * 100).toFixed(2)}% apart; limit ${(b.threshold * 100).toFixed(1)}%, away from parity only)`;
   line.reference = {
     status: vref.status, price: vref.price ?? null, disagreement: vref.disagreement === undefined ? null : round(vref.disagreement, 5), live: vref.live, reason: vref.reason,
     venues: vref.venues.map((v) => ({ venue: v.venue, used: v.used, mid: r6(v.mid), fee: r6(v.fee), roundTrip: r6(v.roundTrip), impact: r6(v.impact), depth: r6(v.depth), weight: r6(v.weight), ...(v.dropped ? { dropped: v.dropped } : {}) })),
@@ -595,15 +597,16 @@ async function tick(): Promise<void> {
     else if ('alarm' in w && w.deviation !== null) alerts.limiter.clear(`watch-${w.source}`);
   }
   // The CoinGecko BRAKE (owner, 23 Nov 2026): CoinGecko is never a price. Only the ratio reference / CoinGecko
-  // is tracked; a ratio more than --brake-max-deviation from its 24 h median blocks rebalancing this tick.
+  // is tracked; a ratio that moved AWAY from parity by more than --brake-max-deviation beyond its 24 h median
+  // blocks rebalancing this tick (a move toward CoinGecko never brakes).
   const cgRead = watch.find((w) => w.source.startsWith('coingecko'));
   const brake = coingeckoBrake(state.brake, {
     reference: ref.ok && watchComparable && !vc.uncertain ? ref.price : undefined,
     coingecko: cgRead ? { price: cgRead.price, at: cgRead.at, error: cgRead.error } : undefined, now,
   }, { maxDeviation: cfg.brakeMaxDeviation, warmupDeviation: cfg.brakeWarmupDeviation, minReadings: cfg.brakeMinReadings, sampleMs: cfg.brakeSampleSec * 1000 });
   state.brake = brake.state;
-  line.brake = { braking: brake.braking, mode: brake.mode, readings: brake.readings, threshold: brake.threshold, ratio: r6(brake.ratio), normal: r6(brake.normal), deviation: brake.deviation === undefined ? null : round(brake.deviation, 5), ...(brake.state.since ? { since: new Date(brake.state.since).toISOString() } : {}), ...(brake.state.unavailableSince ? { coingeckoUnavailableSince: new Date(brake.state.unavailableSince).toISOString() } : {}) };
-  if (brake.started) await alert('coingecko-brake', `BRAKE: reference/CoinGecko ratio ${r6(brake.ratio)} is ${((brake.deviation ?? 0) * 100).toFixed(2)}% from its normal ${r6(brake.normal)} (limit ${(brake.threshold * 100).toFixed(1)}%${brake.mode === 'warmup' ? ', warm-up' : ''}): no rebalance until it is back inside. The pool is NOT paused by this.`, line);
+  line.brake = { braking: brake.braking, mode: brake.mode, readings: brake.readings, threshold: brake.threshold, ratio: r6(brake.ratio), normal: r6(brake.normal), deviation: brake.deviation === undefined ? null : round(brake.deviation, 5), excess: brake.excess === undefined ? null : round(brake.excess, 5), ...(brake.state.since ? { since: new Date(brake.state.since).toISOString() } : {}), ...(brake.state.unavailableSince ? { coingeckoUnavailableSince: new Date(brake.state.unavailableSince).toISOString() } : {}) };
+  if (brake.started) await alert('coingecko-brake', `BRAKE: reference/CoinGecko ${brakeWhy(brake)}${brake.mode === 'warmup' ? ' (warm-up)' : ''}: no rebalance until it is back inside. The pool is NOT paused by this.`, line);
   if (brake.ended) { alerts.limiter.clear('coingecko-brake'); line.brakeEnded = true; }
   if (brake.unavailableLong) await alert('coingecko-unavailable', `CoinGecko unavailable or stale since ${new Date(brake.state.unavailableSince!).toISOString()}: the brake has no signal; trading continues on the on-ledger median and two-tick protections.`, line);
   else if (brake.mode !== 'unavailable') alerts.limiter.clear('coingecko-unavailable');
@@ -741,7 +744,7 @@ async function tick(): Promise<void> {
   // The CoinGecko brake: it may only stop rebalancing (the fee may widen, not narrow, as in a hold). It never
   // pauses the pool: a lasting brake only blocks rebalances (the pause rules are the reference's and the anchor's).
   if (brake.braking) {
-    const why = `CoinGecko brake: ratio ${r6(brake.ratio)} is ${((brake.deviation ?? 0) * 100).toFixed(2)}% from its normal ${r6(brake.normal)} (limit ${(brake.threshold * 100).toFixed(1)}%)`;
+    const why = `CoinGecko brake: ${brakeWhy(brake)}`;
     const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, undefined, actions, line, why, caution) : undefined;
     line.decision = `BRAKE: ${why}: no rebalance${fr ? `; ${fr}` : ''}`;
     return void log(line);

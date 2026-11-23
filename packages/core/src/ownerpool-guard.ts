@@ -435,9 +435,18 @@ export const COINGECKO_BRAKE_DEFAULTS = {
 
 /**
  * The CoinGecko BRAKE. CoinGecko is never a price: only the ratio reference / CoinGecko is tracked, and
- * when the current ratio is more than `maxDeviation` from its rolling normal (the median over the last
- * 24 h; `warmupDeviation` from the latest ratio until `minReadings` exist... see below) the bot does not
- * rebalance on that tick. It never pauses the pool by itself and never changes a price or an amount.
+ * when the current ratio has moved AWAY FROM PARITY (1) by more than `maxDeviation` beyond its rolling
+ * normal (the median over the last 24 h; parity, with `warmupDeviation`, until `minReadings` exist... see
+ * below) the bot does not rebalance on that tick. It never pauses the pool by itself and never changes a
+ * price or an amount.
+ * - The rule (owner, 23 Nov 2026), with F(x) = max(x, 1/x) the multiplicative distance of x from parity:
+ *     brake  iff  F(ratio) > F(normal) x (1 + threshold)
+ *   i.e. the on-ledger reference is further from CoinGecko than usual, by more than the limit. A move
+ *   TOWARD CoinGecko (F shrinking) never brakes, however large, since that is the on-ledger price catching
+ *   up. A ratio that crosses parity brakes only if it ends further from parity, on the other side, than
+ *   the normal is by more than the limit. Because F(ratio) <= F(normal) x F(ratio / normal), a brake also
+ *   implies `deviation` (the distance from the normal) > threshold: the old rule's condition still holds.
+ *   `excess` = F(ratio) / F(normal) - 1 (negative: closer to parity than the normal).
  * - Warm-up (fewer than `minReadings` ratios): the normal is 1 (reference and CoinGecko both quote USD per
  *   XRD), and only a deviation beyond `warmupDeviation` brakes.
  * - Every healthy reading enters the normal, braking or not (a lasting real divergence is learned after
@@ -447,7 +456,7 @@ export const COINGECKO_BRAKE_DEFAULTS = {
  * `reference` undefined (unhealthy, or not comparable): nothing is recorded, no brake.
  */
 export function coingeckoBrake(prev: BrakeState | undefined, o: { reference?: number; coingecko?: { price: number; at: number; error?: string }; now: number }, c: Partial<typeof COINGECKO_BRAKE_DEFAULTS> = {}): {
-  state: BrakeState; braking: boolean; mode: 'warmup' | 'normal' | 'unavailable' | 'no-reference'; ratio?: number; normal?: number; deviation?: number; threshold: number;
+  state: BrakeState; braking: boolean; mode: 'warmup' | 'normal' | 'unavailable' | 'no-reference'; ratio?: number; normal?: number; deviation?: number; excess?: number; threshold: number;
   started: boolean; ended: boolean; unavailableLong: boolean; readings: number;
 } {
   const k = { ...COINGECKO_BRAKE_DEFAULTS, ...c };
@@ -469,7 +478,9 @@ export function coingeckoBrake(prev: BrakeState | undefined, o: { reference?: nu
   const deviation = priceDistance(ratio, normal);
   const last = st.ratios[st.ratios.length - 1];
   if (!last || o.now - last.at >= k.sampleMs) st.ratios.push({ at: o.now, r: ratio });
-  const braking = deviation > threshold;
+  // Away from parity only: F(ratio) > F(normal) x (1 + threshold), F(x) = max(x, 1/x) = 1 + priceDistance(x, 1).
+  const excess = (1 + priceDistance(ratio, 1)) / (1 + priceDistance(normal, 1)) - 1;
+  const braking = excess > threshold;
   if (braking) st.since ??= o.now; else st.since = undefined;
-  return { state: st, braking, mode: warm ? 'normal' : 'warmup', ratio, normal, deviation, threshold, started: braking && !wasBraking, ended: !braking && wasBraking, unavailableLong: false, readings: st.ratios.length };
+  return { state: st, braking, mode: warm ? 'normal' : 'warmup', ratio, normal, deviation, excess, threshold, started: braking && !wasBraking, ended: !braking && wasBraking, unavailableLong: false, readings: st.ratios.length };
 }
