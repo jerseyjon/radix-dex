@@ -5,13 +5,14 @@
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  Decimal, OWNER_POOL_BOT_DEFAULTS as BD, OWNER_POOL_PACKAGES, aggregateVenues, ownerPoolAllowanceNow, ownerPoolStepMismatches, readOwnerPoolTransactions,
+  Decimal, OWNER_POOL_BOT_DEFAULTS as BD, OWNER_POOL_PACKAGES, aggregateVenues, ownerPoolAllowanceNow, ownerPoolStepMismatches, poolTokenProblems, readOwnerPoolTransactions,
   readOwnerPools, readRecentOwnerPoolTransactions, type Gateway, type OwnerPoolState, type VenueReference,
 } from '@radix-dex/core';
 import { VENUE_NAMES, hasReferenceVenues, makeVenues, readVenueSource, type VenueSource } from '@radix-dex/core/sources';
 import type { Config } from './config.ts';
 import { HttpError } from './http.ts';
 import { TtlCache, type MarketData } from './marketdata.ts';
+import { NewPoolError, createdPool, newPoolPackage, planNewPool, probeMid, type NewPoolToken } from './newpool.ts';
 import {
   NO_FEES, OwnerActionError, addFees, botRules, botView, cleanWant, ownerAnchorView, venueViews, curvePrice, describePoolTx, gapBps, heartbeatView, isOwnerAction, markoutView, planOwnerAction, previewView,
   type BotView, type FeeTotals, type PoolActivity, type ProcessHealth, type VenueView,
@@ -54,9 +55,12 @@ export class PoolsService {
     this.config = o.config; this.gateway = o.gateway; this.read = o.readGateway; this.data = o.data;
   }
 
-  /** The OwnerPools listed here, by component address: DEX_OWNER_POOLS and those the market list holds (markets file). */
+  /**
+   * The OwnerPools listed here, by component address: DEX_OWNER_POOLS, those the market list holds
+   * (markets file), and those discovery found owned by a configured owner badge.
+   */
   addresses(): string[] {
-    return [...new Set([...this.config.ownerPools, ...this.data.pools.filter((p) => p.venue === 'ownerpool').map((p) => p.address)])];
+    return this.data.ownerPoolAddresses(this.data.pools.filter((p) => p.venue === 'ownerpool').map((p) => p.address));
   }
 
   private listed(component: string): string {
@@ -99,18 +103,21 @@ export class PoolsService {
     return e.value;
   }
 
+  /** The bot's reference venues for XRD/hUSDC on mainnet, aggregated with its rules. */
+  private async venueReference(): Promise<MarketRef> {
+    this.venues ??= makeVenues(VENUE_NAMES, this.gateway, { sizeXrd: BD.quoteSizeXrd, smallFraction: BD.smallQuoteFraction });
+    const quotes = await Promise.all(this.venues.map(readVenueSource));
+    const ref: VenueReference = aggregateVenues(quotes, Date.now(), {
+      minVenues: BD.minVenues, maxAgeMs: BD.maxSourceAgeSec * 1000, maxDisagreement: BD.maxDisagreement, maxRoundTrip: BD.maxRoundTrip, minImpactBps: BD.minImpactBps, maxVenueFee: BD.maxVenueFee,
+    });
+    const venues = venueViews(ref.venues);
+    const used = venues.filter((v) => v.used).map((v) => v.venue).join(', ');
+    if (ref.price === undefined) return { price: NaN, source: 'on-ledger venues, the bot\'s rules', status: 'none', reason: ref.reason, at: Date.now(), venues };
+    return { price: ref.price, source: `on-ledger venues, the bot's rules: ${used}`, status: ref.status === 'ok' ? 'ok' : 'disagree', reason: ref.reason, at: Date.now(), venues };
+  }
+
   private async readReference(state: OwnerPoolState): Promise<MarketRef | undefined> {
-    if (hasReferenceVenues(this.config.network.name, state.resourceA, state.resourceB)) {
-      this.venues ??= makeVenues(VENUE_NAMES, this.gateway, { sizeXrd: BD.quoteSizeXrd, smallFraction: BD.smallQuoteFraction });
-      const quotes = await Promise.all(this.venues.map(readVenueSource));
-      const ref: VenueReference = aggregateVenues(quotes, Date.now(), {
-        minVenues: BD.minVenues, maxAgeMs: BD.maxSourceAgeSec * 1000, maxDisagreement: BD.maxDisagreement, maxRoundTrip: BD.maxRoundTrip, minImpactBps: BD.minImpactBps, maxVenueFee: BD.maxVenueFee,
-      });
-      const venues = venueViews(ref.venues);
-      const used = venues.filter((v) => v.used).map((v) => v.venue).join(', ');
-      if (ref.price === undefined) return { price: NaN, source: 'on-ledger venues, the bot\'s rules', status: 'none', reason: ref.reason, at: Date.now(), venues };
-      return { price: ref.price, source: `on-ledger venues, the bot's rules: ${used}`, status: ref.status === 'ok' ? 'ok' : 'disagree', reason: ref.reason, at: Date.now(), venues };
-    }
+    if (hasReferenceVenues(this.config.network.name, state.resourceA, state.resourceB)) return this.venueReference();
     const bot = this.files(state.address).bot;
     if (bot?.reference && Date.now() - bot.reference.at < 600_000) {
       return { price: bot.reference.price, source: 'the bot\'s last reference (its state file)', status: 'bot', reason: `read ${Math.round((Date.now() - bot.reference.at) / 1000)} s ago`, at: bot.reference.at, venues: [] };
@@ -324,5 +331,172 @@ export class PoolsService {
     if (st.status !== 'CommittedSuccess') return { status: st.status, error: st.error ?? null, mismatches: null };
     const state = await this.state(component, true);
     return { status: st.status, error: null, mismatches: ownerPoolStepMismatches(state, cleanWant(body.want)) };
+  }
+
+  // ---------------------------------------------------------------- a new pool
+
+  private botPairs(): string[] { return this.config.network.name === 'mainnet' ? ['XRD/hUSDC'] : []; }
+
+  /** The first configured owner badge (`DEX_POOL_OWNER_BADGES`) that `account` holds now, read on the ledger. */
+  private async heldOwnerBadge(account: string, fresh: boolean): Promise<string | undefined> {
+    for (const badge of this.config.poolOwnerBadges) {
+      const read = () => this.read.fungibleBalance(account, badge).then((b) => new Decimal(b).gte(1));
+      if (fresh ? await read() : await this.ownerCache.get(`new|${badge}|${account}`, read)) return badge;
+    }
+    return undefined;
+  }
+
+  /**
+   * Whether creating pools is on here, from which package, and whether `account` (if given) holds a
+   * configured owner badge on the ledger. The page shows the "New pool" form only then.
+   */
+  async newPoolAccess(account: unknown) {
+    const pkg = newPoolPackage(this.allowed());
+    const enabled = this.config.poolOwnerBadges.length > 0 && pkg !== undefined;
+    const base = {
+      enabled, network: this.config.network.name, xrd: this.config.network.xrd, package: pkg ?? null, ownerBadges: this.config.poolOwnerBadges,
+      /** The pairs the market-making bot manages; any other pool runs as a plain pool. */
+      botPairs: this.botPairs(),
+    };
+    if (account === null || account === undefined || account === '') return { ...base, owner: false, ownerBadge: null };
+    const acct = this.checkAccount(account);
+    const badge = enabled ? await this.heldOwnerBadge(acct, false) : undefined;
+    return { ...base, owner: badge !== undefined, ownerBadge: badge ?? null };
+  }
+
+  private checkResource(v: unknown, what: string): string {
+    const hrp = this.config.network.name === 'mainnet' ? 'rdx' : 'tdx_2_';
+    if (typeof v !== 'string' || !new RegExp(`^resource_${hrp}1[02-9ac-hj-np-z]{50,70}$`).test(v.trim())) throw new HttpError(400, `${what}: not a resource address on this network`);
+    return v.trim();
+  }
+
+  private readonly tokenCache = new TtlCache<NewPoolToken & { name: string; iconUrl: string | null }>(60_000);
+
+  /** A token read from the ledger with its checks as a pool token (`poolTokenProblems`; the network's XRD is native and not checked). */
+  tokenInfo(address: string): Promise<NewPoolToken & { name: string; iconUrl: string | null }> {
+    return this.tokenCache.get(address, async () => {
+      const [d] = await this.read.entityDetails([address]);
+      if (!d || d.address !== address) throw new HttpError(404, 'No such resource on the ledger');
+      const md = new Map<string, any>((d.metadata?.items ?? []).map((i: any) => [i.key, i.value?.typed?.value]));
+      const known = this.data.tokens.get(address);
+      const symbol = String(md.get('symbol') ?? known?.symbol ?? '').slice(0, 16) || `${address.slice(0, 14)}…`;
+      const divisibility = Number(d.details?.divisibility);
+      const problems = address === this.config.network.xrd ? { errors: [], warnings: [] } : poolTokenProblems(d.details);
+      if (!(Number.isInteger(divisibility) && divisibility >= 0 && divisibility <= 18) && !problems.errors.length) problems.errors.push('no divisibility');
+      return {
+        address, symbol, name: String(md.get('name') ?? known?.name ?? '').slice(0, 64), iconUrl: typeof md.get('icon_url') === 'string' ? md.get('icon_url') : known?.iconUrl ?? null,
+        divisibility: Number.isInteger(divisibility) ? divisibility : 18, errors: problems.errors, warnings: problems.warnings,
+      };
+    });
+  }
+
+  /**
+   * Tokens for the picker: a pasted resource address is read from the ledger with its checks; text is
+   * matched against the symbols and names of the tokens the site lists (exact symbol first). Symbols
+   * are not unique (anyone can copy one), so the page always shows the address too.
+   */
+  async newPoolTokens(q: unknown) {
+    const s = typeof q === 'string' ? q.trim() : '';
+    if (s.startsWith('resource_')) return [await this.tokenInfo(this.checkResource(s, 'Token'))];
+    const all = [...this.data.tokens.values()];
+    const tvl = new Map<string, number>();
+    for (const m of this.data.markets) for (const t of [m.base.address, m.quote.address]) tvl.set(t, (tvl.get(t) ?? 0) + m.tvlUsd);
+    const needle = s.toLowerCase();
+    const rank = (t: { symbol: string; name?: string }) => {
+      const sym = t.symbol.toLowerCase(), name = (t.name ?? '').toLowerCase();
+      return !needle ? 3 : sym === needle ? 0 : sym.startsWith(needle) ? 1 : sym.includes(needle) || name.includes(needle) ? 2 : -1;
+    };
+    return all.map((t) => ({ t, r: rank(t) })).filter((x) => x.r >= 0)
+      .sort((x, y) => x.r - y.r || (tvl.get(y.t.address) ?? 0) - (tvl.get(x.t.address) ?? 0) || x.t.symbol.localeCompare(y.t.symbol))
+      .slice(0, 20).map(({ t }) => ({ address: t.address, symbol: t.symbol, name: t.name ?? '', iconUrl: t.iconUrl ?? null }));
+  }
+
+  private readonly pairMarkets = new TtlCache<{ market?: { price: number; source: string }; reason?: string }>(30_000);
+
+  /**
+   * The market price of a new pair (B per A), when on-ledger venues quote it. XRD/hUSDC on mainnet: the
+   * bot's reference venues under its rules (as the script's `instantiate`), only when they agree.
+   * Otherwise a two-way probe of the router over the listed venues, OwnerPools left out (the owner's
+   * own pools are never their own reference), of a thousandth of each seed amount.
+   */
+  private newPairMarket(a: NewPoolToken, b: NewPoolToken, amountA: string, amountB: string) {
+    const probe = (amount: string, div: number) => { const d = new Decimal(amount).div(1000).toDecimalPlaces(div, Decimal.ROUND_DOWN); return d.gt(0) ? d.toFixed() : amount; };
+    const pa = probe(amountA, a.divisibility), pb = probe(amountB, b.divisibility);
+    return this.pairMarkets.get(`${a.address}|${b.address}|${pa}|${pb}`, async () => {
+      const net = this.config.network.name;
+      const direct = hasReferenceVenues(net, a.address, b.address), inverse = hasReferenceVenues(net, b.address, a.address);
+      if (direct || inverse) {
+        const r = await this.venueReference();
+        if (r.status !== 'ok' || !(r.price > 0)) return { reason: `the bot's reference venues give no agreed price (${r.status}: ${r.reason})` };
+        return { market: { price: direct ? r.price : 1 / r.price, source: r.source } };
+      }
+      const pools = this.data.pools.filter((p) => p.venue !== 'ownerpool');
+      const xrd = this.config.network.xrd;
+      const [qa, qb] = await Promise.all([
+        this.data.quoter.best(pools, a.address, b.address, pa, xrd).catch(() => undefined),
+        this.data.quoter.best(pools, b.address, a.address, pb, xrd).catch(() => undefined),
+      ]);
+      if (!qa || !qb) return { reason: 'no route between these two tokens on the listed venues' };
+      const m = probeMid({ sellA: qa.sellAmount, getB: qa.buyAmount, sellB: qb.sellAmount, getA: qb.buyAmount });
+      if ('reason' in m) return { reason: m.reason };
+      const venues = [...new Set([...qa.route, ...qb.route].map((p) => p.venue))].join(', ');
+      return { market: { price: m.price, source: `the router over on-ledger venues (${venues}), two-way probe of ${pa} ${a.symbol} / ${pb} ${b.symbol}, spread ${(m.spread * 100).toFixed(2)}%` } };
+    });
+  }
+
+  /**
+   * Plan a new pool for an account holding a configured owner badge NOW (read fresh on the ledger),
+   * with the script's guards, and preview it on the Gateway. Nothing is signed or sent here.
+   */
+  async prepareNewPool(body: any) {
+    if (!body || typeof body !== 'object') throw new HttpError(400, 'Body must be a JSON object');
+    const account = this.checkAccount(body.account);
+    if (!this.config.poolOwnerBadges.length) throw new HttpError(403, 'Creating pools is off on this server (no owner badge configured)');
+    const pkg = newPoolPackage(this.allowed());
+    if (!pkg) throw new HttpError(400, 'No OwnerPool package is allow-listed on this network');
+    const params = body.params && typeof body.params === 'object' && !Array.isArray(body.params) ? body.params : {};
+    const ra = this.checkResource(params.resourceA, 'Token A'), rb = this.checkResource(params.resourceB, 'Token B');
+    const badge = await this.heldOwnerBadge(account, true);
+    if (!badge) throw new HttpError(403, 'This account does not hold the pool owner badge');
+    const [ta, tb] = await Promise.all([this.tokenInfo(ra), this.tokenInfo(rb)]);
+    const samePair = this.data.pools.filter((p) => p.venue === 'ownerpool' && [...p.tokens].sort().join() === [ra, rb].sort().join()).map((p) => p.address);
+    const input = { owner: { account, badge }, package: pkg, packages: this.allowed(), tokenA: ta, tokenB: tb, params, samePair, botPairs: this.botPairs() };
+    let plan;
+    try {
+      // Refuse bad input before the market probe (previews on the Gateway), then plan with the market.
+      const first = planNewPool({ ...input, noMarketReason: '' });
+      const m = await this.newPairMarket(ta, tb, first.amountA, first.amountB);
+      plan = planNewPool({ ...input, market: m.market, noMarketReason: m.reason });
+    } catch (e) {
+      if (e instanceof NewPoolError) throw new HttpError(400, e.message);
+      throw e;
+    }
+    let preview = null;
+    if (plan.manifest) {
+      const { epoch } = await this.gateway.status();
+      const pv = await this.gateway.preview(plan.manifest, epoch);
+      preview = previewView(plan.manifest, pv, { owner: account, pool: '', ownerBadge: badge, symbol: (r) => (r === ra ? ta.symbol : r === rb ? tb.symbol : this.symbol(r)) });
+    }
+    return { ...plan, network: this.config.network.name, ownerBadge: badge, package: pkg, tokens: { a: ta, b: tb }, preview };
+  }
+
+  /**
+   * After the wallet sent a new pool: the transaction's status, the pool it created, whether the ledger
+   * shows what the step set, and whether discovery now lists it (read again here, so the page can offer
+   * the pause at once). The market list is rebuilt in the background so the router quotes it.
+   */
+  async verifyNewPool(body: any) {
+    if (!body || typeof body !== 'object' || typeof body.txid !== 'string' || !/^txid_[a-z0-9_]{20,100}$/.test(body.txid)) throw new HttpError(400, 'Bad transaction id');
+    const st = await this.read.transactionStatus(body.txid);
+    if (st.status !== 'CommittedSuccess') return { status: st.status, error: st.error ?? null, pool: null, listed: false, mismatches: null };
+    const j = await this.read.post('/transaction/committed-details', { intent_hash: body.txid, opt_ins: { receipt_state_changes: true } });
+    const pool = createdPool((j?.transaction?.receipt?.state_updates?.new_global_entities ?? []).map((e: any) => String(e?.entity_address)));
+    if (!pool) return { status: st.status, error: 'The transaction created no pool component', pool: null, listed: false, mismatches: null };
+    await this.data.discovery.refresh();
+    const listed = this.addresses().includes(pool);
+    const state = await this.state(pool, true).catch(() => undefined);
+    const mismatches = state ? ownerPoolStepMismatches(state, cleanWant(body.want)) : ['the pool could not be read as an allow-listed OwnerPool'];
+    if (listed) void this.data.refresh().catch(() => undefined);
+    return { status: st.status, error: null, pool, listed, mismatches };
   }
 }

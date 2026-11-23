@@ -19,3 +19,4 @@ export * from './solver.ts';
 export * from './orderkey.ts';
 export * from './orderbook.ts';
 export * from './ownerpool-markout.ts';
+export * from './ownerpool-discovery.ts';

@@ -151,6 +151,8 @@ export async function createApp(config: Config) {
     // Added 23 Nov 2026: a read-only server takes no orders (the site still shows markets and the Pools page).
     readOnly: config.readOnly,
     ownerPools: pools.addresses().length,
+    // Added 23 Nov 2026: the owner's pools found on the ledger by their owner badge (DEX_POOL_OWNER_BADGES).
+    ownerPoolDiscovery: { enabled: data.discovery.enabled, found: data.discovery.addresses().length, error: data.discovery.lastError ?? null },
     limitOrders: config.solverBadge && !config.readOnly
       ? {
         enabled: true, solverBadge: config.solverBadge, registry: config.registry ?? null, maxLifetimeSec: config.maxOrderLifetimeSec, filling: Boolean(solver),
@@ -414,6 +416,13 @@ export async function createApp(config: Config) {
   // sent here: the page hands the manifest to the owner's wallet.
   api.on('POST', '/api/pools/:component/prepare', async ({ params, body }) => pools.prepare(params.component!, await body()), 5);
   api.on('POST', '/api/pools/:component/verify', async ({ params, body }) => pools.verify(params.component!, await body()), 2);
+  // A new pool, for an account holding a configured owner badge (DEX_POOL_OWNER_BADGES), read on the
+  // ledger: the token picker, the plan with the script's guards, previewed (never sent), and the check
+  // after the wallet sent it. The created pool is then listed by discovery, without a redeploy.
+  api.on('GET', '/api/new-pool', ({ url }) => pools.newPoolAccess(url.searchParams.get('account')));
+  api.on('GET', '/api/new-pool/tokens', ({ url }) => pools.newPoolTokens(url.searchParams.get('q')), 2);
+  api.on('POST', '/api/new-pool/prepare', async ({ body }) => pools.prepareNewPool(await body()), 8);
+  api.on('POST', '/api/new-pool/verify', async ({ body }) => pools.verifyNewPool(await body()), 2);
 
   return { api, data, store, solver, gateway, readGateway, config, book, pools };
 }

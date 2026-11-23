@@ -442,6 +442,10 @@ export function cleanWant(w: any): Parameters<typeof ownerPoolStepMismatches>[1]
   const dec = (v: unknown) => typeof v === 'string' && /^-?\d{1,40}(\.\d{1,18})?$/.test(v);
   const pairOk = (v: unknown): v is [string, string] => Array.isArray(v) && v.length === 2 && dec(v[0]) && dec(v[1]);
   if (pairOk(w.reserves)) out.reserves = w.reserves;
+  if (pairOk(w.inventory)) out.inventory = w.inventory;
+  const res = (v: unknown): v is string => typeof v === 'string' && /^resource_[a-z0-9_]{20,90}$/.test(v);
+  if (Array.isArray(w.resources) && w.resources.length === 2 && w.resources.every(res)) out.resources = [w.resources[0], w.resources[1]];
+  if (res(w.ownerBadge)) out.ownerBadge = w.ownerBadge;
   if (pairOk(w.anchor)) out.anchor = w.anchor;
   if (Number.isInteger(w.feeBps)) out.feeBps = w.feeBps;
   if (typeof w.ownerPaused === 'boolean') out.ownerPaused = w.ownerPaused;

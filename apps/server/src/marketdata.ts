@@ -1,7 +1,7 @@
 import {
   type Depth, type Gateway, type LedgerSwap, type Market, type Pool, type Quote, type Token,
   Quoter, buildMarkets, filterAllowedPools, listCaviarNine, listDefiPlaza, listOciswap, mergeDepth, poolsToProbe, tokensFromLedger, defaultJsonFetch, Decimal,
-  OWNER_POOL_PACKAGES, ownerPoolAsPool, readOwnerPools } from '@radix-dex/core';
+  OWNER_POOL_PACKAGES, OwnerPoolDiscovery, ownerPoolAsPool, readOwnerPools } from '@radix-dex/core';
 import { readFileSync } from 'node:fs';
 import type { Config } from './config.ts';
 
@@ -49,6 +49,8 @@ export class MarketData {
   private readonly config: Config;
   private readonly gateway: Gateway;
   readonly quoter: Quoter;
+  /** The owner's pools found on the ledger (`DEX_POOL_OWNER_BADGES`), listed beside `DEX_OWNER_POOLS`. */
+  readonly discovery: OwnerPoolDiscovery;
   private readonly quoteCache = new TtlCache<Quote | undefined>(8_000);
   private readonly depthCache = new TtlCache<Depth>(20_000);
   private readonly tradesCache = new TtlCache<(LedgerSwap & { venue: string })[]>(15_000);
@@ -60,13 +62,19 @@ export class MarketData {
     this.config = config;
     this.gateway = gateway;
     this.quoter = new Quoter(gateway);
+    this.discovery = new OwnerPoolDiscovery(gateway, { badges: config.poolOwnerBadges ?? [], packages: OWNER_POOL_PACKAGES[config.network.name] ?? [] });
+  }
+
+  /** Every OwnerPool address to list: the markets file's, `DEX_OWNER_POOLS` and the discovered ones. */
+  ownerPoolAddresses(fromFile: string[] = []): string[] {
+    return [...new Set([...(this.config.ownerPools ?? []), ...fromFile, ...this.discovery.addresses()])];
   }
 
   /** Rebuild the market list from the venues. A venue that fails is skipped; the previous list is kept if all fail. */
   async refresh(): Promise<void> {
     if (this.config.network.name !== 'mainnet') {
       // No venue APIs off mainnet: markets come from a local file of tokens and pools.
-      if (this.config.marketsFile || this.config.ownerPools.length) {
+      if (this.config.marketsFile || this.config.ownerPools.length || this.discovery.enabled) {
         const j = this.config.marketsFile ? JSON.parse(readFileSync(this.config.marketsFile, 'utf8')) : { tokens: [], pools: [] };
         this.tokens = new Map((j.tokens as Token[]).map((t) => [t.address, t]));
         const filePools = (j.pools ?? []) as Pool[];
@@ -119,13 +127,14 @@ export class MarketData {
   }
 
   /**
-   * The OwnerPools to list: those named in the markets file (`fromFile`) and in `DEX_OWNER_POOLS`,
-   * each read from the ledger, which must show an `OwnerPool` of an allow-listed package. Its tokens
+   * The OwnerPools to list: those named in the markets file (`fromFile`), in `DEX_OWNER_POOLS`, and
+   * those discovery finds owned by a configured owner badge (read again here first), each read from the ledger, which must show an `OwnerPool` of an allow-listed package. Its tokens
    * come from the ledger; a file entry naming other tokens is refused. A pool that cannot be read
    * or is refused is left out and reported, and the rest are kept.
    */
   private async ownerPools(fromFile: Pool[]): Promise<{ pools: Pool[]; errors: string[] }> {
-    const addresses = [...new Set([...fromFile.map((p) => p.address), ...this.config.ownerPools])];
+    await this.discovery.refresh();
+    const addresses = this.ownerPoolAddresses(fromFile.map((p) => p.address));
     const allowed = OWNER_POOL_PACKAGES[this.config.network.name] ?? [];
     const pools: Pool[] = [], errors: string[] = [];
     await Promise.all(addresses.map(async (address) => {
@@ -139,6 +148,7 @@ export class MarketData {
       }
     }));
     pools.sort((a, b) => a.address.localeCompare(b.address));
+    if (this.discovery.lastError) errors.push(`OwnerPool discovery: ${this.discovery.lastError}`);
     return { pools, errors };
   }
 

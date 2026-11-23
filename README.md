@@ -62,7 +62,8 @@ depth and quotes but cannot trade.
 | `DEX_ORDER_BOOK` | `OrderBook` component, to enable resting orders with partial fills | unset |
 | `DEX_REGISTRY` | `OrderRegistry` component, to enable hard cancels | unset |
 | `DEX_MARKETS_FILE` | JSON of tokens and pools, for networks with no venue API | unset |
-| `DEX_OWNER_POOLS` | Comma-separated OwnerPool component addresses to route through. Pools are listed by address only, never discovered; each must be an `OwnerPool` of a package in `OWNER_POOL_PACKAGES` (packages/core/src/ownerpool.ts; none on mainnet yet), checked on the ledger. A Stokenet markets file may list them too (venue `ownerpool`) | unset |
+| `DEX_OWNER_POOLS` | Comma-separated OwnerPool component addresses to route through, beside the discovered ones (`DEX_POOL_OWNER_BADGES`). Each must be an `OwnerPool` of a package in `OWNER_POOL_PACKAGES` (packages/core/src/ownerpool.ts), checked on the ledger. A Stokenet markets file may list them too (venue `ownerpool`) | unset |
+| `DEX_POOL_OWNER_BADGES` | Owner badges whose OwnerPools are found on the ledger and listed (their own state must name the badge; see docs/MAINNET-POOLS.md section 13), and whose holder may create pools from the Pools page. Empty turns both off | mainnet: the DIFD pools owner badge; Stokenet: none |
 | `DEX_DAPP_DEFINITION` | dApp definition account, so the wallet will connect | unset |
 | `DEX_CLIENT_IP_HEADER` | Header with the visitor's address when behind a proxy, for the rate limit (`cf-connecting-ip` behind Cloudflare) | unset |
 | `DEX_RATE_PER_MINUTE` | API requests allowed per visitor per minute | `240` |

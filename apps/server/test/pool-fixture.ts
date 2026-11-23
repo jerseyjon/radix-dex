@@ -18,25 +18,25 @@ const V = {
   ib: 'internal_vault_tdx_2_1tqhju6gnwzhqmvhma5vh7e76qyt57mu9k3kl8w9wrun7mvgvng09zr',
 };
 
-export interface PoolOpts { ra?: string; rb?: string; ia?: string; ib?: string; fee?: number; paused?: boolean; operatorPaused?: boolean; operator?: string | null; anchor?: [string, string] }
+export interface PoolOpts { address?: string; ownerBadge?: string; packageAddress?: string; blueprint?: string; ra?: string; rb?: string; ia?: string; ib?: string; fee?: number; paused?: boolean; operatorPaused?: boolean; operator?: string | null; anchor?: [string, string] }
 
 export function poolItem(o: PoolOpts = {}) {
   const operator = o.operator === undefined ? OP_BADGE : o.operator;
   const anchor = o.anchor ?? ['1250', '1'];
   return {
-    address: POOL,
+    address: o.address ?? POOL,
     fungible_resources: { total_count: 2, items: [
       { aggregation_level: 'Vault', resource_address: TEUR, vaults: { total_count: 2, items: [{ vault_address: V.ib, amount: o.ib ?? '0.8' }, { vault_address: V.b, amount: o.rb ?? '16' }] } },
       { aggregation_level: 'Vault', resource_address: XRD, vaults: { total_count: 2, items: [{ vault_address: V.ia, amount: o.ia ?? '1000' }, { vault_address: V.a, amount: o.ra ?? '20000' }] } },
     ] },
-    details: { type: 'Component', package_address: PACKAGE, blueprint_name: 'OwnerPool', state: { kind: 'Tuple', type_name: 'OwnerPool', fields: [
+    details: { type: 'Component', package_address: o.packageAddress ?? PACKAGE, blueprint_name: o.blueprint ?? 'OwnerPool', state: { kind: 'Tuple', type_name: 'OwnerPool', fields: [
       { field_name: 'resource_a', value: XRD }, { field_name: 'resource_b', value: TEUR },
       { field_name: 'divisibility_a', value: '18' }, { field_name: 'divisibility_b', value: '6' },
       { field_name: 'vault_a', value: V.a }, { field_name: 'vault_b', value: V.b },
       { field_name: 'fee_bps', value: String(o.fee ?? 30) },
       { field_name: 'paused', value: o.paused ?? false }, { field_name: 'operator_paused', value: o.operatorPaused ?? false },
       { field_name: 'inventory_a', value: V.ia }, { field_name: 'inventory_b', value: V.ib },
-      { field_name: 'owner_badge', value: OWNER_BADGE },
+      { field_name: 'owner_badge', value: o.ownerBadge ?? OWNER_BADGE },
       operator
         ? { kind: 'Enum', field_name: 'operator', variant_id: '1', variant_name: 'Some', fields: [{ kind: 'Reference', value: operator }] }
         : { kind: 'Enum', field_name: 'operator', variant_id: '0', variant_name: 'None', fields: [] },

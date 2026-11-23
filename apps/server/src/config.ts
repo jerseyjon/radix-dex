@@ -29,11 +29,19 @@ export interface Config {
   marketsFile: string | undefined;
   /**
    * OwnerPool components to route through, by component address (`DEX_OWNER_POOLS`, comma-separated).
-   * Anyone can instantiate an OwnerPool, so pools are only ever listed by address, never discovered;
-   * each must also be an `OwnerPool` of a package in `OWNER_POOL_PACKAGES` for the network, checked
+   * Anyone can instantiate an OwnerPool, so a pool is listed only by address here or when discovery
+   * finds it owned by a configured badge (`poolOwnerBadges`); each must also be an `OwnerPool` of a package in `OWNER_POOL_PACKAGES` for the network, checked
    * on the ledger. On Stokenet the markets file may list them too (venue "ownerpool").
    */
   ownerPools: string[];
+  /**
+   * Owner badges whose OwnerPools are found on the ledger and listed without being named
+   * (`DEX_POOL_OWNER_BADGES`, comma-separated; empty turns discovery off). Default on mainnet: the DIFD
+   * pools owner badge. A pool counts only when its own state names one of these badges as its owner and
+   * it is an OwnerPool of an allow-listed package (packages/core/src/ownerpool-discovery.ts). The same
+   * badges decide who may create a pool from the Pools page.
+   */
+  poolOwnerBadges: string[];
   /** dApp definition account the wallet checks the site against. Without it the site is read-only. */
   dAppDefinition: string | undefined;
   /** Header carrying the visitor's address when the server sits behind a proxy (for example `cf-connecting-ip` behind Cloudflare). */
@@ -127,6 +135,12 @@ const DEFAULT_FEE_TOKENS: Record<string, string[]> = {
  * old default for every network, kept low because test XRD is not priced like the real thing (the test
  * pool has had it at about 200x mainnet) and tests place small orders.
  */
+/** The DIFD pools owner badge (data/mainnet-pool/mainnet.json `poolBadge`, created 23 Nov 2026). */
+export const DEFAULT_POOL_OWNER_BADGES: Record<string, string[]> = {
+  mainnet: ['resource_rdx1th7yck078twm9znh2kmcn68axgylpp6ctnxwl5rkpmjj636cfzda6m'],
+  stokenet: [],
+};
+
 export const DEFAULT_MIN_BOOK_ORDER_XRD: Record<string, number> = { mainnet: 100, stokenet: 5 };
 
 /** A comma-separated list of resource (or other entity) addresses on this network; a bad entry stops the server. */
@@ -163,6 +177,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxOpenOrdersPerAccount: int(env, 'DEX_MAX_OPEN_ORDERS', 50, 1, 10_000),
     marketsFile: env.DEX_MARKETS_FILE,
     ownerPools: resources(env, 'DEX_OWNER_POOLS', [], name === 'mainnet' ? 'rdx' : 'tdx_2_', 'component'),
+    poolOwnerBadges: resources(env, 'DEX_POOL_OWNER_BADGES', DEFAULT_POOL_OWNER_BADGES[name] ?? [], name === 'mainnet' ? 'rdx' : 'tdx_2_'),
     dAppDefinition: env.DEX_DAPP_DEFINITION,
     clientIpHeader: env.DEX_CLIENT_IP_HEADER,
     ratePerMinute: int(env, 'DEX_RATE_PER_MINUTE', 240, 1, 1_000_000),
