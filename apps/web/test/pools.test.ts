@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { PreparedAction } from '../src/api.ts';
-import { ago, canSign, fmtGap, gapTone, healthLabel, poolStatus, shortId } from '../src/pools.ts';
+import { ago, canSign, fmtGap, gapTone, healthLabel, poolStatus, seedPriceLabel, shortId } from '../src/pools.ts';
 
 test('pool status in words', () => {
   assert.deepEqual(poolStatus({ paused: false, ownerPaused: false, operatorPaused: false }), { label: 'Open', tone: 'up' });
@@ -42,4 +42,14 @@ test('a prepared action goes to the wallet only when it previewed, for the conne
   assert.match(canSign({ ...base, prepared: prepared(true), walletAccount: undefined }).why!, /Connect/);
   assert.match(canSign({ ...base, prepared: prepared(true), walletAccount: 'account_b' }).why!, /another account/);
   assert.match(canSign({ ...base, prepared: prepared(true), now: 200_000 }).why!, /two minutes/);
+});
+
+test('the new pool\'s seed price for display: B per A, trailing zeros dropped, nothing until both amounts are positive', () => {
+  assert.equal(seedPriceLabel('2000', '1.6'), '0.0008');
+  assert.equal(seedPriceLabel('100000', '76.3'), '0.000763');
+  assert.equal(seedPriceLabel('3', '1'), '0.3333333333');
+  assert.equal(seedPriceLabel('1', '2'), '2');
+  assert.equal(seedPriceLabel('', '2'), undefined);
+  assert.equal(seedPriceLabel('0', '2'), undefined);
+  assert.equal(seedPriceLabel('1e3', '2'), undefined);
 });

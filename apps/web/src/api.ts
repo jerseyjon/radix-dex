@@ -156,6 +156,19 @@ export interface PreparedAction {
     changes: { entity: string; label: string; items: { resource: string; symbol: string; amount: string }[] }[] };
 }
 
+// ---------------------------------------------------------------- a new pool (/api/new-pool)
+
+export interface NewPoolAccess { enabled: boolean; network: string; xrd: string; package: string | null; ownerBadges: string[]; botPairs: string[]; owner: boolean; ownerBadge: string | null }
+export interface NewPoolTokenHit { address: string; symbol: string; name: string; iconUrl: string | null; divisibility?: number; errors?: string[]; warnings?: string[] }
+export interface NewPoolPrepared {
+  title: string; manifest: string | null; want: unknown; amountA: string; amountB: string; feeBps: number; seedPrice: string;
+  market: { price: number; source: string; gap: number } | null; needs: ('price' | 'issuer-risk')[]; blocked: string[]; notes: string[]; warnings: string[];
+  scriptStep: string; network: string; ownerBadge: string; package: string;
+  tokens: { a: NewPoolTokenHit; b: NewPoolTokenHit };
+  preview: PreparedAction['preview'] | null;
+}
+export interface NewPoolVerified { status: string; error: string | null; pool: string | null; listed: boolean; mismatches: string[] | null }
+
 export const api = {
   config: () => (STATIC ? get<ServerConfig>(`${BASE}snapshot/config.json`) : get<ServerConfig>('/api/config')),
   markets: () => (STATIC ? get<MarketSummary[]>(`${BASE}snapshot/markets.json`) : get<MarketSummary[]>('/api/markets')),
@@ -175,4 +188,8 @@ export const api = {
   preparePoolAction: (component: string, body: { account: string; action: OwnerAction; params: Record<string, unknown> }) => post<PreparedAction>(`/api/pools/${q(component)}/prepare`, body),
   verifyPoolAction: (component: string, txid: string, want: unknown) =>
     post<{ status: string; error: string | null; mismatches: string[] | null }>(`/api/pools/${q(component)}/verify`, { txid, want }),
+  newPoolAccess: (account?: string) => get<NewPoolAccess>(`/api/new-pool${account ? `?account=${q(account)}` : ''}`),
+  newPoolTokens: (query: string) => get<NewPoolTokenHit[]>(`/api/new-pool/tokens?q=${q(query)}`),
+  prepareNewPool: (body: { account: string; params: Record<string, unknown> }) => post<NewPoolPrepared>('/api/new-pool/prepare', body),
+  verifyNewPool: (txid: string, want: unknown) => post<NewPoolVerified>('/api/new-pool/verify', { txid, want }),
 };

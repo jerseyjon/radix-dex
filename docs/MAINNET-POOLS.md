@@ -370,7 +370,8 @@ Not made (another review was reading these files):
 lists any OwnerPool). It reads; the owner's wallet signs. Nothing on the server holds or needs the owner's
 key, and the server never submits an owner transaction.
 
-**The table** lists every OwnerPool in `DEX_OWNER_POOLS` (and on Stokenet the markets file): pair, the
+**The table** lists every OwnerPool the server finds owned by the pool owner badge (below, "Listing"), every
+one in `DEX_OWNER_POOLS`, and on Stokenet the markets file's: pair, the
 curve's price, the gap to the market, TVL, fee, open or paused, and whether the bot and the watcher are
 alive. **Open** shows one pool:
 
@@ -420,15 +421,73 @@ set, like `record`.
 | Revoke | `revoke` | type REVOKE; the emergency stop of section 6 step 4 |
 
 Not on the page (use the script): `inventory`, `withdraw-inventory`, `owner-rebalance`, `operator-badge`,
-`appoint`, `unwind`, and the set-up steps.
+`appoint`, `unwind`, and the set-up steps (`badge`, `publish`).
 
 A preview is good for two minutes; prepare again if a swap moved the reserves ("Reserves moved").
+
+### A new pool from the page (`#/pools/new`)
+
+A **New pool** button appears above the table for a connected account that holds the pool owner badge, read
+on the ledger (`DEX_POOL_OWNER_BADGES`, below). Without a wallet, `#/pools/new` takes a typed account and
+previews only. The page is the script's `instantiate` step, with the same builder and guards:
+
+| Guard | What the server does |
+|---|---|
+| Package | the newest package in `OWNER_POOL_PACKAGES` for the network (mainnet: the one published 23 Nov 2026); anything else is refused |
+| Owner | the account must hold a configured owner badge NOW (fresh ledger read); the pool's owner is that badge, proved in the same transaction (the blueprint asserts it) |
+| Tokens | read from the ledger: a recaller or freezer (held, or assignable), or restricted transfers, is **refused**; a minter or burner someone holds (e.g. hUSDC's bridge) is shown as issuer risk and must be **accepted by ticking a box**. The network's XRD is native and not checked. The owner badge itself cannot be a pool token |
+| Amounts and fee | plain decimals within each token's divisibility, both above zero; fee 0-500 bps |
+| Seed price vs market | XRD/hUSDC on mainnet: the bot's reference venues under its rules, as the script (only when they agree). Any other pair: a two-way probe of the router over the listed venues, **OwnerPools left out**, of a thousandth of each seed amount; the mid is the geometric mean of the two sides, and a two-way spread above 5% counts as no market. With a market, a seed price more than **1%** away is **refused** (only the script's `--force` goes past it). With no market, the owner must **confirm the exact price stated** (1 A = x B, 10 significant digits) |
+| One transaction | `instantiate_with_liquidity`: the pool is created AND funded in one transaction (pool audit F2: no empty pool ever exists). No fee lock: the wallet adds its own |
+| Same pair | a note when the owner already has a pool for the two tokens |
+
+The preview shows the badge proved, both withdrawals and the network fee; **Sign in wallet** sends exactly the
+previewed manifest. After the commit the page reads the transaction, finds the pool it created, checks the
+ledger shows what the step set (as `record` does), and offers **Pause it now (recommended)** at once: swaps are
+open from the moment the pool exists. Operator steps (`operator-badge`, `limits`, `appoint`) stay script-only
+(`--name <pool>`). **The bot manages only XRD/hUSDC today**: any other pair runs as a plain constant-product
+pool, kept near the market by arbitrage only.
+
+### Listing: the owner's pools are found on the ledger
+
+The server no longer needs a `DEX_OWNER_POOLS` edit and a restart for a new pool. Every market refresh (5
+minutes, and at once after the page verifies a new pool) it reads the transactions that presented a
+configured owner badge (`/stream/transactions`, `manifest_badges_presented_filter`, incrementally from the last
+state version read), takes the components they created, and lists one only when **its own state on the
+ledger** shows: an `OwnerPool` component, of a package in `OWNER_POOL_PACKAGES`, a split pool, whose
+`owner_badge` is a configured badge. Anyone can instantiate the public package, but only with a proof of the
+badge they name as owner (lib.rs `build`), and no method changes it: a pool someone makes with their own badge
+is never listed, nor one of another package, nor anything else a badge transaction created. Verdicts are kept
+(they cannot change); a component the Gateway did not return is tried again. The discovered pools join
+`DEX_OWNER_POOLS` and the markets file's, are listed on the Pools page and quoted by the router; paused ones
+are listed and not quoted, as before. `/api/config` reports `ownerPoolDiscovery` (enabled, how many found, the
+last error).
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `DEX_POOL_OWNER_BADGES` | owner badges whose pools are listed, and who may create pools from the page; empty turns both off | mainnet: `resource_rdx1th7yck078twm9znh2kmcn68axgylpp6ctnxwl5rkpmjj636cfzda6m` (the DIFD pools owner badge); Stokenet: none |
+| `DEX_OWNER_POOLS` | still honoured, merged with the discovered pools | unset |
+
+Proven on Stokenet (23 Nov 2026), with the throwaway owner key and a read-only Stokenet server from the
+`add-pool` worktree (`DEX_POOL_OWNER_BADGES` = the Stokenet pool owner badge, no `DEX_OWNER_POOLS`): discovery
+listed the existing `teur-dry` pool; `/api/new-pool/prepare` built and previewed XRD/TEUR 2000 + 1.6 at 50 bps
+(no market: blocked until the price was confirmed); the script's `instantiate --send` committed the same
+manifest plus its `lock_fee` line (`txid_tdx_2_14p8pya6n36mw72yme89apfksehnphakr536d6mg82stwepgepyaq7gthg3`,
+pool `component_tdx_2_1czs9rlx908d2aasqh92yzr7cwpz7vttnjlm0dynnpy7jgxnvlue996`); `/api/new-pool/verify` found
+the pool, no mismatches, listed; the router quoted XRD to TEUR through it; then `pause`
+(`txid_tdx_2_1ka7w9qe97fxd8ep4s5d5t906s5swz9fslgcml0d5rt6rsw74206qjuqpzn`, previewed first through the page's
+action) and `unwind` (`txid_tdx_2_1q3zryuug82f7l6zp7t386af4p3dznw3j5t803lsr5fr7hvma54kswl3z9s`) returned the
+2000 XRD and 1.6 TEUR to the owner. On mainnet (read-only, previews only) discovery listed the XRD/hUSDC pool with
+no `DEX_OWNER_POOLS`, a seed at the old price (4.3% from the market) was refused, and a seed at the market
+previewed successfully for the owner account once the hUSDC issuer risk was accepted.
+
+### A read-only server
 
 To look at mainnet without touching the live site, run a second, read-only server (no solver is made,
 no order taken, whatever else is set):
 
 ```
 DEX_NETWORK=mainnet DEX_READ_ONLY=1 DEX_PORT=8790 DEX_DATA_DIR=/tmp/dex-ro DEX_OWNER_POOL_FILES=data \
-DEX_WEB_DIR=apps/web/dist DEX_OWNER_POOLS=component_rdx1cz6ga0dfz3vqefku0vvgyu0fsv9q6u09vtkpew5ysa8qdsz3ha6zyr \
+DEX_WEB_DIR=apps/web/dist \
 npx tsx apps/server/src/main.ts
 ```

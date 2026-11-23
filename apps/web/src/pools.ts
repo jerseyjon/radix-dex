@@ -47,7 +47,7 @@ export function healthLabel(h: ProcessHealth | undefined, now: number): { label:
  * the account the wallet has connected (a manifest proves the badge from the account it names), and
  * it is fresh (the reserves guard was read at most `maxAgeMs` ago).
  */
-export function canSign(o: { walletAccount: string | undefined; prepared: PreparedAction | undefined; preparedFor: string | undefined; preparedAt: number; now: number; maxAgeMs?: number }): { ok: boolean; why?: string } {
+export function canSign(o: { walletAccount: string | undefined; prepared: Pick<PreparedAction, 'preview'> | undefined; preparedFor: string | undefined; preparedAt: number; now: number; maxAgeMs?: number }): { ok: boolean; why?: string } {
   if (!o.prepared) return { ok: false, why: 'Preview first' };
   if (!o.prepared.preview.ok) return { ok: false, why: 'The preview failed: this would fail on the ledger' };
   if (!o.walletAccount) return { ok: false, why: 'Connect the owner account in the Radix Wallet to sign' };
@@ -60,4 +60,12 @@ export function canSign(o: { walletAccount: string | undefined; prepared: Prepar
 export function shortId(a: string | null | undefined): string {
   if (!a) return '—';
   return a.length > 24 ? `${a.slice(0, 14)}…${a.slice(-6)}` : a;
+}
+
+/** The seed price of a new pool for display, B per A to 10 significant digits; undefined until both amounts are positive numbers. */
+export function seedPriceLabel(amountA: string, amountB: string): string | undefined {
+  const a = Number(amountA.trim()), b = Number(amountB.trim());
+  if (!/^\d+(\.\d+)?$/.test(amountA.trim()) || !/^\d+(\.\d+)?$/.test(amountB.trim()) || !(a > 0) || !(b > 0)) return undefined;
+  const t = (b / a).toPrecision(10);
+  return t.includes('e') ? t : t.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
 }

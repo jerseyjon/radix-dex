@@ -431,6 +431,26 @@ table.limits tr + tr td { border-top: 0; }
 .preview-card pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--fs-xs); color: var(--text-2); background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm); padding: var(--s2); margin: var(--s2) 0 0; }
 .preview-card summary { cursor: pointer; color: var(--accent); font-size: var(--fs-sm); }
 .result { margin: 0; font-size: var(--fs-sm); }
+/* New pool (#/pools/new) */
+.panel-head .grow { flex: 1; }
+.btn-small { padding: 6px 12px; font-size: var(--fs-sm); text-decoration: none; display: inline-flex; align-items: center; min-height: 32px; }
+.row3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--s2); }
+.note-info { margin: 0; color: var(--text-2); font-size: var(--fs-sm); display: flex; gap: var(--s2); align-items: flex-start; background: var(--accent-soft); border-radius: var(--r-md); padding: var(--s2) var(--s3); }
+.note-info .icon { flex: none; margin-top: 2px; color: var(--accent); }
+.token-picker { position: relative; display: grid; gap: var(--s1); }
+.token-picker .lbl { color: var(--muted); font-size: var(--fs-sm); }
+.token-picker input, .token-chosen { height: 40px; background: var(--bg); border: 1px solid var(--line-2); border-radius: var(--r-md); padding: 0 var(--s3); font-size: var(--fs-md); text-align: left; display: flex; align-items: center; gap: var(--s2); width: 100%; color: var(--text); }
+.token-picker input:focus, .token-chosen:focus-visible { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.token-chosen .icon { margin-left: auto; color: var(--muted); }
+.token-hits { position: absolute; z-index: 20; top: 100%; left: 0; right: 0; margin: 4px 0 0; padding: var(--s1); list-style: none; background: var(--surface-2); border: 1px solid var(--line-2); border-radius: var(--r-md); box-shadow: var(--shadow); max-height: 280px; overflow-y: auto; }
+.token-hits button { width: 100%; text-align: left; display: flex; gap: var(--s2); align-items: baseline; padding: var(--s2); border-radius: var(--r-sm); min-height: 36px; }
+.token-hits button:hover, .token-hits button:focus-visible { background: var(--surface-3); }
+.token-hits .pad { padding: var(--s2); }
+.token-picker p { margin: 0; }
+.preview-card .notes.warn { color: var(--warn); }
+.created { display: grid; gap: var(--s2); border-top: 1px solid var(--line); padding-top: var(--s3); }
+.created p { margin: 0; }
+.pad-b { margin: 0; }
 @media (max-width: 760px) {
   .pools-page .top { flex-wrap: wrap; }
   .pool-grid { grid-template-columns: minmax(0, 1fr); }

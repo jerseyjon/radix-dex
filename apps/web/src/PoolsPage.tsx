@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { type OperatorLimits, type OwnerAction, type PoolDetail, type PoolRow, type PreparedAction, type ServerConfig, ApiError, api } from './api';
 import { fmtAmount, fmtPrice, fmtUsd, shortAddr } from './format';
+import { NewPool } from './NewPool';
 import { PoolGlance, MiniGap } from './PoolGraphics';
 import { ago, canSign, fmtGap, gapTone, healthLabel, poolStatus, shortId } from './pools';
 import { Empty, Icon, Logo, SkeletonRows } from './ui';
@@ -13,7 +14,9 @@ import { type Wallet, type WalletAccount, getWallet } from './wallet';
  * built and previewed by the server, then signed in the owner's own wallet.
  */
 export function PoolsPage({ route }: { route: string }) {
-  const component = route.startsWith('#/pools/') ? decodeURIComponent(route.slice('#/pools/'.length)) : undefined;
+  const sub = route.startsWith('#/pools/') ? decodeURIComponent(route.slice('#/pools/'.length)) : undefined;
+  const isNew = sub === 'new';
+  const component = isNew ? undefined : sub;
   const [config, setConfig] = useState<ServerConfig>();
   const [error, setError] = useState<string>();
   const [accounts, setAccounts] = useState<WalletAccount[]>([]);
@@ -22,7 +25,7 @@ export function PoolsPage({ route }: { route: string }) {
   useEffect(() => { api.config().then(setConfig, (e: Error) => setError(e.message)); }, []);
   const wallet = useMemo(() => (config ? getWallet(config.networkId, config.dAppDefinition) : undefined), [config]);
   useEffect(() => wallet?.onAccounts((a) => { setAccounts(a); setAccount((cur) => (cur && a.some((x) => x.address === cur) ? cur : a[0]?.address)); }), [wallet]);
-  useEffect(() => { document.title = component ? 'Pool · Radix DEX' : 'Pools · Radix DEX'; return () => { document.title = 'Radix DEX'; }; }, [component]);
+  useEffect(() => { document.title = isNew ? 'New pool · Radix DEX' : component ? 'Pool · Radix DEX' : 'Pools · Radix DEX'; return () => { document.title = 'Radix DEX'; }; }, [component, isNew]);
   const explorer = config?.networkId === 1 ? 'https://dashboard.radixdlt.com' : 'https://stokenet-dashboard.radixdlt.com';
 
   return (
@@ -31,7 +34,7 @@ export function PoolsPage({ route }: { route: string }) {
         <Logo />
         <nav className="nav" aria-label="Sections">
           <a href="#">Trade</a>
-          <a href="#/pools" aria-current={component ? undefined : 'page'} className="on">Pools</a>
+          <a href="#/pools" aria-current={component || isNew ? undefined : 'page'} className="on">Pools</a>
         </nav>
         <div className="right">
           {config && <span className={`net ${config.network}`}><span className="dot" aria-hidden="true" />{config.network}</span>}
@@ -45,7 +48,8 @@ export function PoolsPage({ route }: { route: string }) {
       </header>
       <main className="pools-main">
         {error && <p className="error">{error}</p>}
-        {component ? <PoolView component={component} account={account} wallet={wallet} explorer={explorer} /> : <PoolTable />}
+        {isNew ? <NewPool account={account} wallet={wallet} explorer={explorer} />
+          : component ? <PoolView component={component} account={account} wallet={wallet} explorer={explorer} /> : <PoolTable account={account} />}
       </main>
     </div>
   );
@@ -68,12 +72,21 @@ function usePoll<T>(load: () => Promise<T>, ms: number, deps: unknown[]): { valu
 
 // ------------------------------------------------------------------ the table
 
-function PoolTable() {
+function PoolTable({ account }: { account: string | undefined }) {
   const { value: rows, error } = usePoll(api.pools, 30_000, []);
+  // "New pool" only for a connected account holding the pool owner badge, checked on the ledger.
+  const [canCreate, setCanCreate] = useState(false);
+  useEffect(() => {
+    let live = true;
+    setCanCreate(false);
+    if (account) api.newPoolAccess(account).then((a) => { if (live) setCanCreate(a.enabled && a.owner); }, () => undefined);
+    return () => { live = false; };
+  }, [account]);
   const now = Date.now();
   return (
     <section className="panel pools-table" aria-label="Pools">
-      <header className="panel-head"><h1 className="panel-title">Pools</h1><span className="head-note">The owner's own pools (OwnerPool), read from the ledger</span></header>
+      <header className="panel-head"><h1 className="panel-title">Pools</h1><span className="head-note grow">The owner's own pools (OwnerPool), read from the ledger</span>
+        {canCreate && <a className="btn-primary btn-small" href="#/pools/new">New pool</a>}</header>
       {error && <p className="error">{error}</p>}
       {!rows && !error && <SkeletonRows rows={3} label="Loading pools" />}
       {rows && rows.length === 0 && <Empty>No pools are listed on this server.</Empty>}
