@@ -1,4 +1,4 @@
-# OwnerPool market-making bot (Stokenet only)
+# OwnerPool market-making bot (sends on Stokenet; mainnet guarded)
 
 `scripts/owner-pool-bot.ts` keeps a split OwnerPool's price near a reference price using only the
 OPERATOR (hot) key. Its decisions are pure functions in `packages/core/src/ownerpool-bot.ts`, tested in
@@ -25,10 +25,11 @@ only part of what the contract would allow.
 2. **Reads the pool** from the ledger, vault by vault (reserves, inventory, fee, both pauses, limits,
    stored allowance, the anchor on ledger), and the contract's own `operator_status` by preview. The
    allowance is computed locally too, and the two are compared on every tick.
-3. **Maps the reference onto the pool** (`target = reference * scale`).
+3. **Maps the reference onto the pool**: `target = median of the last 3 healthy references x scale`
+   (no target until 3 are in; scale is always 1 on mainnet).
 4. **Checks the owner's anchor.** The anchor the OWNER last stated is read from the ledger (see "The
-   owner's anchor" below). If the target is more than 5% from it, the bot stops following, sets the
-   operator pause, logs and alerts that the owner must restate the anchor. If the owner's anchor cannot
+   owner's anchor" below). If the target is more than 5% from it, the bot stops following at once; on the
+   second such tick in a row it sets the operator pause, logs and alerts that the owner must restate the anchor. If the owner's anchor cannot
    be determined, the bot does not rebalance (or change the fee).
 5. **Pause control.** If the reference stays unusable (no live venue, or the venues more than 4% apart)
    for 10 minutes, it sets the operator pause; it clears a pause only if it set it itself, after 15
@@ -42,6 +43,7 @@ only part of what the contract would allow.
    the allowance (keeping a reserve) AND inside the rolling cap (at most 60% of the allowance in any 10
    minutes), never past a cap or floor. With a single confirmed venue: a quarter of the allowance per
    tick and 30% in any 10 minutes.
+   The CoinGecko brake can block it (see "CoinGecko brake").
 8. **Fee.** It sets the fee from a simple rule (base fee 100 bps, widened by volatility and when it is
    behind, + 50 bps with a single confirmed venue), clamped to the owner's operator range, with hysteresis.
 
@@ -49,6 +51,106 @@ Every transaction is built by code, previewed in the same tick (the exact notari
 signature, no free credit) and sent only if the preview succeeded. Its intent hash is appended to the
 sent log (`data/owner-pool-bot-sent.jsonl`, `--sent-log`) BEFORE it is submitted, so the watcher can
 tell the bot's operator actions from anyone else's. One JSON line is logged per tick.
+
+## Safety rules added after the review of 23 Nov 2026
+
+The independent review (`docs/review-2026-11-23-bot-review.md`) found the bot not yet safe for mainnet.
+Its findings are fixed as follows; the "Fixes" section of the review names the commits. Pure rules are in
+`packages/core/src/ownerpool-guard.ts` (tested in `packages/core/test/ownerpool-guard.test.ts`), file
+helpers in `packages/core/src/ownerpool-files.ts` (node only, not exported from the package index).
+
+**Start-up (refused with exit 2, logged as `refused` with every problem, and alerted as `start-refused`
+when an alert URL is set; systemd does not restart exit 2):**
+- **Scale (C-1).** On mainnet only `--scale 1` (the default there); `auto` or any other value is refused,
+  in the bot and the watcher. Stokenet keeps `auto` for the TEUR stand-in.
+- **Pair (H-1).** The pool's (`resource_a`, `resource_b`) must be the reference pair in the venues'
+  orientation: mainnet XRD/hUSDC, Stokenet XRD/TEUR (`OWNER_POOL_REFERENCE_PAIRS`). An inverted pool is
+  named as such. Checked at start and on every tick (a mismatch on a tick stops the bot, exit 2).
+- **Explicit identity (H-3).** On mainnet `--pool`, `--badge`, `--key`, `--state` and `--sent-log` must be
+  given: there are no mainnet defaults. Stokenet defaults: the test pool, `data/owner-pool-bot-stokenet-state.json`.
+- **State identity (H-3).** The state file carries `identity: {network, pool, badge, operatorAccount}`; a
+  file without one (every file before this change) or with another is refused: start a fresh one. The
+  watcher's checkpoint carries `{network, pool}` the same way.
+- **Flags (L-2).** Every numeric flag is range-checked (`OWNER_POOL_FLAG_RANGES`; tighter on mainnet, e.g.
+  `--max-anchor-distance` at most 0.1, `--max-tx-per-hour` at most 30, `--venue-hold` at least 300 s), and a
+  flag followed by another flag (`--scale --send`) is an error, not a value. All argument problems are
+  reported together.
+- **Lock (L-1).** `data/locks/owner-pool-bot-<network>-<pool>.lock`, created with O_EXCL, holding the pid
+  and program name; a lock whose pid is gone, or now runs another program, is stale and replaced. Released
+  on every exit. Keyed on the pool, so two bots with different state files cannot run on one pool.
+- **`--send` (M-6).** Needs an alert URL on every network; the start alert is the test and must be
+  delivered (HTTP 2xx), or the bot refuses.
+- **Mainnet `--send` guard.** All of: scale 1; explicit pool, badge, key, state, sent log; no `fixed:`/`file:`
+  venues, no `--exclude-venues(-file)`, no `--owner-anchor` (L-3); CoinGecko among the watch sources (the
+  brake); `OWNER_POOL_PACKAGES.mainnet` not empty; the pool in `MAINNET_SEND_POOLS`
+  (`packages/core/src/ownerpool-guard.ts`, committed, EMPTY: mainnet `--send` is impossible until the owner
+  adds his pool); `--mainnet-live`, a separate acknowledgement. Then, at start: the pool read from the
+  ledger must be of an allow-listed package and the reference pair, and the start alert delivered.
+  Checked before the key is read, so the refusals can be seen with no mainnet key at all.
+
+**While running:**
+- **Median target (H-2).** The target is the median of the last `--reference-median` (3) healthy readings
+  (from the full confirmed venue set) no older than 3 x 3 intervals. With 3, a price pushed on one venue
+  must be held for 2 of 3 ticks (two minutes) before the target follows it, and the first 3 ticks after a
+  start have no target (no rebalance, no fee change). 3 is the smallest odd window that rejects one
+  outlier; 5 would add two more minutes of lag to every real move.
+- **Anchor stop (H-2).** Beyond the anchor distance the bot stops following at once, but pauses the pool
+  only after `--anchor-strikes` (2) ticks in a row: one tick of a moved thin venue can no longer pause it.
+- **CoinGecko brake (H-2, the owner's decision of 23 Nov 2026).** See its own section below.
+- **Halt and cap (M-2).** The operator pause ON and a fee WIDEN are never blocked by the 3-failure halt or
+  the hourly cap. A rebalance failing with "Reserves moved" (a swap raced it, by design harmless) does not
+  count toward the halt; such races have their own limit, `--max-races` (10 in a row), logged as `race`.
+- **Validity and order (M-3).** Each transaction is valid for 2 epochs and `--tx-validity` (120) seconds
+  after the operated network's LEDGER time (`max_proposer_timestamp_exclusive`), so a timed-out send cannot
+  commit 25 minutes later. The bot waits past that validity; a send whose status is still unknown is kept
+  as `pending` in the state file and resolved first on the next tick (committed: its spend enters the
+  rolling window from the ledger event, and a late pause is recorded as the bot's; failed; or expired on
+  the ledger clock plus 30 s). Nothing else is sent while one is pending, so a pause or fee change can
+  never land after a newer one.
+- **Ledger time for quotes (M-4).** Each tick reads the mainnet Gateway's status first; every venue quote
+  takes its ledger time (`proposer_round_timestamp`), and when that is more than `--max-gateway-lag` (120 s)
+  behind, no venue counts (alert `gateway-lag`). The public Gateway measured 9-21 s behind on 23 Nov.
+- **Heartbeat (M-5).** Both processes write `data/heartbeat/owner-pool-{bot,watch}-<network>.json` every
+  tick (`--heartbeat`). `scripts/owner-pool-heartbeat-check.ts`, run every 2 minutes by
+  `deploy/owner-pool-heartbeat.timer` (not installed), alerts `NO HEARTBEAT` when a file is missing,
+  unreadable or older than 600 s, and `Heartbeat back` when it returns. A refusal at start (a corrupt
+  state file with no usable `.bak`, an unreadable key, a stale lock held, a guard condition) is alerted.
+- **Durable state (L-6).** Saved by temp file, fsync, the previous file kept as `.bak`, rename, directory
+  fsync; a corrupt state file falls back to `.bak` (logged `state-recovered`), else the bot refuses.
+- **Target depth (L-4).** Re-read from the reserves whenever the owner changed them (an
+  `OwnerPoolLiquidityEvent` or an owner rebalance in the pool's events, seen by the anchor re-check), so
+  `--side balanced` follows the owner's deposits and withdrawals instead of the depth at first start.
+
+## CoinGecko brake
+
+The owner's decision (23 Nov 2026): CoinGecko becomes a BRAKE, never a price source. Code
+`coingeckoBrake` (`packages/core/src/ownerpool-guard.ts`), tests in `ownerpool-guard.test.ts`.
+
+- **What is tracked.** Only the ratio `on-ledger reference / CoinGecko` (both USD per XRD), on ticks with
+  a healthy reference from the full confirmed set, sampled at most once per `--brake-sample` (300 s), kept
+  for 24 h in the state file (`brake.ratios`, at most 288). Its **normal** is the median of those ratios.
+  On 23 Nov the ratio was about 0.972 (CoinGecko 2.8% above the one live venue): a steady premium like
+  that is learned, not braked. Every healthy ratio enters the normal, braking or not, so a lasting real
+  divergence is learned after about 12 h; a manipulation would have to be held that long.
+- **When it brakes.** The current ratio is more than `--brake-max-deviation` (2%) from the normal. Until
+  the normal has `--brake-min-readings` (12, one hour at the default sampling) the normal is 1 (parity)
+  and only the 15% alarm threshold (`--brake-warmup-deviation`) brakes.
+- **What it does.** No rebalance on that tick; the fee step runs with narrowing blocked (it may widen),
+  as in a hold. Logged on every tick (`brake: {braking, mode, ratio, normal, deviation, threshold}`,
+  decision `BRAKE: ...`); alerted once per episode (`coingecko-brake`), the key cleared when the ratio is
+  back inside.
+- **It never pauses the pool.** A brake that lasts (10 minutes, an hour) only keeps blocking rebalances;
+  the pool keeps trading at its current curve and fee. Pausing remains the reference's (unhealthy for 10
+  minutes) and the anchor's (2 ticks beyond 5%) rules.
+- **CoinGecko unavailable or stale** (an error, or its own `last_updated_at` older than 15 minutes): no
+  brake signal, and an episode in progress ends. Trading continues on the on-ledger median and the
+  two-tick protections (the owner's preference: a CoinGecko outage must not stop the pool); logged as
+  `mode: unavailable`, alerted `coingecko-unavailable` after one hour.
+- **Never a price.** CoinGecko enters no reference, target, history or amount: `coingeckoBrake` returns
+  only a decision, and a test reads the bot's source to check that the target, the history and
+  `decideRebalance` take no watch value.
+- On mainnet `--send` requires CoinGecko among the watch sources. With synthetic venues (drills) the
+  ratio is meaningless and the brake is off.
 
 ## The owner's anchor (from the ledger)
 
@@ -94,8 +196,8 @@ anchor 1250:1), skipping the later operator rebalances (which moved the ledger a
 npx tsx scripts/owner-pool-bot.ts --once
 npx tsx scripts/owner-pool-bot.ts                 # keeps running; Ctrl-C or SIGTERM stops it after the current tick
 
-# really send, on Stokenet only
-npx tsx scripts/owner-pool-bot.ts --send
+# really send, on Stokenet (an alert URL is required; its start alert must be delivered)
+npx tsx scripts/owner-pool-bot.ts --send --alert-url http://127.0.0.1:18941/bot
 
 # a fixed reference already in pool units (tests and drills): synthetic venues
 npx tsx scripts/owner-pool-bot.ts --once --scale 1 --venues fixed:0.0008,fixed:0.0008
@@ -114,16 +216,20 @@ It needs the operator key in `data/stokenet-owner-pool-operator.key` (`--key`), 
 in that account (`--badge`), and the pool (`--pool`); the defaults are the Stokenet test pool's.
 The key is read at start and never printed. The bot has no owner key.
 
-`--send` on any network other than Stokenet is refused in code, whatever the other flags say. Running
-it for a mainnet pool needs the owner's explicit go-ahead and a code change.
+`--send` on mainnet is refused unless every condition of the mainnet guard holds (above); today two of
+them cannot hold (`MAINNET_SEND_POOLS` and `OWNER_POOL_PACKAGES.mainnet` are empty), so it is refused
+whatever the flags say. Running it for a mainnet pool needs the owner's go-ahead AND a committed code
+change listing his pool.
 
-State lives in `data/owner-pool-bot-state.json` (`--state`; `data/` is gitignored): the reference
+State lives in `data/owner-pool-bot-stokenet-state.json` on Stokenet (`--state`, required on mainnet;
+`data/` is gitignored): its identity, the reference
 history (6 h, for volatility), the scale calibration, the target depth, the time of the last fee
 change, the send times of the last hour, the pause bookkeeping, the failure counter, the owner's
 anchor statement read from the ledger, the "behind" counter, the alert rate limiter, the live
 venue set with any running venue-set hold, the confirmed venue set with its two-tick streak counters
-(`venueConfirm`), and the current single-venue episode (`singleVenue`). A lock file
-next to it stops a second bot from running on the same state.
+(`venueConfirm`), the current single-venue episode (`singleVenue`), the CoinGecko brake (`brake`), the
+target depth and the owner reserve change it was taken after (`depth`, `ownerReserveChange`), the
+anchor strikes, the race counter and any unresolved send (`pending`). The lock is per pool, in `data/locks/`.
 
 ## Reference price
 
@@ -357,16 +463,22 @@ fix it.
 | reserve (`--reserve-fraction`) | 10% of one full budget never spent | an always-available slice for a sudden move |
 | minimum move (`--min-move`) | 3 bps of price | smaller moves are not worth a transaction (~0.5 XRD each) |
 | side (`--side`) | balanced | removal (reserves to inventory) costs only its price move, an addition about 1.5x (price plus depth); `balanced` removes while the curve is deeper than its depth at the bot's first start and adds from inventory while it is shallower, so the curve neither shrinks to its floors nor fills to its caps over time. Whichever candidate closes more of the gap wins; the preferred one wins within 1 bps |
-| target depth (`--target-depth`) | sqrt(Ra*Rb) at first start (state file) | the curve size the owner set up |
+| target depth (`--target-depth`) | sqrt(Ra*Rb), re-read after every owner reserve change (state file) | the curve size the owner set up, including later deposits and withdrawals (review L-4) |
+| reference median (`--reference-median`) | 3 healthy readings | a one-tick manipulation is never the target (review H-2); at least 3 on mainnet |
+| anchor strikes (`--anchor-strikes`) | 2 ticks | one tick of a moved venue cannot pause the pool (review H-2) |
+| CoinGecko brake (`--brake-max-deviation`, `--brake-min-readings`, `--brake-warmup-deviation`, `--brake-sample`) | 2%; 12; 15%; 300 s | the owner's decision; see "CoinGecko brake" |
+| Gateway lag (`--max-gateway-lag`) | 120 s | quotes from an older ledger are not the market (review M-4) |
+| validity (`--tx-validity`) | 2 epochs and 120 s of ledger time | a timed-out send must not commit minutes later (review M-3) |
+| races (`--max-races`) | 10 in a row | a swap racing a rebalance is normal on a traded pool (review M-2) |
 | max anchor distance (`--max-anchor-distance`) | 5% from the OWNER's anchor | the design's loss bound grows with how far the curve may be from a stated anchor (D); 5% is the distance the design's tables treat as a stale anchor. Beyond it the owner, not the bot, decides the price |
 | anchor resume (`--anchor-resume-factor`) | 0.8 (within 4%) | hysteresis, so the bot does not pause and resume on every tick near the boundary |
 | owner anchor | the ledger's last `OwnerPoolAnchorEvent` | the owner's own statement, not a copy that can go stale; `--owner-anchor A:B` only as a fallback (see above) |
 | anchor re-check (`--anchor-recheck`) | 300 s | a restatement is noticed within five minutes; incremental, so cheap |
-| alert URL (`--alert-url`, env `OWNER_POOL_BOT_ALERT_URL`) | none: nothing sent | see "Alerts" |
+| alert URL (`--alert-url`, env `OWNER_POOL_BOT_ALERT_URL`) | none: nothing sent (REQUIRED with `--send`) | see "Alerts" |
 | alert interval (`--alert-interval`) | 3600 s per condition | one message per problem per hour is noticed without flooding a phone |
 | behind alert (`--alert-behind-ticks`) | 10 ticks in a row | ten minutes of not catching up is no longer noise |
 | tick-error alert (`--alert-error-ticks`) | 3 in a row | the back-off has started |
-| sent log (`--sent-log`) | `data/owner-pool-bot-sent.jsonl` | the watcher compares operator actions on ledger with it |
+| sent log (`--sent-log`) | `data/owner-pool-bot-sent.jsonl` on Stokenet; required on mainnet | the watcher compares operator actions on ledger with it; created empty at start |
 | base fee (`--base-fee`) | 100 bps | the owner's decision: the on-ledger venues quote 0.2-6.5% round trips at 1,000 XRD, so 30 bps left the pool far the cheapest place to trade against a possibly stale price. On mainnet the owner sets an operator fee range of about 50-200 bps at pool set-up. The Stokenet test pool's range is 10-100 bps, so there the fee sits at 100 (clamped; see below) |
 | volatility multiplier (`--vol-multiplier`) | 2 | the fee should cover about a two-sigma move of the reference between two ticks (the curve is stale for up to one tick) |
 | volatility window (`--vol-window`) | 1 h | recent enough to react, long enough to be a measure |
@@ -376,7 +488,7 @@ fix it.
 | narrow after (`--narrow-interval`) | 900 s since the last change | calm must last before the spread comes back in |
 | fee range | the owner's [min, max] (10-100 bps on Stokenet) | the contract refuses anything else; with a single-value range the bot never touches the fee. The rule's target is clamped into the range and the log line says `clamped: max of the operator range ...`; once the fee IS the clamped target nothing is attempted (no tick after tick of refused changes), and a change that failed (preview refused or send failed) is not retried for the same fee within `--narrow-interval` |
 | tx cap (`--max-tx-per-hour`) | 12 | about three times what a busy hour needs (one rebalance and a fee change every 15 min); a bug cannot burn fees or budget fast |
-| failure halt (`--max-failures`, `--halt`) | 3 failed sends in a row: no sends for 1 h | a contract or ledger problem should stop it, not loop it |
+| failure halt (`--max-failures`, `--halt`) | 3 failed sends in a row: no sends for 1 h, except the protective pause and fee widening | a contract or ledger problem should stop it, not loop it; it must not stop the bot protecting the pool |
 | fee lock (`--fee-lock`) | 5 XRD | previews measure 0.37-0.51 XRD per bot transaction |
 | `--no-fee` | off | to run the bot without fee control |
 
@@ -406,7 +518,7 @@ checks its own distance against the OWNER's stated anchor, not the ledger's.
 
 ## Alerts
 
-Optional: `--alert-url <url>` or env `OWNER_POOL_BOT_ALERT_URL`. Each alert is a plain HTTP POST of a
+`--alert-url <url>` or env `OWNER_POOL_BOT_ALERT_URL`; optional in a dry run, required with `--send`. Each alert is a plain HTTP POST of a
 short text body (at most 1,000 characters, `content-type: text/plain`), so an ntfy topic URL
 (`https://ntfy.sh/<topic>`) works as is. Nothing is sent when neither is set. The URL is never logged
 (the start line shows `alertUrl: "(set)"`); each tick's log line lists the alerts raised and whether
@@ -415,12 +527,16 @@ timeout); an alert that could not be delivered is retried on the next occurrence
 
 | Key | When |
 |---|---|
-| `start`, `stop` | the loop starts / stops (not with `--once`). NEVER rate-limited: every restart, a crash loop included, is reported |
+| `start`, `stop` | the loop starts / stops (not with `--once` unless `--send`). NEVER rate-limited: every restart, a crash loop included, is reported. With `--send` the start alert must be delivered |
+| `start-refused` | the bot refused to start (every problem listed). Never rate-limited |
+| `coingecko-brake` | the CoinGecko brake engaged: no rebalance until the ratio is back inside (once per episode) |
+| `coingecko-unavailable` | CoinGecko unavailable or stale for over an hour: the brake has no signal |
+| `gateway-lag` | the mainnet Gateway's ledger is more than `--max-gateway-lag` behind: no venue counts |
 | `pool-pause`, `pool-unpause` | the bot set or cleared the operator pause (with the txid, or "previewed only" in a dry run) |
 | `anchor-stop` | the reference is beyond `--max-anchor-distance` from the owner's anchor: the owner must restate it |
 | `anchor-restated` | the ledger shows a new owner anchor statement (never rate-limited since 23 Nov 2026: each restatement zeroes the allowance; a correction minutes later was suppressed before) |
 | `anchor-unknown` | the owner's anchor cannot be read from the ledger (and whether the flag is used instead) |
-| `halt` | `--max-failures` sends failed in a row: sending stops for `--halt` seconds |
+| `halt` | `--max-failures` sends failed in a row (or `--max-races` "Reserves moved" races): sending stops for `--halt` seconds, except the protective pause and fee widening |
 | `reference-unhealthy` | the on-ledger reference has been unusable (no live venue, or the venues more than 4% apart) for longer than `--pause-after` |
 | `single-venue` | only one venue is confirmed live: trading cautiously (once per episode; cleared when two or more are confirmed) |
 | `venue-hold` | the set of live venues changed: holding position for `--venue-hold` (which venues dropped / came back) |
@@ -441,7 +557,16 @@ listener on 127.0.0.1 during the soak (below). No real URL has been used.
 
 `scripts/owner-pool-watch.ts` follows the pool's own events and alerts (same sink, same flags and env
 variable) on what the audits call the theft pattern and on anything the owner should see. It holds no
-key, signs nothing, and does not depend on the bot: run it where the operator key is not. Rules in
+key, signs nothing, and does not depend on the bot: run it where the operator key is not.
+
+**On mainnet** it needs `--pool`, `--state` and an alert URL, scale 1 only, and the bot's sent log
+(`--bot-sent-log`, which must exist: the bot creates it at start). Without the log it refuses, unless
+`--no-sent-log` is given: the `not-bot` rule is then OFF, and the start line (`not-bot-rule`) and the start
+alert say so. **The sent log is not trustworthy against a thief on the bot's host**: whoever stole the
+operator key from that machine can append his own txids to the log before submitting. The behavioural
+rules below (`move-away`, `fee-outside-rule`) and the spend rules do not use the log and are the real
+theft detection; `not-bot` only catches a second key holder who cannot write that file (e.g. the watcher
+reads a copy shipped append-only from the bot's host). Rules in
 `packages/core/src/ownerpool-watch.ts`, tested in `packages/core/test/ownerpool-watch.test.ts`.
 
 ```
@@ -453,11 +578,14 @@ npx tsx scripts/owner-pool-watch.ts --once --replay       # the pool's whole his
 |---|---|---|---|
 | `large-spend` | alert | one operator `rebalance` spends more than this share of the allowance available before it (cost / (cost + allowance after), both from the event) | 60% (`--max-spend-share`); the bot never spends more than 50% |
 | `window-spend` | alert | operator moves within any 10 minutes (event times), two or more, spent more than this share of the allowance available when the first was made (sum of costs / (sum + allowance after the last)) | 60% (`--max-window-spend`, `--spend-window`), the bot's own cap. Catches a thief copying the bot's "half, then half": on the Stokenet history it flags the first soak's 18:58-18:59 pair (74.3%) |
-| `spend-24h` | alert | operator budget spent in the last 24 h (event times) above this many full budgets | 1 budget (`--max-spend-24h`); up to 2 can refill in 24 h at 72 epochs |
+| `spend-24h` | alert | operator budget spent in the last 24 h (event times) above this many full budgets | 1 + 24 h / (window_epochs x `--epoch-sec` 301): the full allowance plus a day of refill, so the bot's legitimate use never alarms (3 budgets at 144 epochs on mainnet, about 5 on Stokenet's 72); `--max-spend-24h` overrides |
+| `move-away` | alert, never rate-limited | an operator `rebalance` (from its event: reserves after, minus the move) that leaves the pool further than `--move-tolerance` (10 bps) from the watcher's reference now AND from its median of 3 than it was. The bot only moves toward its target, so this is never the bot's. Live only (not in a replay) | needs no sent log |
+| `move-unhealthy` | warn | an operator `rebalance` while the watcher's own reference is unusable | |
+| `fee-outside-rule` | alert, never rate-limited | an operator fee change outside what the bot's fee rule can produce now: below the base fee (less 10 bps), or above base + 2 x vol x 2 (the watcher's own volatility measure, doubled) + behind + single-venue add + 10 bps, clamped to the operator range (the range's top while the venues disagree). `--bot-base-fee` etc. must match the bot's flags | needs no sent log |
 | `operator-change` | alert | `OwnerPoolOperatorEvent` names a different operator (appointed, replaced, revoked) | |
 | `limits-change` | alert | `OwnerPoolOperatorEvent` carries operator limits that differ from the last known (`set_operator_limits`, or a re-appointment with new limits): lists each changed field | baseline from the pool's state at a live start |
-| `not-bot` | alert | an operator action (operator `rebalance`, `operator_set_fee`, `set_operator_paused` proved with the operator badge) whose intent hash is not in the bot's sent log; `info` for actions older than the log | `--bot-sent-log` |
-| `fee-change` | warn (operator) / info (owner) | the fee in `OwnerPoolConfigEvent` changed | |
+| `not-bot` | alert | an operator action (operator `rebalance`, or a fee or operator-pause change not made by the owner) whose intent hash is not in the bot's sent log; `info` for actions older than the log | `--bot-sent-log` |
+| `fee-change` | warn (operator) / info (owner) | the fee in `OwnerPoolConfigEvent` changed. The owner's only when the manifest PROVES the owner badge (`create_proof_of_amount`/`_non_fungibles` on it); anything else, a call through another component included, is the operator's (review M-1) | |
 | `pause-change` | warn | the owner's or the operator's pause flag changed | |
 | `anchor-restated` | info | `OwnerPoolAnchorEvent` | |
 | `anchor-drift` | warn | the owner's anchor is this far from the reference (mapped onto the pool) | 5% (`--max-anchor-drift`) |
@@ -468,11 +596,16 @@ still logged), except `limits-change` and `operator-change`, which alert every t
 each is a separate owner act, and on Stokenet a limits change reversed minutes later would otherwise
 have gone unalerted). Code: `watchAlertMode` (pure, tested). `info` findings are never alerted.
 
-Who called a method is read from the transaction's manifest (the methods it calls on the pool and the
-badges it names); the operator badge in force is the last one the pool announced. The reference is
+Who changed the fee or the operator pause is decided by proof: the owner only when the root manifest
+proves the owner badge from an account; otherwise the operator, whatever component made the call
+(review M-1). The operator badge in force is the last one the pool announced. A replay from the pool's
+first transaction starts from a fresh pool's configuration (unpaused, no operator: instantiate emits no
+config event), so the owner's first pause after instantiation and the first appointment are reported. The reference is
 the bot's (on-ledger venues, `--venues`, `--quote-size`; drift is checked only while they agree); with `--scale auto` the watcher takes the bot's calibration from
 `--bot-state` when it matches the owner's anchor, else calibrates itself to the anchor. Its checkpoint
-(next state version, last config, the operator limits, the 24 h spends, the owner's anchor) is `data/owner-pool-watch-state.json`.
+(identity, next state version, last config, the operator limits, the 24 h spends, the owner's anchor, its
+own recent references) is `data/owner-pool-watch-stokenet-state.json` on Stokenet (`--state`, required on
+mainnet); a replay never writes it.
 `warn` and `alert` findings are sent (rate-limited per rule); `info` is only logged.
 
 What it flagged on the Stokenet history (replay, 22 Nov 2026): see "Soak test" below.
@@ -995,6 +1128,57 @@ inventory 1,672.003 XRD / 1.238127 TEUR, **fee 30 bps, both pauses off**, operat
 anchor 1250:1, limits 300 bps / 72 epochs, caps 22000 / 17.6, floors 10000 / 8, fee range 10-100,
 allowance 0.00167 (refilling).
 
+## Soak 9 on Stokenet (23 Nov 2026, 12:45-13:35 UTC, code afd52e2): the review fixes and the CoinGecko brake
+
+Real bot (`--send`) and watcher on the test pool, mainnet only read; alerts to a local listener on
+127.0.0.1:18941 (`/bot`, `/watch`, `/hb`, `/guard`). A FRESH state file (`data/soak/s9-state.json`: the
+identity check refuses every older one). Drivers `data/soak/run9.sh` and `run9b.sh`, logs
+`data/soak/run9-A.log`, `run9-B2.log`, `run9-C2.log`, `watch9.log`, phases `phases9.txt`, alerts
+`alerts9.jsonl`, heartbeat check `hb9.log`, balances `balances9.txt`. TEST flags: `--brake-sample 60` (the
+brake's normal fills in 12 minutes, not an hour); phase B forces the brake. Bot ticks 60 s, watcher 30 s.
+
+- **A (12:45-13:13, defaults):** start alert delivered (required with `--send`). Ticks 1-2: no target,
+  "warming up: 1 (2) of 3 healthy reference readings" (median of 3, H-2). Tick 3: gap 35 bps, rebalance
+  `removeB` 0.032344 TEUR (clipped to the single-venue spendable 0.00208; cost on ledger 0.0020833)
+  `txid_tdx_2_1ypqpdnjtcl026fe5rvwt5q9x4y2st07peqv7rd7es7a75edeaqusryd8eh`, and fee 30 -> 100
+  `txid_tdx_2_1jhgnljw4d9wwz8vdyndcp35jl0x7k4ck80v66fj4dlyv0g5u7k7sptugte`, both committed inside their
+  2-epoch / 120 s validity. The watcher saw both: the fee as `fee-change` (warn, as designed), the
+  rebalance with no finding: no `move-away` (it moved toward the reference), no `fee-outside-rule` (100 in
+  its bounds 90-100), no `not-bot`. A second bot on the same pool with ANOTHER state file was refused by the
+  lock (12:49:41, alerted `start-refused`). The heartbeat check found both processes alive. Alice sold 300
+  XRD (`txid_tdx_2_1fkwt3l3...`): gap 295 bps, and the bot could not move: "no move fits", because an
+  operator move's cost is measured from the ledger anchor (its own last price, 0.0008012) and the
+  spendable part of the allowance (about 0.002) is less than that distance (3%). That is the contract's
+  budget at work, as in the failure-path test 4: `behind` alerted after 10 ticks. The brake's normal filled
+  at tick 13 (`mode: normal`, ratio 0.9771 to 0.9772, deviation under 0.01%: no brake).
+- **The first driver's mistake:** it stopped the bot by signalling the `npx` wrapper, which does not pass
+  SIGTERM on; the phase A bot ran on to 13:13, and the B and C bots were refused by its lock (13:03:54,
+  13:13:30, alerted): the lock doing its job. A second driver signals the bot's own process. Alice's
+  second sale (13:06, `txid_tdx_2_1te2hdzye...`) happened under the phase A bot (behind); the watcher
+  alerted `pool-drift` 6.1% and its clearing later.
+- **B2 (13:15-13:24, brake forced: TEST `--brake-min-readings 100 --brake-warmup-deviation 0.01`):** warm-up
+  mode with parity as the normal, the ratio 0.9776 is 2.29% from it, over the 1% test threshold: every
+  tick `BRAKE: ... no rebalance`, the fee step ran with narrowing blocked (fee stayed 100), ONE
+  `coingecko-brake` alert for the episode (13:15:43), no pause. Alice bought back with 0.4 TEUR
+  (`txid_tdx_2_1lhd0ffze...`): gap 610 -> 71 bps, still braked, no rebalance.
+- **C2 (13:24-13:33, defaults again):** brake `normal` from the 37 ratios gathered since A, deviation under
+  0.01%: released. Gap 71 bps over the 50 bps dead band but again "no move fits" (the ledger-anchor cost,
+  as above): `behind`, no send.
+- **After:** the heartbeat check with `--max-age 60`, 71 s after the bot stopped: `NO HEARTBEAT:
+  owner-pool-bot (stokenet) last beat 71 s ago`, alerted; the watcher's alive. A copy of the state file cut
+  short loaded from its `.bak` (`state-recovered`); with the `.bak` broken too the bot refused and alerted
+  (`data/soak/corrupt9.log`). The watcher ran 94 ticks with no error; every bot transaction was in its
+  sent log. No tick error, no race, no unresolved send, the mainnet Gateway 2-21 s behind (never over 120).
+- **Pool left at** (state version 35113315): reserves 19,466.729 XRD / 15.463664 TEUR (price 0.00079437),
+  inventory 1,672.003 XRD / 1.270471 TEUR, **fee 30 bps** (owner `set_fee 30`,
+  `txid_tdx_2_1jqmxnkwferd56jver0u33gwx46mezx7lq6enstmszrqqzhnxkkqqeqzlm3`), **both pauses off**, operator
+  badge 2. Cost: operator 175.5503 -> 174.6511 XRD (2 transactions), owner 0.38 XRD (the fee restore),
+  alice 7197.61 -> 7107.77 XRD (600 XRD sold, 0.4 TEUR sold back, fees).
+
+Not seen on ledger in this soak (unit-tested): a "Reserves moved" race, an unresolved send, a lagging
+Gateway, the `move-away` and `fee-outside-rule` alerts, the brake in `normal` mode (the market did not
+move 2% against CoinGecko), a rebalance after a trade (the ledger-anchor cost blocked it both times).
+
 ## Not done, not tested, open
 
 - **The on-ledger venues barely move, so the reference barely moves.** Between trades a pool's
@@ -1003,9 +1187,10 @@ allowance 0.00167 (refilling).
   side was emptied by a trade at about 21:09 and it could no longer quote), and only DefiPlaza's (dropped)
   quotes drifted continuously. An executable quote is a real price, but on this pair it is often a price
   nobody is trading at: the bot will follow the pools, not the wider market. In the first soak CoinGecko
-  moved 0.000786 -> 0.000810 while the pools stood still. The CoinGecko watch alert (15%) is the only
-  signal that the venues have gone stale relative to the market. Whether that is acceptable for mainnet
-  is the owner's call.
+  moved 0.000786 -> 0.000810 while the pools stood still. Since 23 Nov the CoinGecko brake stops
+  rebalancing when the reference moves more than 2% against CoinGecko relative to their usual ratio, but
+  nothing makes a frozen venue follow the market: a venue that stands still while CoinGecko moves 2%
+  brakes the bot (no rebalance) rather than steering it.
 - **Thin venues come and go.** CaviarNine held under 1 hUSDC on its bid side all evening and from 21:09
   could not quote even 100 XRD; when it dropped out, the reference jumped from 0.000815 to 0.000799
   (-2.0%) because the remaining weight was mostly Ociswap basic. Now handled by the 1% fee rule (Ociswap
@@ -1028,15 +1213,20 @@ allowance 0.00167 (refilling).
   own Gateway or fewer venues.
 - **Alerts** were only sent to a local listener on 127.0.0.1; no ntfy topic or other real URL has been
   tried.
-- **Watcher**: the `not-bot` comparison reads the bot's sent log from the same disk, so it only works
-  where the watcher can read that file; run elsewhere, it needs the log shipped to it (not done). It
-  classifies callers from the root manifest (methods called on the pool, badges named): a call made
-  through another component, or from a subintent, is seen by its events (rebalance, config) but not
-  attributed. Drift checks need the venues to agree. `limits-change` was seen on ledger on 23 Nov (case 5 of
+- **Watcher**: the `not-bot` comparison reads the bot's sent log, so it only works where the watcher can
+  read that file; run elsewhere, it needs the log shipped to it (not done; on mainnet the watcher refuses
+  to start without it unless `--no-sent-log`). A log on the bot's host can be forged by a thief there.
+  Fee and operator-pause changes are attributed by proof of the owner badge (a call through another
+  component is the operator's); an owner acting through a subintent or an access controller whose
+  manifest does not `create_proof_of_*` the badge would be reported as the operator (a false alarm, not a
+  miss). The behavioural rules use the watcher's reference at the tick that sees the move (up to one
+  interval later), not the one at the move. Drift checks need the venues to agree. `limits-change` was seen on ledger on 23 Nov (case 5 of
   the failure-path tests).
 - The bot's own sends are recorded before submission; a send whose submission then fails leaves a
   txid in the log that never reaches the ledger (harmless).
-- Not tested on ledger: a swap racing a rebalance; the `venue-hold-restart` alert (unit-tested only).
+- Not tested on ledger: a swap racing a rebalance ("Reserves moved", now outside the halt), a send left
+  unresolved past its validity (the `pending` path), a Gateway lag beyond 120 s, and the `move-away` and
+  `fee-outside-rule` alerts (no thief was simulated); the `venue-hold-restart` alert. All unit-tested.
   A Gateway outage, the 3-failure halt, an anchor restatement, the `behind` alert and a limits change
   were run on ledger on 23 Nov (see "Failure-path tests on the ledger").
 - Only a price from the full confirmed set enters the volatility history: `trade` ticks and `hold`
@@ -1048,5 +1238,9 @@ allowance 0.00167 (refilling).
   the first tick of Soak 6 (spendable a quarter of the allowance, window 30%), where the move fitted.
 - Volatility is measured from the bot's own samples, so after a restart with an old or empty history
   it starts from zero for the window.
-- Mainnet: refused in code. No mainnet pool exists; the bot has never seen one.
+- Mainnet: `--send` refused in code (the allow-list and the package list are empty). No mainnet pool
+  exists; the bot has never seen one. The review's other suggestions not taken: a minimum depth per venue
+  below which it cannot be the only venue, and `minVenues` above 1 (H-2 points 4-5; only one venue
+  qualifies today, so either would stop the bot); spends in the rolling window are taken from the bot's
+  own committed (and late-committed) sends, not re-read from the pool's events.
 - Profit sweeping (free proportional decreases) is not done.

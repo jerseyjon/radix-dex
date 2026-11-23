@@ -41,8 +41,9 @@ Stokenet run, `docs/review-2026-11-21/owner-pool-split-stokenet.md`.
 | **Window** | 144 epochs (12 h) | Mainnet epochs measured 5.02 minutes on 23 Nov 2026 (Stokenet 5.03). The design's 72 epochs assumed ~10-minute epochs; 144 keeps the same 12 h. A shorter window refills the budget faster, which helps the bot and a thief equally |
 | **Caps / floors** | Caps = reserves +10%, floors = 50% of reserves (the script's defaults, computed from the pool when `limits` runs) | Design Q2/Q3: the operator cannot grow the curve past what the owner put there, nor shrink it below half |
 | **Sweep the fees?** | Not at first | Swap fees stay in the reserves and deepen the curve. Taking them out is an owner `withdraw` of a proportional amount (`withdraw --a <XRD>`, B computed so the price does not move). The bot's `--side balanced` steers back towards the depth at its first start, so frequent sweeps are not needed |
-| **Alerts** | The existing valwatch ntfy topic (owner's choice) | Its URL is not in this repository (section 2). Note the review's warning: anyone who knows an ntfy.sh topic name can read and post to it |
-| **Where the bot runs** | Owner's call (the DEX server box is the obvious place) | The operator key lives there. The watcher should ideally run elsewhere |
+| **Alerts** | The existing valwatch ntfy topic (owner's choice) | Its URL is not in this repository (section 2). REQUIRED: the bot refuses `--send` without one and without a delivered start alert, and the mainnet watcher refuses to start without one. Note the review's warning: anyone who knows an ntfy.sh topic name can read and post to it |
+| **CoinGecko brake** | On (the owner's decision, 23 Nov 2026) | Never a price: when the ratio on-ledger reference / CoinGecko moves more than 2% from its 24 h median, the bot does not rebalance; it never pauses the pool for it. Mainnet `--send` refuses to run without CoinGecko watched. `docs/owner-pool-bot.md`, "CoinGecko brake" |
+| **Where the bot runs** | Owner's call (the DEX server box is the obvious place) | The operator key lives there. The watcher and the heartbeat check should ideally run elsewhere; the watcher then needs the bot's sent log shipped to it, or `--no-sent-log` (its `not-bot` rule off, said at start). A sent log on the bot's host can be forged by a thief on that host; the watcher's behavioural rules do not depend on it |
 
 ## 2. Prerequisites
 
@@ -121,7 +122,7 @@ bot is installed, in its dry run (`journalctl --user -u owner-pool-bot`).
 | 9 | `appoint --anchor market` (or `--anchor 1:<hUSDC per XRD>`) `--operator-account <acct> --fund 20` | `NN-appoint.rtm` | operator = the new badge, anchor as stated (the allowance starts at 0 and refills over the window); the badge and 20 XRD in the operator account |
 | 10 | install and start the bot and the watcher in DRY RUN (section 5) | nothing | the bot's start line `venue-guard` ok; each tick reads the owner's anchor from the ledger, the reference, a decision; previews succeed |
 | 11 | `unpause` | `NN-unpause.rtm` | owner pause off; the router quotes the pool once it is listed |
-| 12 | going live: the code change in section 5, then `OWNER_POOL_BOT_FLAGS=--send` | nothing | the bot's first rebalance and fee change on ledger; the watcher shows them as the bot's (not `not-bot`) |
+| 12 | going live: the committed allow-list change in section 5, then `OWNER_POOL_BOT_FLAGS=--send --mainnet-live` | nothing | the bot's start alert arrives (it refuses otherwise); its first rebalance and fee change on ledger; the watcher shows them as the bot's (no `not-bot`, `move-away` or `fee-outside-rule`) |
 
 Later, as needed: `deposit`, `withdraw`, `withdraw-inventory`, `anchor` (restate when the market moved
 more than 5% and the bot paused itself; zeroes its allowance), `fee`, and
@@ -143,13 +144,14 @@ Units (not installed): `deploy/owner-pool-bot.service`, `deploy/owner-pool-watch
 ```
 install -d -m 700 ~/.config/radix-dex
 install -m 600 deploy/owner-pool.env.example ~/.config/radix-dex/owner-pool.env   # fill in: alert URL, pool, operator badge
-cp deploy/owner-pool-bot.service deploy/owner-pool-watch.service ~/.config/systemd/user/   # adjust WorkingDirectory
+cp deploy/owner-pool-bot.service deploy/owner-pool-watch.service deploy/owner-pool-heartbeat.service deploy/owner-pool-heartbeat.timer ~/.config/systemd/user/   # adjust WorkingDirectory
 systemctl --user daemon-reload
-systemctl --user enable --now owner-pool-watch owner-pool-bot
+systemctl --user enable --now owner-pool-bot owner-pool-watch owner-pool-heartbeat.timer   # the bot first: it creates the sent log the watcher requires
 journalctl --user -u owner-pool-bot -f
 ```
 
-The bot runs `--network mainnet --scale 1 --base-fee 50` with the operator key, and **in dry run**
+The bot runs `--network mainnet --scale 1 --base-fee 50` with the operator key (the watcher with
+`--bot-base-fee 50`, so its `fee-outside-rule` bounds match), and **in dry run**
 while `OWNER_POOL_BOT_FLAGS` is empty: it reads, decides, previews every transaction it would send,
 logs one JSON line per tick, and sends nothing. Before going live, check in its log:
 
@@ -157,30 +159,51 @@ logs one JSON line per tick, and sends nothing. Before going live, check in its 
 - `ownerAnchor` = the anchor stated at step 9, `distance` small;
 - `decision` reasonable for the gap between the pool and the reference, and its previews succeeding;
 - `fee.target` within the range (expect 100 with one venue);
+- `referenceMedian` warmed up (3 readings) and `brake.mode` going from `warmup` to `normal` after an
+  hour, `brake.ratio` steady (about 0.97 on 23 Nov), `mainnetGateway.lagSec` well under 120;
+- the heartbeat files in `data/heartbeat/` refreshed every minute, and `journalctl --user -u
+  owner-pool-heartbeat` showing `alive: true`;
 - no `refused` or tick errors.
 
 A one-off check by hand, same flags: `npx tsx scripts/owner-pool-bot.ts --once --network mainnet
 --pool <pool> --badge <operator badge> --key data/mainnet-owner-pool-operator.key --scale 1 --base-fee 50
 --state data/owner-pool-bot-mainnet-state.json --sent-log data/owner-pool-bot-mainnet-sent.jsonl`.
 
-**The guard.** `scripts/owner-pool-bot.ts` (lines 84-89 on 23 Nov 2026) exits with `refused` if
-`--send` is given on any network but Stokenet. Going live needs a code change, made only on the
-owner's explicit go-ahead (described, not made here):
+**The guard** (since 23 Nov 2026, the review's conditions; `sendGuardProblems` in
+`packages/core/src/ownerpool-guard.ts`). `--send` with `--network mainnet` is refused, before any key is
+read, unless ALL of these hold; every unmet one is listed in the `refused` line and in a `start-refused`
+alert:
 
-- move the check after `cfg` is built and allow `--send` on mainnet only for a pool named in a
-  committed allow-list, e.g. `const MAINNET_SEND_POOLS: string[] = []` in the bot, filled with the
-  one pool address the owner approved, so a flag alone can never make it send for another pool;
-- keep refusing every other network/pool combination, and log the allow-list check on the start line;
-- on mainnet require `--key`, `--badge` and `--pool` explicitly (the defaults are the Stokenet test pool's).
+1. scale 1 (`--scale` absent or 1; `auto` is refused on mainnet even in a dry run);
+2. `--pool`, `--badge`, `--key`, `--state` and `--sent-log` given explicitly (no mainnet defaults; also
+   required for a mainnet dry run);
+3. no test inputs: no `fixed:`/`file:` venues, no `--exclude-venues(-file)`, no `--owner-anchor`;
+4. CoinGecko among the watch sources (the brake);
+5. an alert URL, and then a delivered start alert;
+6. `OWNER_POOL_PACKAGES.mainnet` lists the audited package (empty today);
+7. the pool is in `MAINNET_SEND_POOLS` in `packages/core/src/ownerpool-guard.ts` (empty today), a committed
+   allow-list, so a flag alone can never make it send for another pool;
+8. `--mainnet-live`, a separate acknowledgement, so a copied Stokenet command line cannot reach mainnet by
+   changing `--network` alone.
 
-Then set `OWNER_POOL_BOT_FLAGS=--send` in the env file and `systemctl --user restart owner-pool-bot`.
+At start it then reads the pool: it must be an `OwnerPool` of an allow-listed package, with resource_a XRD
+and resource_b hUSDC (the venues' orientation), and the state file must carry this network, pool, badge
+and operator account (a state file from Stokenet, or from before this change, is refused). Numeric flags
+are range-checked, tighter on mainnet.
+
+Going live, on the owner's explicit go-ahead: add the pool's address to `MAINNET_SEND_POOLS` and the
+package to `OWNER_POOL_PACKAGES.mainnet` (step 3) in one reviewed commit, deploy it, set
+`OWNER_POOL_BOT_FLAGS=--send --mainnet-live` in the env file and `systemctl --user restart owner-pool-bot`.
+The refusals were run on 23 Nov 2026 with no mainnet key (`data/soak/guard9.log`; see section 10).
 
 ## 6. Emergency stop
 
 Fastest first:
 
-1. **The bot stops itself**: on `--max-anchor-distance` (5%), an unhealthy reference for 10 minutes,
-   or 3 failed sends, it sets the operator pause or halts (alerts `anchor-stop`, `reference-unhealthy`, `halt`).
+1. **The bot stops itself**: on `--max-anchor-distance` (5%, two ticks in a row), an unhealthy
+   reference for 10 minutes, or 3 failed sends, it sets the operator pause or halts (alerts `anchor-stop`,
+   `reference-unhealthy`, `halt`); the pause is never blocked by the halt or the hourly cap. The CoinGecko
+   brake only stops rebalancing (`coingecko-brake`), it does not pause.
 2. **Stop the bot**: `systemctl --user stop owner-pool-bot`. The curve stays where it is and keeps
    trading at its fee.
 3. **Pause swaps (owner)**: `pause`, sign. Nothing trades; the bot can do nothing while the owner's
@@ -193,8 +216,11 @@ Fastest first:
    --operator-account <a NEW account> --reopen` (steps 3-4 in one transaction). All of this was run on
    Stokenet on 23 Nov 2026 (section 10).
 
-The watcher alerts (never rate-limited) on every operator change and limits change, and on the theft
-pattern (`large-spend`, `window-spend`, `spend-24h`, `not-bot`).
+The watcher alerts (never rate-limited) on every operator change and limits change and on the
+behavioural theft rules (`move-away`: an operator move away from the reference; `fee-outside-rule`: an
+operator fee the bot's rule cannot produce), and (rate-limited) on the spend pattern (`large-spend`,
+`window-spend`, `spend-24h`) and `not-bot`. The heartbeat check alerts `NO HEARTBEAT` when the bot or the
+watcher stops writing its heartbeat (a kill, an OOM, a lost host).
 
 ## 7. Reading the markout summary
 
@@ -287,6 +313,15 @@ the pool). After each, `record`'s check found the ledger as the step set it.
 | unwind (1,100 XRD / 0.88 TEUR back) | `txid_tdx_2_1aw7dk2gu6czntp7sgplu6ydfs7sxj2n047cpqemgkk7p785jnx4qzz6rgh` |
 | operator returns the second badge | `txid_tdx_2_1zgu3g48dqlp0cxlx00pdlhr2rlrj7mgawkdrzekmrczca7qx9pjsv76e0q` |
 
+Mainnet `--send` guard refusals (23 Nov 2026, after the review fixes; no mainnet key exists, so nothing
+could be signed): `data/soak/guard9.sh` ran the bot with `--network mainnet --send --once`, adding one
+condition per run: every run exited 2 with each unmet condition named (explicit flags; alert URL; the
+empty `OWNER_POOL_PACKAGES.mainnet`; the pool not in `MAINNET_SEND_POOLS`; `--mainnet-live`; `--scale auto`;
+synthetic venues, `--exclude-venues`, `--owner-anchor`; `--no-watch`; out-of-range flags; a flag
+swallowing the next). A mainnet DRY RUN with every flag is refused at the missing key. On Stokenet: a
+state file without identity or of another network refused; `--send` with no alert URL, or with one whose
+start alert is not delivered, refused. Logs `data/soak/guard9.log`, `guard9b.log`.
+
 Also run: `simulate` (allocated addresses, one preview) succeeded on Stokenet and on mainnet; the
 refusals fired as they should (deposit when the curve was 6.25% from the stated market price; a seed
 12.5% off; a one-sided owner-rebalance that would move the price 2%; limits-fee with the fee outside
@@ -316,12 +351,14 @@ limits changes and the unpause. All test funds went back to the throwaway owner 
 
 Not made (another review was reading these files):
 
-1. `scripts/owner-pool-bot.ts`: the `--send` guard (section 5), and requiring `--key`, `--badge`,
-   `--pool` on mainnet.
+1. ~~`scripts/owner-pool-bot.ts`: the `--send` guard (section 5), and requiring `--key`, `--badge`,
+   `--pool` on mainnet.~~ Done 23 Nov 2026 (review fixes, section 5); the allow-list
+   `MAINNET_SEND_POOLS` stays empty until the owner's go-ahead.
 2. `scripts/owner-pool-sources.ts`: the reference venues are XRD/hUSDC only (`VENUE_POOLS`, the quote
    code sells XRD and hUSDC). An XRD/LSULP pool needs LSULP venues and quoting before any bot can run it.
 3. `packages/core/src/ownerpool.ts`: `OWNER_POOL_PACKAGES.mainnet` must list the package once published
    (step 3); until then the bot, watcher and router refuse the pool.
-4. Watcher replay (observation): on `--replay` the pool's first `OwnerPoolConfigEvent` is the baseline,
-   so the owner's first pause after instantiation was not reported as a `pause-change`. A live watcher
-   started before instantiation would not miss it; worth a test.
+4. ~~Watcher replay (observation): on `--replay` the pool's first `OwnerPoolConfigEvent` is the baseline,
+   so the owner's first pause after instantiation was not reported as a `pause-change`.~~ Fixed 23 Nov
+   2026: a replay from the first transaction starts from a fresh pool's configuration (instantiate emits
+   no config event), so that pause, and the first appointment, are reported; tested.

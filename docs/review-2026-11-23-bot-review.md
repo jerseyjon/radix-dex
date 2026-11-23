@@ -323,3 +323,48 @@ that refuses to start unless all of the following hold:
 With those checks, plus conservative owner limits (a small budget per window, caps and floors close to
 the reserves, a fee range of about 50-200 bps), enabling mainnet is a safe change. The pool should start
 small: every loss path above scales with pool size, and the contract bounds it per window, not overall.
+
+## Fixes (23 Nov 2026, branch `pool-split-stokenet`)
+
+Each finding was checked against the code before it was fixed (all reproduced as described). Commits:
+**9df7532** (core rules and tests: `packages/core/src/ownerpool-guard.ts`, `ownerpool-files.ts`, watcher
+rules), **c41a29b** (the bot), **afd52e2** (the watcher, the heartbeat check, the units), and the docs
+commit that adds this section. Tests: 258 before, 281 after.
+
+| Finding | Status | How |
+|---|---|---|
+| C-1 scale auto | Fixed (9df7532, c41a29b, afd52e2) | `resolveScale`: on mainnet only 1 (the default there), `auto` and any other value refused, bot and watcher; the watcher never reads the bot's calibration on mainnet. Stokenet keeps `auto` |
+| H-1 pair and orientation | Fixed (9df7532, c41a29b, afd52e2) | `OWNER_POOL_REFERENCE_PAIRS` (mainnet XRD/hUSDC, Stokenet XRD/TEUR) and `pairProblem` (names an inverted pool); checked at start and every tick, bot and watcher |
+| H-2 cheap reference manipulation | Fixed in part (9df7532, c41a29b) | Target = median of the last 3 healthy readings (none until 3); the anchor stop pauses only after 2 ticks in a row (it stops following at once). The CoinGecko BRAKE (owner's decision, added the same day): the ratio reference/CoinGecko against its 24 h median; beyond 2% no rebalance (fee may widen), never a pause, never a price. Not done: a minimum depth per venue and `minVenues` > 1 (points 4-5: only one venue qualifies today) |
+| H-3 state not bound | Fixed (9df7532, c41a29b, afd52e2) | State carries `{network, pool, badge, operatorAccount}` (watcher `{network, pool}`), refused on mismatch or absence; network-specific defaults, none on mainnet (`--pool`, `--badge`, `--key`, `--state`, `--sent-log` required); lock O_EXCL per network and pool in `data/locks/`, stale pid (or pid now another program) replaced, released on every exit; state saved temp + fsync + `.bak` + rename |
+| H-4 not-bot off or forgeable | Fixed (9df7532, afd52e2) | Behavioural rules without the log: `move-away` (an operator move further from the watcher's reference now AND its median of 3, by more than 10 bps; alert, never rate-limited), `move-unhealthy` (warn), `fee-outside-rule` (an operator fee outside the bot rule's bounds; alert). On mainnet the watcher requires the sent log (it must exist; the bot creates it at start) or `--no-sent-log`, which says plainly at start (log and alert) that the rule is off. Documented: the log on the bot's host is not trustworthy against a thief on that host. CoinGecko is not used by the watcher's rule |
+| M-1 intermediary fee change | Fixed (9df7532) | Manifest proofs parsed (`create_proof_of_amount/_non_fungibles`); a fee or operator-pause change is the operator's unless the owner badge is PROVED; such a change is `warn` and enters `not-bot` |
+| M-2 halt and cap block the pause; races halt | Fixed (9df7532, c41a29b) | `isProtectiveSend`: the pause ON and fee widens pass the halt and the hourly cap; `recordSendOutcomeV2`: "Reserves moved" counts toward its own limit (10 in a row), never toward the 3-failure halt |
+| M-3 long validity, out-of-order sends | Fixed (9df7532, c41a29b) | 2 epochs and `max_proposer_timestamp_exclusive` = Operated-network ledger time + 120 s; the bot waits past it; a still-unknown send is `pending` in the state and resolved first on the next tick (late commit: spend recorded from its event, a late pause kept as the bot's); nothing new is sent while one is pending |
+| M-4 lagging Gateway | Fixed (9df7532, c41a29b, afd52e2) | Quotes take the mainnet Gateway's `proposer_round_timestamp` (read just before them); more than 120 s behind: no venue counts (alert `gateway-lag`). Own Gateway for mainnet: still recommended, not done |
+| M-5 no liveness alert | Fixed (9df7532, c41a29b, afd52e2) | Heartbeat file per process per tick; `scripts/owner-pool-heartbeat-check.ts` + `deploy/owner-pool-heartbeat.{service,timer}` (not installed) alert on a missing or stale beat; every start-up refusal (corrupt state with no usable `.bak`, unreadable key, lock held, guard) is alerted `start-refused` |
+| M-6 --send without alerts | Fixed (9df7532, c41a29b) | `--send` (any network) needs an alert URL and a DELIVERED start alert, else refused |
+| L-1 lock | Fixed (see H-3) | |
+| L-2 flag ranges | Fixed (9df7532, c41a29b, afd52e2) | `OWNER_POOL_FLAG_RANGES` (tighter on mainnet); `optValue` refuses a flag followed by a flag; argument errors refused together (exit 2) |
+| L-3 test inputs with --send | Fixed (9df7532, c41a29b) | `fixed:`/`file:` venues, `--exclude-venues(-file)` and `--owner-anchor` refused with `--send` on mainnet |
+| L-4 target depth frozen | Fixed (9df7532, c41a29b) | Re-read from the reserves after every owner reserve change (`OwnerPoolLiquidityEvent` or owner rebalance, found by the anchor re-check); `--target-depth` still overrides |
+| L-5 spend-24h false alarms | Fixed (9df7532, afd52e2) | Default limit 1 + 24 h / (window_epochs x 301 s): 3 budgets at 144 epochs, about 5 at 72 |
+| L-6 no fsync | Fixed (see H-3) | Corrupt state falls back to `.bak`, else refused and alerted |
+| Mainnet `--send` guard | Fixed (9df7532, c41a29b) | `sendGuardProblems`: the seven conditions plus CoinGecko watched and the committed `MAINNET_SEND_POOLS` allow-list (empty, so mainnet `--send` stays impossible until the owner adds his pool) and `--mainnet-live`. Refusals run with no mainnet key: `data/soak/guard9.log` |
+| Watcher replay baseline (set-up agent's observation) | Fixed (9df7532, afd52e2) | A replay from the first transaction starts from a fresh pool's config (`REPLAY_BASELINE`): the owner's first pause after instantiate, and the first appointment, are reported |
+| Info: `OWNER_POOL_PACKAGES.mainnet` empty | Kept (fail-safe) | Now also a named condition of the guard |
+| Info: no tests for the bot's I/O | Partly | The guard, lock, state identity, durable save, pending gate, halt rules and brake are pure and tested; the wiring was exercised on Stokenet (soak 9, `docs/owner-pool-bot.md`) |
+
+Stokenet soak with `--send` and the watcher, fresh state file, 12:45-13:35 UTC (`docs/owner-pool-bot.md`,
+"Soak 9"): median warm-up, a rebalance and a fee widen committed and seen by the watcher with no theft
+finding, the lock refusing a second bot, the CoinGecko brake engaged (forced by TEST flags) and released,
+the heartbeat check alerting a stopped bot, a corrupt state recovered from `.bak` and, with both broken,
+refused and alerted. Mainnet `--send` refusals with no mainnet key: `data/soak/guard9.log`, `guard9b.log`
+(each condition named; every run exit 2). Pool left at fee 30 bps, both pauses off.
+
+Open after the fixes: the review's H-2 points 4-5 (minimum venue depth, `minVenues` > 1) not done; an own
+mainnet Gateway not set up; the rolling spend window uses the bot's own committed sends, not the pool's
+events; not seen on ledger (unit-tested only): a "Reserves moved" race, an unresolved send, a lagging
+Gateway, `move-away` and `fee-outside-rule`. Observed: after a trade moves the pool away from the
+operator's last price by more than the spendable allowance, no operator move fits (its cost is measured
+from that price), so the bot stays `behind` until the allowance refills or arbitrage closes the gap.
