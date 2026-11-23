@@ -27,6 +27,7 @@ Stokenet run, `docs/review-2026-11-21/owner-pool-split-stokenet.md`.
 10. What was proven on Stokenet (23 Nov 2026)
 11. What could not be previewed on mainnet, and why
 12. Changes needed in files outside this work
+13. The Pools page on the site
 
 ## 1. Decisions the owner makes first
 
@@ -354,7 +355,7 @@ Not made (another review was reading these files):
 1. ~~`scripts/owner-pool-bot.ts`: the `--send` guard (section 5), and requiring `--key`, `--badge`,
    `--pool` on mainnet.~~ Done 23 Nov 2026 (review fixes, section 5); the allow-list
    `MAINNET_SEND_POOLS` stays empty until the owner's go-ahead.
-2. `scripts/owner-pool-sources.ts`: the reference venues are XRD/hUSDC only (`VENUE_POOLS`, the quote
+2. `scripts/owner-pool-sources.ts` (since 23 Nov 2026 `packages/core/src/ownerpool-sources.ts`, re-exported from the old path): the reference venues are XRD/hUSDC only (`VENUE_POOLS`, the quote
    code sells XRD and hUSDC). An XRD/LSULP pool needs LSULP venues and quoting before any bot can run it.
 3. `packages/core/src/ownerpool.ts`: `OWNER_POOL_PACKAGES.mainnet` must list the package once published
    (step 3); until then the bot, watcher and router refuse the pool.
@@ -362,3 +363,59 @@ Not made (another review was reading these files):
    so the owner's first pause after instantiation was not reported as a `pause-change`.~~ Fixed 23 Nov
    2026: a replay from the first transaction starts from a fresh pool's configuration (instantiate emits
    no config event), so that pause, and the first appointment, are reported; tested.
+
+## 13. The Pools page on the site
+
+`https://dex.difd.net/#/pools` (a **Pools** link appears in the trading page's header when the server
+lists any OwnerPool). It reads; the owner's wallet signs. Nothing on the server holds or needs the owner's
+key, and the server never submits an owner transaction.
+
+**The table** lists every OwnerPool in `DEX_OWNER_POOLS` (and on Stokenet the markets file): pair, the
+curve's price, the gap to the market, TVL, fee, open or paused, and whether the bot and the watcher are
+alive. **Open** shows one pool:
+
+| Card | What it shows | From |
+|---|---|---|
+| Price | the curve (B per A), the market reference and the gap; each venue used or left out, and why | the ledger; the bot's venues and its own rules (`aggregateVenues`, the bot's defaults), by free previews, cached a minute. Pairs with no venues (Stokenet) use the bot's last reference from its state file if fresh |
+| Liquidity | reserves, TVL, inventory, fee, owner pause, operator pause | the ledger |
+| Operator | operator badge, anchor, the allowance now (of the budget), limits, the operator account's XRD | the ledger; the operator account from the bot's state file |
+| Bot and watcher | alive or stale, last seen; the bot's last transaction, its reference, the venues it trusts, ticks behind, failures, halt, its pause | the heartbeat files and the bot's state file (`DEX_OWNER_POOL_FILES`, default the data directory; read only, never written) |
+| Fees earned | swaps, fees kept per token and their value, volume | the pool's swap events since it was created (read incrementally, in memory) |
+| Markout | trades, fees + markout at +5 and +30 minutes, break-even fee | the watcher's `owner-pool-markout-<network>.jsonl` (the same summary as section 7) |
+| Recent activity | the last 50 transactions with pool events: swap, owner (it proved the owner badge) or operator, and what each did | the pool's events |
+
+A heartbeat is stale after 600 s (`DEX_HEARTBEAT_MAX_AGE_SEC`), as the heartbeat timer judges it. Nothing
+on the page shows a key, a file path, a process id or the alert URL.
+
+**Owner actions** appear only for an account that holds the pool's owner badge, read on the ledger (the
+contract checks the badge again on every call anyway). Connect the owner account with the Radix Wallet;
+without a wallet, an account can be typed in to preview (nothing can be signed then). Each action is
+built on the server with the same builders and guards as the script step named on the card, previewed
+against the Gateway, and shown: succeeds or fails, the network fee, the badge proved, every balance
+change, the notes and the manifest. **Sign in wallet** then sends exactly that manifest to the wallet
+(no fee lock: the wallet adds its own). After the commit the page checks the pool shows what the action
+set, like `record`.
+
+| Action | Script step | Guard |
+|---|---|---|
+| Deposit | `deposit` | reserves read now (`expected`); refused when the curve is more than 1% from the market, or when there is no market price, unless you tick the box |
+| Withdraw | `withdraw` | reserves read now; token B defaults to the proportional amount; never more than the reserves |
+| Pause / Unpause | `pause` / `unpause` | none (the owner's pause) |
+| Fee | `fee` | 0-500 bps; notes a fee outside the operator's range |
+| Anchor | `anchor` | at the market (rounded to 12 places) or a price you give; reserves read now; zeroes the allowance |
+| Limits + fee | `limits-fee` | one transaction; empty fields keep their value; a fee outside the new range is refused |
+| Revoke | `revoke` | type REVOKE; the emergency stop of section 6 step 4 |
+
+Not on the page (use the script): `inventory`, `withdraw-inventory`, `owner-rebalance`, `operator-badge`,
+`appoint`, `unwind`, and the set-up steps.
+
+A preview is good for two minutes; prepare again if a swap moved the reserves ("Reserves moved").
+
+To look at mainnet without touching the live site, run a second, read-only server (no solver is made,
+no order taken, whatever else is set):
+
+```
+DEX_NETWORK=mainnet DEX_READ_ONLY=1 DEX_PORT=8790 DEX_DATA_DIR=/tmp/dex-ro DEX_OWNER_POOL_FILES=data \
+DEX_WEB_DIR=apps/web/dist DEX_OWNER_POOLS=component_rdx1cz6ga0dfz3vqefku0vvgyu0fsv9q6u09vtkpew5ysa8qdsz3ha6zyr \
+npx tsx apps/server/src/main.ts
+```
