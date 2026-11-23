@@ -2,7 +2,7 @@
 // the Stokenet pool's real history (22 Nov 2026).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { OWNER_POOL_WATCH_DEFAULTS as W, driftFindings, limitsRecord, parseOwnerPoolEvent, operatorActions, watchTransaction, type OwnerPoolEvent, type OwnerPoolTx, type WatchContext, type WatchState } from '../src/index.ts';
+import { AlertSink, watchAlertMode, OWNER_POOL_WATCH_DEFAULTS as W, driftFindings, limitsRecord, parseOwnerPoolEvent, operatorActions, watchTransaction, type OwnerPoolEvent, type OwnerPoolTx, type WatchContext, type WatchState } from '../src/index.ts';
 
 const OWNER = 'resource_owner_badge';
 const OP = 'resource_operator_badge';
@@ -125,4 +125,18 @@ test('watch: an operator limits change is flagged; the same limits re-announced 
     { field_name: 'limits', kind: 'Tuple', fields: Object.entries(L).map(([k, v]) => ({ field_name: k, kind: 'Decimal', value: v })) },
   ]);
   assert.deepEqual(parsed, { name: 'OwnerPoolOperatorEvent', operator: OP, limits: L });
+});
+
+test('watcher alerts: a limits change and its reversal minutes later are both alerted; spends and drift stay rate-limited', async () => {
+  assert.equal(watchAlertMode({ rule: 'limits-change', severity: 'alert' }), 'force');
+  assert.equal(watchAlertMode({ rule: 'operator-change', severity: 'alert' }), 'force');
+  assert.equal(watchAlertMode({ rule: 'large-spend', severity: 'alert' }), 'limited');
+  assert.equal(watchAlertMode({ rule: 'pool-drift', severity: 'warn' }), 'limited');
+  assert.equal(watchAlertMode({ rule: 'anchor-restated', severity: 'info' }), 'none');
+  let posted = 0;
+  const sink = new AlertSink('http://127.0.0.1:1/x', { intervalMs: H, fetch: async () => { posted++; return { ok: true, status: 200 }; } });
+  for (const [i, rule] of (['limits-change', 'limits-change', 'large-spend', 'large-spend'] as const).entries()) {
+    await sink.alert(rule, 'x', t0 + i * 180_000, { force: watchAlertMode({ rule, severity: 'alert' }) === 'force' });
+  }
+  assert.equal(posted, 3, 'both limits changes, the first large spend only');
 });

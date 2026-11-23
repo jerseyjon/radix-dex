@@ -39,6 +39,20 @@ export const OWNER_POOL_WATCH_DEFAULTS = {
 
 export type WatchSeverity = 'alert' | 'warn' | 'info';
 
+/**
+ * Rules whose every finding is alerted, never rate-limited: each is a separate owner act on the pool's
+ * configuration (rare, and each one matters on its own). Seen on Stokenet 23 Nov 2026: a limits change
+ * and its reversal minutes later; with the per-rule rate limit the reversal was not alerted. The other
+ * rules keep the per-rule limit (one alert per rule per --alert-interval), so a burst of spends or drift
+ * does not flood the phone; their findings are still all in the log.
+ */
+export const WATCH_ALWAYS_ALERT: ReadonlySet<WatchFinding['rule']> = new Set(['limits-change', 'operator-change']);
+/** Whether a finding is alerted at all, and whether it bypasses the rate limit. */
+export function watchAlertMode(f: Pick<WatchFinding, 'rule' | 'severity'>): 'none' | 'limited' | 'force' {
+  if (f.severity === 'info') return 'none';
+  return WATCH_ALWAYS_ALERT.has(f.rule) ? 'force' : 'limited';
+}
+
 export interface WatchFinding {
   rule: 'large-spend' | 'window-spend' | 'spend-24h' | 'limits-change' | 'fee-change' | 'pause-change' | 'operator-change' | 'anchor-restated' | 'not-bot' | 'anchor-drift' | 'pool-drift';
   severity: WatchSeverity;

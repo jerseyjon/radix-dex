@@ -463,6 +463,11 @@ npx tsx scripts/owner-pool-watch.ts --once --replay       # the pool's whole his
 | `anchor-drift` | warn | the owner's anchor is this far from the reference (mapped onto the pool) | 5% (`--max-anchor-drift`) |
 | `pool-drift` | warn | the pool's price is this far from the reference | 3% (`--max-pool-drift`) |
 
+Alerts are rate-limited per rule (one per rule per `--alert-interval`, default 1 h; every finding is
+still logged), except `limits-change` and `operator-change`, which alert every time (since 23 Nov 2026:
+each is a separate owner act, and on Stokenet a limits change reversed minutes later would otherwise
+have gone unalerted). Code: `watchAlertMode` (pure, tested). `info` findings are never alerted.
+
 Who called a method is read from the transaction's manifest (the methods it calls on the pool and the
 badges it names); the operator badge in force is the last one the pool announced. The reference is
 the bot's (on-ledger venues, `--venues`, `--quote-size`; drift is checked only while they agree); with `--scale auto` the watcher takes the bot's calibration from

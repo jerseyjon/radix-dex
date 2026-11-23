@@ -28,7 +28,7 @@ import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } f
 import {
   AlertSink, Decimal, Gateway, NETWORKS, OWNER_POOL_BOT_DEFAULTS as BD, OWNER_POOL_PACKAGES, OWNER_POOL_WATCH_DEFAULTS as W, aggregateVenues, calibrateScale, limitsRecord,
   driftFindings, dueMarks, findOwnerAnchor, markRecord, parseMarkoutLines, tradeFromSwap, tradeRecord, type MarkoutRef, lastOwnerAnchor, readOwnerPoolTransactions, readOwnerPools, watchTransaction,
-  type NetworkName, type OwnerAnchorStatement, type WatchFinding, type WatchState,
+  watchAlertMode, type NetworkName, type OwnerAnchorStatement, type WatchFinding, type WatchState,
 } from '../packages/core/src/index.ts';
 import { assertReferenceExcludesOwnerPools, makeVenues, readVenueSource } from './owner-pool-sources.ts';
 
@@ -122,8 +122,9 @@ function botLog(): { txids: Set<string>; since?: number } | undefined {
 
 async function report(f: WatchFinding, live: boolean): Promise<void> {
   const rec: Record<string, unknown> = { event: 'finding', ...f, ...(f.at ? { at: new Date(f.at).toISOString() } : {}) };
-  if (f.severity !== 'info' && (live || cfg.alertOnReplay)) {
-    const r = await alerts.alert(f.rule, `${f.severity.toUpperCase()} ${f.rule}: ${f.text}${f.txid ? ` (${f.txid})` : ''}`);
+  const mode = watchAlertMode(f);
+  if (mode !== 'none' && (live || cfg.alertOnReplay)) {
+    const r = await alerts.alert(f.rule, `${f.severity.toUpperCase()} ${f.rule}: ${f.text}${f.txid ? ` (${f.txid})` : ''}`, Date.now(), { force: mode === 'force' });
     rec.alert = { sent: r.sent, ...(r.suppressed ? { suppressed: true } : {}), ...(r.error ? { error: r.error } : {}), ...(alerts.enabled ? {} : { noUrl: true }) };
   }
   log(rec);
