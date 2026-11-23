@@ -8,6 +8,7 @@ export * from './ownerpool-setup.ts';
 export * from './ownerpool-bot.ts';
 export * from './ownerpool-events.ts';
 export * from './ownerpool-watch.ts';
+export * from './ownerpool-guard.ts';
 export * from './alerts.ts';
 export * from './quote.ts';
 export * from './markets.ts';

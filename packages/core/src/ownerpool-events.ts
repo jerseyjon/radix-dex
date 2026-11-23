@@ -38,6 +38,12 @@ export interface OwnerPoolTx {
   methods: string[];
   /** Every resource address the root manifest names (e.g. the badge it proves). */
   resources: string[];
+  /**
+   * Resources the root manifest PROVES from an account (`create_proof_of_amount` /
+   * `create_proof_of_non_fungibles`): the owner badge here is the only proof that the owner acted.
+   * Optional: older callers and tests that build transactions by hand may leave it out.
+   */
+  proofs?: string[];
   /** The pool's own events, in emission order. */
   events: OwnerPoolEvent[];
 }
@@ -113,8 +119,9 @@ export function parseOwnerPoolTransaction(t: any, pool: string): OwnerPoolTx | u
   const manifest = typeof t.manifest_instructions === 'string' ? t.manifest_instructions : '';
   const methods = [...manifest.matchAll(new RegExp(`CALL_METHOD\\s+Address\\("${escapeRe(pool)}"\\)\\s+"(\\w+)"`, 'g'))].map((m) => m[1]!);
   const resources = [...new Set([...manifest.matchAll(/Address\("(resource_[a-z0-9_]+)"\)/g)].map((m) => m[1]!))];
+  const proofs = [...new Set([...manifest.matchAll(/"create_proof_of_(?:amount|non_fungibles)"\s+Address\("(resource_[a-z0-9_]+)"\)/g)].map((m) => m[1]!))];
   const at = Date.parse(t.confirmed_at ?? t.round_timestamp ?? '');
-  return { txid: t.intent_hash, stateVersion: t.state_version, at: Number.isFinite(at) ? at : 0, methods, resources, events };
+  return { txid: t.intent_hash, stateVersion: t.state_version, at: Number.isFinite(at) ? at : 0, methods, resources, proofs, events };
 }
 
 export interface OwnerAnchorStatement {
@@ -198,9 +205,22 @@ export async function findOwnerAnchor(gateway: Gateway, pool: string, o: { maxPa
  * Bring a known owner anchor up to date: read only what came after `scannedTo` (the newest state
  * version already searched). A newer statement replaces `known`.
  */
-export async function refreshOwnerAnchor(gateway: Gateway, pool: string, known: OwnerAnchorStatement | undefined, scannedTo: number, o: { maxPages?: number } = {}): Promise<{ statement?: OwnerAnchorStatement; complete: boolean; newest: number }> {
+export async function refreshOwnerAnchor(gateway: Gateway, pool: string, known: OwnerAnchorStatement | undefined, scannedTo: number, o: { maxPages?: number } = {}): Promise<{ statement?: OwnerAnchorStatement; complete: boolean; newest: number; ownerReserveChange?: number }> {
   const r = await readOwnerPoolTransactions(gateway, pool, scannedTo + 1, { maxPages: o.maxPages ?? 20, manifest: false });
   const newer = lastOwnerAnchor(r.txs);
   const statement = newer && (!known || newer.stateVersion > known.stateVersion) ? newer : known;
-  return { statement, complete: r.complete, newest: Math.max(scannedTo, r.next - 1) };
+  return { statement, complete: r.complete, newest: Math.max(scannedTo, r.next - 1), ownerReserveChange: lastOwnerReserveChange(r.txs) };
+}
+
+/**
+ * The state version of the newest transaction in `txs` in which the OWNER changed the reserves: a
+ * deposit or withdrawal (`OwnerPoolLiquidityEvent`) or an owner rebalance. The bot re-reads its target
+ * depth after it (review L-4).
+ */
+export function lastOwnerReserveChange(txs: OwnerPoolTx[]): number | undefined {
+  let sv: number | undefined;
+  for (const t of txs) {
+    if (t.events.some((e) => e.name === 'OwnerPoolLiquidityEvent' || (e.name === 'OwnerPoolRebalanceEvent' && e.byOwner))) sv = Math.max(sv ?? 0, t.stateVersion);
+  }
+  return sv;
 }

@@ -1,4 +1,5 @@
 import { priceDistance, anchorPrice } from './ownerpool-bot.ts';
+import { moveAwayFromReference } from './ownerpool-guard.ts';
 import type { OwnerPoolEvent, OwnerPoolTx } from './ownerpool-events.ts';
 import type { OwnerPoolOperatorLimits } from './ownerpool.ts';
 
@@ -25,8 +26,18 @@ export const OWNER_POOL_WATCH_DEFAULTS = {
   intervalSec: 60,
   /** One operator move spending more than this share of the allowance available before it. */
   maxSpendShare: 0.6,
-  /** Operator spend over the last 24 h above this many full budgets (one budget refills per window). */
+  /**
+   * Operator spend over the last 24 h above this many full budgets. Default: derived from the pool's
+   * window (`spend24hBudgets`: the full allowance plus 24 h of refill), so legitimate use never alarms;
+   * a number given here overrides it.
+   */
   maxSpend24hBudgets: 1,
+  /** Epoch length for that derivation (mainnet measured 5.02 min, Stokenet 5.03 on 23 Nov 2026). */
+  epochSec: 301,
+  /** An operator rebalance that ends further than this (bps) from the reference than it began: not the bot. */
+  moveAwayToleranceBps: 10,
+  /** The bot's fee rule bounds (the bot's defaults); a fee outside them, by more than the margin, is not the bot's. */
+  feeMarginBps: 10,
   /** Operator moves within any `spendWindowSec` spending more than this share of the allowance available at the window's start (the bot's own cap is the same). */
   maxWindowSpendShare: 0.6,
   spendWindowSec: 600,
@@ -46,7 +57,7 @@ export type WatchSeverity = 'alert' | 'warn' | 'info';
  * rules keep the per-rule limit (one alert per rule per --alert-interval), so a burst of spends or drift
  * does not flood the phone; their findings are still all in the log.
  */
-export const WATCH_ALWAYS_ALERT: ReadonlySet<WatchFinding['rule']> = new Set(['limits-change', 'operator-change']);
+export const WATCH_ALWAYS_ALERT: ReadonlySet<WatchFinding['rule']> = new Set(['limits-change', 'operator-change', 'move-away', 'fee-outside-rule']);
 /** Whether a finding is alerted at all, and whether it bypasses the rate limit. */
 export function watchAlertMode(f: Pick<WatchFinding, 'rule' | 'severity'>): 'none' | 'limited' | 'force' {
   if (f.severity === 'info') return 'none';
@@ -54,13 +65,22 @@ export function watchAlertMode(f: Pick<WatchFinding, 'rule' | 'severity'>): 'non
 }
 
 export interface WatchFinding {
-  rule: 'large-spend' | 'window-spend' | 'spend-24h' | 'limits-change' | 'fee-change' | 'pause-change' | 'operator-change' | 'anchor-restated' | 'not-bot' | 'anchor-drift' | 'pool-drift';
+  rule: 'large-spend' | 'window-spend' | 'spend-24h' | 'limits-change' | 'fee-change' | 'pause-change' | 'operator-change' | 'anchor-restated' | 'not-bot' | 'anchor-drift' | 'pool-drift'
+    | 'move-away' | 'move-unhealthy' | 'fee-outside-rule';
   severity: WatchSeverity;
   txid?: string;
   stateVersion?: number;
   at?: number;
   text: string;
 }
+
+/**
+ * The config a pool starts with, for a replay from its first transaction: instantiate emits no
+ * OwnerPoolConfigEvent, so without this the first config event (the owner's first pause, seen on
+ * Stokenet 23 Nov 2026) became the baseline and was never reported. Unpaused both ways, no operator;
+ * the instantiate fee is not in any event (-1: unknown, the first fee seen is logged, not compared).
+ */
+export const REPLAY_BASELINE: Pick<WatchState, 'config' | 'operator'> = { config: { feeBps: -1, paused: false, operatorPaused: false }, operator: null };
 
 export interface WatchState {
   /** The pool's last known config (fee, owner pause, operator pause). */
@@ -86,6 +106,22 @@ export interface WatchContext {
   /** Rolling window rule; absent: not checked. */
   maxWindowSpendShare?: number;
   spendWindowMs?: number;
+  /**
+   * The behavioural theft rules (H-4), live only (absent in a replay: the reference describes now, not
+   * then). `refs`: the watcher's reference now and its recent median, mapped onto the pool (B per A);
+   * `healthy`: its venues agree and quote. `feeBounds`: what the bot's fee rule could produce now.
+   */
+  live?: { refs: number[]; healthy: boolean; reason?: string; toleranceBps: number; feeBounds?: { lo: number; hi: number } };
+}
+
+/**
+ * Whether the owner acted in this transaction: its manifest PROVES the owner badge from an account
+ * (`create_proof_of_*`). Merely naming the badge (as an argument to some other component) proves nothing.
+ * Transactions without parsed proofs (hand-built in tests) fall back to "names the badge".
+ */
+export function ownerProved(t: OwnerPoolTx, ownerBadge: string | undefined): boolean {
+  if (!ownerBadge) return false;
+  return t.proofs ? t.proofs.includes(ownerBadge) : t.resources.includes(ownerBadge);
 }
 
 /** Who made a transaction's operator-side changes, from what its manifest called and proved. */
@@ -93,12 +129,8 @@ export function operatorActions(t: OwnerPoolTx, ctx: Pick<WatchContext, 'operato
   const out: string[] = [];
   for (const e of t.events) if (e.name === 'OwnerPoolRebalanceEvent' && !e.byOwner) out.push('rebalance');
   if (t.methods.includes('operator_set_fee')) out.push('operator_set_fee');
-  if (t.methods.includes('set_operator_paused')) {
-    // Owner or operator may call it: the operator's when the manifest names the operator badge and not the owner's.
-    const byOwner = !!ctx.ownerBadge && t.resources.includes(ctx.ownerBadge);
-    const byOperator = !!ctx.operatorBadge && t.resources.includes(ctx.operatorBadge);
-    if (byOperator && !byOwner) out.push('set_operator_paused');
-  }
+  // Owner or operator may call it: the operator's unless the manifest proves the owner badge (M-1).
+  if (t.methods.includes('set_operator_paused') && !ownerProved(t, ctx.ownerBadge)) out.push('set_operator_paused');
   return out;
 }
 
@@ -120,6 +152,17 @@ export function watchTransaction(t: OwnerPoolTx, st: WatchState, ctx: WatchConte
       if (cost > 0 && share > ctx.maxSpendShare) {
         out.push({ rule: 'large-spend', severity: 'alert', ...base, text: `Operator move spent ${fmtPct(share)} of the allowance available (cost ${e.cost} of ${before.toPrecision(6)}; limit ${fmtPct(ctx.maxSpendShare)}). The bot never spends more than half: check the operator key.` });
       }
+      // H-4: a move that takes the pool further from the reference is never the bot's (live only).
+      if (ctx.live) {
+        const ra = Number(e.reserveA), rb = Number(e.reserveB);
+        const pa = rb / ra, pb = (rb - Number(e.amountB)) / (ra - Number(e.amountA));
+        if (!ctx.live.healthy) {
+          out.push({ rule: 'move-unhealthy', severity: 'warn', ...base, text: `Operator rebalance while the watcher's reference is unusable (${ctx.live.reason ?? 'unhealthy'}): the bot does not rebalance then unless its own venues read differently. Check the operator key if this repeats.` });
+        } else {
+          const m = moveAwayFromReference(pb, pa, ctx.live.refs, ctx.live.toleranceBps);
+          if (m?.away) out.push({ rule: 'move-away', severity: 'alert', ...base, text: `Operator rebalance moved the pool AWAY from the reference: gap ${m.gapBeforeBps.toFixed(1)} -> ${m.gapAfterBps.toFixed(1)} bps (price ${pb.toPrecision(6)} -> ${pa.toPrecision(6)}, reference ${ctx.live.refs.map((r) => r.toPrecision(6)).join(' / ')}). The bot only moves toward it: check the operator key.` });
+        }
+      }
       if (cost > 0) {
         st.spends.push({ at: t.at, cost, txid: t.txid, after });
         // Rolling window: the moves of the last spendWindowMs (this one included) against the allowance
@@ -140,9 +183,22 @@ export function watchTransaction(t: OwnerPoolTx, st: WatchState, ctx: WatchConte
     }
     if (e.name === 'OwnerPoolConfigEvent') {
       const prev = st.config;
-      const who = ops.includes('operator_set_fee') || ops.includes('set_operator_paused') ? 'operator' : t.methods.length ? `owner/other (${t.methods.join(',')})` : 'unknown caller';
-      if (prev && prev.feeBps !== e.feeBps) out.push({ rule: 'fee-change', severity: who === 'operator' ? 'warn' : 'info', ...base, text: `Fee ${prev.feeBps} -> ${e.feeBps} bps by ${who}.` });
-      if (prev && prev.operatorPaused !== e.operatorPaused) out.push({ rule: 'pause-change', severity: 'warn', ...base, text: `Operator pause ${e.operatorPaused ? 'ON' : 'off'} (by ${who}).` });
+      // M-1: a fee or operator-pause change is the operator's unless the manifest proves the owner badge,
+      // whatever calls it (directly, or through an intermediary component that pushed the operator proof).
+      const byOwner = ownerProved(t, ctx.ownerBadge);
+      const feeChanged = !!prev && prev.feeBps >= 0 && prev.feeBps !== e.feeBps;
+      const opPauseChanged = !!prev && prev.operatorPaused !== e.operatorPaused;
+      if (!byOwner && feeChanged && !ops.includes('operator_set_fee')) ops.push('operator_set_fee');
+      if (!byOwner && opPauseChanged && !ops.includes('set_operator_paused')) ops.push('set_operator_paused');
+      const via = t.methods.length ? t.methods.join(',') : 'no direct call: through another component';
+      const who = byOwner ? `owner (${via})` : `operator (${via})`;
+      if (prev && prev.feeBps < 0) out.push({ rule: 'fee-change', severity: 'info', ...base, text: `Fee ${e.feeBps} bps (first config event; the instantiate fee is not in any event).` });
+      if (feeChanged) out.push({ rule: 'fee-change', severity: byOwner ? 'info' : 'warn', ...base, text: `Fee ${prev!.feeBps} -> ${e.feeBps} bps by ${who}.` });
+      if (feeChanged && !byOwner && ctx.live?.feeBounds) {
+        const b = ctx.live.feeBounds;
+        if (e.feeBps > b.hi || e.feeBps < b.lo) out.push({ rule: 'fee-outside-rule', severity: 'alert', ...base, text: `Operator set the fee ${prev!.feeBps} -> ${e.feeBps} bps, outside what the bot's fee rule can produce now (${b.lo}-${b.hi} bps): not the bot. Check the operator key.` });
+      }
+      if (opPauseChanged) out.push({ rule: 'pause-change', severity: 'warn', ...base, text: `Operator pause ${e.operatorPaused ? 'ON' : 'off'} (by ${who}).` });
       if (prev && prev.paused !== e.paused) out.push({ rule: 'pause-change', severity: 'warn', ...base, text: `OWNER pause ${e.paused ? 'ON' : 'off'} (by ${who}).` });
       st.config = { feeBps: e.feeBps, paused: e.paused, operatorPaused: e.operatorPaused };
     }
