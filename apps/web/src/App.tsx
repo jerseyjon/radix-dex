@@ -9,6 +9,7 @@ import { Markets } from './Markets';
 import { OrderForm } from './OrderForm';
 import { Orders } from './Orders';
 import { type Keyed, forKey, headerChange, pollGuard, retryWaitMs } from './live';
+import { SiteNav, SiteTabBar } from './SiteNav';
 import { Icon, Logo, Mark, TabPanel, Tabs } from './ui';
 import { type WalletAccount, getWallet } from './wallet';
 
@@ -178,6 +179,7 @@ export function App() {
   // The header shows the order book's mid; the chart's tag is the last trade. Say which is which.
   const priceIsMid = depth?.mid != null;
   const headPrice = priceIsMid ? depth?.mid : last?.close;
+  const showPools = !STATIC && (config.ownerPools ?? 0) > 0;
   const pairClick = () => {
     if (wide) { document.querySelector<HTMLInputElement>('.markets input[type="search"]')?.focus(); return; }
     setShowMarkets((v) => !v);
@@ -186,25 +188,25 @@ export function App() {
   return (
     <div className={`app ${showMarkets ? 'show-markets' : ''}`}>
       <header className="top">
-        <Logo />
-        <button className="pair-btn" onClick={pairClick} aria-expanded={wide ? undefined : showMarkets} aria-controls="markets-panel" aria-label={`${market.base.symbol}/${market.quote.symbol}: choose a market`}>
-          <span className="pair-base">{market.base.symbol}</span><span className="pair-quote">/{market.quote.symbol}</span> <span className="caret"><Icon name="chevron" size={14} /></span>
-        </button>
-        <div className="ticker">
-          <span className="ticker-label" title={priceIsMid ? 'Mid price of the order book (pools and limit orders). The chart shows trade prices, so its last price can differ.' : 'Last trade price, from the chart'}>{headPrice === undefined ? 'Price' : priceIsMid ? 'Mid' : 'Last'}</span>
-          <span className="ticker-price">{fmtPrice(headPrice)}</span>
-          <span className={`ticker-change ${changeDir}`} title={changeInfo?.title ?? 'Price change'}>
-            <span className="sr-only">{changeInfo?.label === '24h' ? 'Change over 24 hours' : `Change over the chart's ${changeInfo?.label ?? 'range'}`}</span>{change === undefined ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`}
-            {changeInfo && <span className="ticker-span" aria-hidden="true">{changeInfo.label}</span>}
-          </span>
+        <div className="market-bar glass">
+          <button className="pair-btn" onClick={pairClick} aria-expanded={wide ? undefined : showMarkets} aria-controls="markets-panel" aria-label={`${market.base.symbol}/${market.quote.symbol}: choose a market`}>
+            <span className="pair-base">{market.base.symbol}</span><span className="pair-quote">/{market.quote.symbol}</span> <span className="caret"><Icon name="chevron" size={14} /></span>
+          </button>
+          <div className="ticker">
+            <span className="ticker-label" title={priceIsMid ? 'Mid price of the order book (pools and limit orders). The chart shows trade prices, so its last price can differ.' : 'Last trade price, from the chart'}>{headPrice === undefined ? 'Price' : priceIsMid ? 'Mid' : 'Last'}</span>
+            <span className="ticker-price">{fmtPrice(headPrice)}</span>
+            <span className={`ticker-change ${changeDir}`} title={changeInfo?.title ?? 'Price change'}>
+              <span className="sr-only">{changeInfo?.label === '24h' ? 'Change over 24 hours' : `Change over the chart's ${changeInfo?.label ?? 'range'}`}</span>{change === undefined ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`}
+              {changeInfo && <span className="ticker-span" aria-hidden="true">{changeInfo.label}</span>}
+            </span>
+          </div>
+          <dl className="stats">
+            <div><dt>Liquidity</dt><dd>{fmtUsd(market.tvlUsd)}</dd></div>
+            <div><dt>24h volume</dt><dd>{fmtUsd(market.volume24hUsd)}</dd></div>
+            <div className="venues"><dt>Venues</dt><dd>{market.venues.map(venueName).join(', ') || 'orders only'}</dd></div>
+          </dl>
         </div>
-        <dl className="stats">
-          <div><dt>Liquidity</dt><dd>{fmtUsd(market.tvlUsd)}</dd></div>
-          <div><dt>24h volume</dt><dd>{fmtUsd(market.volume24hUsd)}</dd></div>
-          <div className="venues"><dt>Venues</dt><dd>{market.venues.map(venueName).join(', ') || 'orders only'}</dd></div>
-        </dl>
-        <div className="right">
-          {!STATIC && (config.ownerPools ?? 0) > 0 && <nav className="nav" aria-label="Sections"><a href="#/pools">Pools</a></nav>}
+        <SiteNav current="trade" showPools={showPools} end={<>
           <span className={`net ${config.network}`}><span className="dot" aria-hidden="true" />{config.network}</span>
           {accounts.length > 1 && (
             <select className="account" value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Account">
@@ -213,7 +215,7 @@ export function App() {
           )}
           {/* The Radix connect button is a web component registered by the dApp toolkit. */}
           {wallet ? <radix-connect-button /> : <span className="muted small">{STATIC ? 'read-only preview' : 'wallet not configured'}</span>}
-        </div>
+        </>} />
       </header>
 
       {(STATIC || config.warning || (config.network === 'mainnet' && wallet)) && (
@@ -256,6 +258,7 @@ export function App() {
           onDone={(m) => { setToast(m); void refreshAccount(); }} />
       </div>
       {toast && <div className="toast" role="status"><Icon name="info" size={15} /><span>{toast}</span></div>}
+      <SiteTabBar current="trade" showPools={showPools} />
     </div>
   );
 }

@@ -1,0 +1,133 @@
+/*
+ * DIFD design tokens: direction B, "Liquid glass" (chosen by the owner, 23 Nov 2026).
+ * The ONE file that sets the look: every colour, radius, blur, rim, shadow, font, size and spacing
+ * step used by base.css is a variable here.
+ *
+ * Layout concept: drifting mint / teal / indigo light fields on deep navy, seen through layered
+ * glass panels with a specular rim; a floating glass pill nav on desktop, a glass tab bar on phones.
+ *
+ * Brand colours sampled from difd.png: navy #161b26, off-white #edeae3, mint #34d39e.
+ * The site commits to this one dark look (the glass needs a dark field behind it), so there is no
+ * light theme; every colour is still a token so one could be added here.
+ */
+
+/* Manrope, self-hosted (SIL OFL 1.1, see assets/fonts/OFL-Manrope.txt). Variable weight 200–800. */
+@font-face {
+  font-family: 'Manrope';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 800;
+  src: url('../assets/fonts/manrope-latin-wght-normal.woff2') format('woff2-variations'),
+       url('../assets/fonts/manrope-latin-wght-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Manrope';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 200 800;
+  src: url('../assets/fonts/manrope-latin-ext-wght-normal.woff2') format('woff2-variations'),
+       url('../assets/fonts/manrope-latin-ext-wght-normal.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+:root {
+  /* Brand */
+  --brand-navy: #161b26;
+  --brand-ink: #edeae3;
+  --brand-mint: #34d39e;
+
+  /* Ground */
+  --bg: #0f1526;
+
+  /* Text. All pass 4.5:1 on the glass tint below (checked against the lightest field). */
+  --text: #e8ecf4;          /* headings, values */
+  --text-strong: #ffffff;
+  --text-body: #dde3ee;     /* lede paragraphs */
+  --text-muted: #c3cbdd;    /* labels, secondary copy: never dimmer than this on glass */
+  --text-on-accent: #0f1526;
+  --text-shadow-lede: 0 1px 12px rgba(15, 21, 38, 0.8); /* keeps unpanelled copy legible over fields */
+
+  /* Accent */
+  --accent: #8ff0c0;        /* links, primary button, icons */
+  --accent-strong: #c9f9e0; /* hover, tonal text */
+  --accent-soft: rgba(143, 240, 192, 0.14);
+  --accent-line: rgba(143, 240, 192, 0.45);
+  --accent-glow: rgba(52, 211, 158, 0.35);
+  --focus: #8ff0c0;
+
+  /* States (light enough for 4.5:1 on glass) */
+  --good: #8ff0c0;  --good-soft: rgba(143, 240, 192, 0.14);
+  --warn: #f6cf86;  --warn-soft: rgba(246, 207, 134, 0.14);
+  --bad: #ffa29d;   --bad-soft: rgba(255, 162, 157, 0.14);
+  --neutral-soft: rgba(255, 255, 255, 0.08);
+
+  /* Light fields (radial glows behind the glass) */
+  --field-mint: rgba(52, 211, 158, 0.55);
+  --field-indigo: rgba(99, 102, 241, 0.55);
+  --field-mint-soft: rgba(143, 240, 192, 0.35);
+  --field-teal: rgba(45, 140, 160, 0.45);
+  --field-opacity: 0.75;  /* canvas 0.9; lowered so lede text over the fields keeps 4.5:1 */
+  --field-drift-1: 26s;
+  --field-drift-2: 32s;
+  --field-drift-3: 29s;
+
+  /* Glass */
+  --glass-sheen: linear-gradient(140deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.03) 38%, rgba(255, 255, 255, 0.01) 62%, rgba(143, 240, 192, 0.06));
+  --glass-tint: rgba(18, 25, 44, 0.56);        /* tint under text; canvas used 0.48, raised for contrast */
+  --glass-tint-solid: rgba(22, 30, 52, 0.94);  /* when backdrop-filter is unsupported */
+  --glass-tint-strong: rgba(18, 25, 44, 0.84); /* sheets and menus over content */
+  --glass-border: rgba(255, 255, 255, 0.16);
+  --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.38), inset 0 -1px 0 rgba(255, 255, 255, 0.06), inset 1px 0 0 rgba(255, 255, 255, 0.08);
+  --glass-shadow: 0 24px 60px rgba(3, 6, 16, 0.45);
+  --glass-shadow-sm: 0 18px 44px rgba(3, 6, 16, 0.45);
+  --blur: 26px;
+  --saturate: 170%;
+  --tile-bg: rgba(10, 15, 30, 0.45);           /* recessed stat tiles inside glass */
+  --tile-rim: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --icon-rim: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  --hover-bg: rgba(255, 255, 255, 0.08);
+  --selected-bg: rgba(232, 236, 244, 0.92);    /* current nav item: frosted white pill */
+  --selected-rim: inset 0 1px 0 #ffffff;
+  --button-rim: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  --scrim: rgba(6, 10, 22, 0.45);
+
+  /* Shape */
+  --r-pill: 999px;
+  --r-feature: 36px;  /* feature card (home validator) */
+  --r-card: 30px;
+  --r-card-sm: 26px;  /* phone list cards */
+  --r-tile: 22px;
+  --r-icon: 16px;
+  --r-sm: 10px;
+
+  /* Type */
+  --font: 'Manrope', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+  --fs-2xs: 0.6875rem; /* 11 */
+  --fs-xs: 0.8125rem;  /* 13 */
+  --fs-sm: 0.875rem;   /* 14 */
+  --fs-md: 1rem;       /* 16 */
+  --fs-lg: 1.1875rem;  /* 19 */
+  --fs-xl: 1.3125rem;  /* 21 */
+  --fs-2xl: 1.5rem;    /* 24 */
+  --fs-3xl: clamp(1.75rem, 1.4rem + 1.4vw, 2.125rem); /* 28–34 */
+  --fs-hero: clamp(2.375rem, 1.2rem + 5vw, 4.75rem);  /* 38–76 */
+  --fs-h1: clamp(2rem, 1.3rem + 2.8vw, 3.25rem);      /* inner pages */
+  --lh-body: 1.6;
+  --lh-tight: 1.04;
+  --tracking-tight: -0.035em;
+
+  /* Space */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --s7: 48px; --s8: 72px; --s9: 88px;
+  --container: 1180px;
+  --tap: 44px;
+  --tap-lg: 54px;
+  --tabbar-h: 66px;
+
+  /* Motion */
+  --ease: 0.3s ease;
+  --ease-fast: 0.16s ease;
+
+  color-scheme: dark;
+}

@@ -4,7 +4,8 @@ import { fmtAmount, fmtPrice, fmtUsd, shortAddr } from './format';
 import { NewPool } from './NewPool';
 import { PoolGlance, MiniGap } from './PoolGraphics';
 import { ago, canSign, fmtGap, gapTone, healthLabel, poolStatus, shortId } from './pools';
-import { Empty, Icon, Logo, SkeletonRows } from './ui';
+import { SiteNav, SiteTabBar } from './SiteNav';
+import { Empty, Icon, SkeletonRows } from './ui';
 import { type Wallet, type WalletAccount, getWallet } from './wallet';
 
 /**
@@ -31,12 +32,7 @@ export function PoolsPage({ route }: { route: string }) {
   return (
     <div className="pools-page">
       <header className="top">
-        <Logo />
-        <nav className="nav" aria-label="Sections">
-          <a href="#">Trade</a>
-          <a href="#/pools" aria-current={component || isNew ? undefined : 'page'} className="on">Pools</a>
-        </nav>
-        <div className="right">
+        <SiteNav current="pools" showPools end={<>
           {config && <span className={`net ${config.network}`}><span className="dot" aria-hidden="true" />{config.network}</span>}
           {accounts.length > 1 && (
             <select className="account" value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Account">
@@ -44,13 +40,14 @@ export function PoolsPage({ route }: { route: string }) {
             </select>
           )}
           {wallet ? <radix-connect-button /> : config && <span className="muted small">wallet not configured</span>}
-        </div>
+        </>} />
       </header>
       <main className="pools-main">
         {error && <p className="error">{error}</p>}
         {isNew ? <NewPool account={account} wallet={wallet} explorer={explorer} />
           : component ? <PoolView component={component} account={account} wallet={wallet} explorer={explorer} /> : <PoolTable account={account} />}
       </main>
+      <SiteTabBar current="pools" showPools />
     </div>
   );
 }

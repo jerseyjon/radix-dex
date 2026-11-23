@@ -1,6 +1,7 @@
 // The charts draw on canvas, which cannot use CSS directly. They read the same custom
 // properties that styles.css defines on :root, so the page and the charts share one palette.
-// Change a colour in styles.css (the "Chart" block of :root) and both follow.
+// Change a colour in styles.css (the "Chart" block of :root) or styles/tokens.css and both follow.
+// Custom properties defined as var(--other) come back resolved from getComputedStyle.
 
 export interface ChartTheme {
   up: string; down: string; accent: string;
@@ -11,9 +12,9 @@ export interface ChartTheme {
 
 /** Fallbacks match styles.css; they are only used if the stylesheet has not loaded. */
 const FALLBACK: Omit<ChartTheme, 'font'> = {
-  up: '#2ebd85', down: '#f0616d', accent: '#8ea4ff',
-  grid: '#161b23', axis: '#262e3a', text: '#8d97a6', strong: '#e6e9ef',
-  crosshair: '#5b6575', label: '#262e3a', surface: '#10141a', line: '#1f2630',
+  up: '#8ff0c0', down: '#ffa29d', accent: '#8ff0c0',
+  grid: '#1c2640', axis: '#2b3757', text: '#c3cbdd', strong: '#e8ecf4',
+  crosshair: '#6c7a9a', label: '#2b3757', surface: '#121a2e', line: 'rgba(255, 255, 255, 0.1)',
 };
 
 const VARS: Record<keyof typeof FALLBACK, string> = {

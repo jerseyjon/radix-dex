@@ -315,3 +315,26 @@ site's solver does not watch, so they neither race that solver nor trade against
 on the site. They still share the test pool; `scripts/stokenet-set-price.ts` puts its price back.
 
 Not done: a signed limit order is not split across fills.
+
+## Look: difd.net's "Liquid glass" (since 23 Nov 2026)
+
+The site wears the owner's main site's look. `apps/web/src/styles/tokens.css` is copied verbatim from
+difd-site (`src/styles/tokens.css`): every colour, radius, blur, rim, shadow and the Manrope font
+(self-hosted, `apps/web/src/assets/fonts/`, SIL OFL). `styles.css` maps the DEX's own names onto those
+tokens and keeps a denser type and radius scale (`--dx-fs-*`, `--dx-r-*`) for a trading tool. Copy the file
+again when difd.net's tokens change.
+
+- Navigation: the floating glass pill (DIFD logo back to https://difd.net, Trade, Pools, network, account,
+  wallet; `SiteNav.tsx`); on phones (760 px and below) the sections move to a glass tab bar at the bottom.
+  The wallet button uses the toolkit's `black` theme, as on difd.net.
+- Glass on the panels, cards, order form, tables and the Pools page. The chart and depth, and the order book
+  and trades, stay on the solid `--surface` (#121a2e): glass behind live numbers hurts readability. The pool
+  graphics sit on solid `--surface` tiles inside their glass card; their series colours were re-validated
+  there with the dataviz validator (all checks pass).
+- The light fields are fainter than on difd.net (`--field-opacity` 0.3 against 0.75), stop moving under
+  `prefers-reduced-motion`, and every panel falls back to a solid tint where `backdrop-filter` is unsupported.
+  Text contrast was checked on the worst case (glass sheen over the brightest field): muted text 5.8:1,
+  sell colour 4.9:1, everything else higher.
+- Touch screens (`pointer: coarse`, or 760 px and below): every control at least 44 px tall.
+- The content security policy (`frame-ancestors 'none'` only, `apps/server/src/http.ts`) does not restrict
+  fonts; the fonts are same-origin files served as `font/woff2`.

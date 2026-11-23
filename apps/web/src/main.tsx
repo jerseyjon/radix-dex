@@ -2,6 +2,8 @@ import { StrictMode, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { PoolsPage } from './PoolsPage';
+import { Fields } from './SiteNav';
+import './styles/tokens.css';
 import './styles.css';
 
 declare global {
@@ -16,7 +18,7 @@ function Root() {
     window.addEventListener('hashchange', f);
     return () => window.removeEventListener('hashchange', f);
   }, []);
-  return hash.startsWith('#/pools') ? <PoolsPage route={hash} /> : <App />;
+  return <><Fields />{hash.startsWith('#/pools') ? <PoolsPage route={hash} /> : <App />}</>;
 }
 
 createRoot(document.getElementById('root')!).render(<StrictMode><Root /></StrictMode>);

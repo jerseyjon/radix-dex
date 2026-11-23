@@ -18,6 +18,8 @@ export function getWallet(networkId: number, dAppDefinition: string | null | und
   if (wallet) return wallet;
   const rdt = RadixDappToolkit({ dAppDefinitionAddress: dAppDefinition, networkId, applicationName: 'Radix DEX', applicationVersion: '0.1.0' });
   rdt.walletApi.setRequestData(DataRequestBuilder.accounts().atLeast(1));
+  // The button's look matches difd.net's (its 'black' theme sits well on the glass).
+  rdt.buttonApi.setTheme('black');
   wallet = {
     onAccounts(cb) {
       const sub = rdt.walletApi.walletData$.subscribe((d) => cb((d.accounts ?? []).map((a) => ({ address: a.address, label: a.label }))));
