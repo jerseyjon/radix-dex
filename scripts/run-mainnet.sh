@@ -8,5 +8,7 @@ val() { node -e "const v=JSON.parse(require('fs').readFileSync('data/mainnet-set
 export DEX_NETWORK=mainnet DEX_HOST=127.0.0.1 DEX_PORT="${DEX_PORT:-8787}" DEX_WEB_DIR=apps/web/dist
 export DEX_SOLVER_KEY_FILE=data/mainnet-solver.key DEX_CLIENT_IP_HEADER=cf-connecting-ip
 export DEX_TAKER_FEE_BPS="${DEX_TAKER_FEE_BPS:-10}" DEX_MAKER_FEE_BPS="${DEX_MAKER_FEE_BPS:-0}"
+# The owner's OwnerPools (docs/MAINNET-POOLS.md): XRD/hUSDC created 23 Nov 2026. A paused pool is not quoted.
+export DEX_OWNER_POOLS="${DEX_OWNER_POOLS:-component_rdx1cz6ga0dfz3vqefku0vvgyu0fsv9q6u09vtkpew5ysa8qdsz3ha6zyr}"
 export DEX_SOLVER_BADGE="$(val solverBadge)" DEX_REGISTRY="$(val registry)" DEX_ORDER_BOOK="$(val orderBook)" DEX_DAPP_DEFINITION="$(val dapp)"
 exec npx tsx apps/server/src/main.ts
