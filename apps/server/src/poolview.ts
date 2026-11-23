@@ -3,10 +3,10 @@
 // ownerpool-setup.ts, the same ones scripts/mainnet-owner-pool.ts uses). No I/O here; pools.ts reads
 // the ledger and the files and calls these.
 import {
-  Decimal, OWNER_POOL_MAX_FEE_BPS, heartbeatVerdict, ownerPoolAnchorDistance, ownerPoolDepositManifest, ownerPoolLimitsAndFeeManifest,
+  Decimal, OWNER_POOL_BOT_DEFAULTS, OWNER_POOL_MAX_FEE_BPS, heartbeatVerdict, ownerPoolAnchorDistance, ownerPoolDepositManifest, ownerPoolLimitsAndFeeManifest,
   ownerPoolSetAnchorManifest, ownerPoolSetFeeManifest, ownerPoolSetOperatorManifest, ownerPoolSetPausedManifest, ownerPoolStepMismatches,
   ownerPoolWithdrawManifest, parseMarkoutLines, priceGap, proportionalB, summarizeMarkouts,
-  type OwnerPoolEvent, type OwnerPoolOperatorLimits, type OwnerPoolState, type OwnerPoolTx, type PreviewResult,
+  type OwnerPoolEvent, type OwnerPoolOperatorLimits, type OwnerPoolState, type OwnerPoolTx, type PreviewResult, type VenueReading,
 } from '@radix-dex/core';
 
 // ------------------------------------------------------------------ prices
@@ -176,6 +176,58 @@ export function markoutView(text: string, horizonsMin = [5, 30]) {
   const sum = summarizeMarkouts(records, { horizonsMin });
   const trades = records.filter((r) => r.kind === 'trade');
   return { horizonsMin, trades: sum.all.trades, pending: sum.pending, all: sum.all, bySize: sum.bySize, byFeeBps: sum.byFeeBps, lastTradeAt: trades.length ? Math.max(...trades.map((t) => t.at)) : null };
+}
+
+// ------------------------------------------------------------------ the graphics' inputs
+
+/**
+ * The bot's rules the page draws around the prices, read from the bot's own defaults
+ * (OWNER_POOL_BOT_DEFAULTS): the anchor stop (it stops following, and pauses, when its reference is
+ * more than `anchorStop` from the owner's anchor; resumes inside `anchorStop * anchorResume`), the dead
+ * band (no rebalance while the curve is this close to the reference; null in the defaults = half the
+ * pool's fee), and the share of the allowance it keeps back and spends per tick. The fee band is the
+ * pool's own fee either side of the reference: inside it an arbitrage swap does not pay.
+ * The defaults, not the running bot's flags: the service passes none of these today.
+ */
+export interface BotRules {
+  source: string;
+  anchorStop: number;
+  anchorResume: number;
+  deadBandBps: number;
+  feeBandBps: number;
+  reserveFraction: number;
+  spendFraction: number;
+}
+
+export function botRules(feeBps: number, d: Pick<typeof OWNER_POOL_BOT_DEFAULTS, 'maxAnchorDistance' | 'anchorResumeFactor' | 'deadBandBps' | 'reserveFraction' | 'spendFraction'> = OWNER_POOL_BOT_DEFAULTS): BotRules {
+  return {
+    source: "the bot's defaults",
+    anchorStop: d.maxAnchorDistance,
+    anchorResume: d.maxAnchorDistance * d.anchorResumeFactor,
+    deadBandBps: d.deadBandBps ?? feeBps / 2,
+    feeBandBps: feeBps,
+    reserveFraction: d.reserveFraction,
+    spendFraction: d.spendFraction,
+  };
+}
+
+/**
+ * The owner's anchor the bot measures its stop from: the owner's last statement on the ledger as the
+ * bot read it (its state file), else the pool's ledger anchor (which the operator's costed moves also
+ * restate, so it is only the owner's until the bot moves the curve).
+ */
+export function ownerAnchorView(bot: Pick<BotView, 'ownerAnchor'> | undefined, ledgerAnchor: [string, string] | undefined): { anchor: [string, string]; price: number; source: 'owner-statement' | 'ledger'; at: number | null } | null {
+  const pick = bot?.ownerAnchor ? { anchor: bot.ownerAnchor.anchor, source: 'owner-statement' as const, at: bot.ownerAnchor.at || null } : ledgerAnchor ? { anchor: ledgerAnchor, source: 'ledger' as const, at: null } : undefined;
+  if (!pick) return null;
+  const price = Number(pick.anchor[1]) / Number(pick.anchor[0]);
+  return Number.isFinite(price) && price > 0 ? { ...pick, price } : null;
+}
+
+/** A reference venue as the page shows it: its fee-free mid, and its measured depth (A) and own fee for the depth overlay. */
+export interface VenueView { venue: string; used: boolean; mid: number | null; dropped: string | null; depth: number | null; fee: number | null }
+export function venueViews(readings: Pick<VenueReading, 'venue' | 'used' | 'mid' | 'dropped' | 'depth' | 'fee'>[]): VenueView[] {
+  const n = (v: number | undefined) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  return readings.map((v) => ({ venue: v.venue, used: v.used, mid: n(v.mid), dropped: v.dropped ?? null, depth: n(v.depth), fee: n(v.fee) }));
 }
 
 // ------------------------------------------------------------------ owner actions

@@ -13,8 +13,8 @@ import type { Config } from './config.ts';
 import { HttpError } from './http.ts';
 import { TtlCache, type MarketData } from './marketdata.ts';
 import {
-  NO_FEES, OwnerActionError, addFees, botView, cleanWant, curvePrice, describePoolTx, gapBps, heartbeatView, isOwnerAction, markoutView, planOwnerAction, previewView,
-  type BotView, type FeeTotals, type PoolActivity, type ProcessHealth,
+  NO_FEES, OwnerActionError, addFees, botRules, botView, cleanWant, ownerAnchorView, venueViews, curvePrice, describePoolTx, gapBps, heartbeatView, isOwnerAction, markoutView, planOwnerAction, previewView,
+  type BotView, type FeeTotals, type PoolActivity, type ProcessHealth, type VenueView,
 } from './poolview.ts';
 
 export interface MarketRef {
@@ -23,7 +23,7 @@ export interface MarketRef {
   status: 'ok' | 'disagree' | 'none' | 'bot';
   reason: string;
   at: number;
-  venues: { venue: string; used: boolean; mid: number | null; dropped: string | null }[];
+  venues: VenueView[];
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -106,7 +106,7 @@ export class PoolsService {
       const ref: VenueReference = aggregateVenues(quotes, Date.now(), {
         minVenues: BD.minVenues, maxAgeMs: BD.maxSourceAgeSec * 1000, maxDisagreement: BD.maxDisagreement, maxRoundTrip: BD.maxRoundTrip, minImpactBps: BD.minImpactBps, maxVenueFee: BD.maxVenueFee,
       });
-      const venues = ref.venues.map((v) => ({ venue: v.venue, used: v.used, mid: v.mid ?? null, dropped: v.dropped ?? null }));
+      const venues = venueViews(ref.venues);
       const used = venues.filter((v) => v.used).map((v) => v.venue).join(', ');
       if (ref.price === undefined) return { price: NaN, source: 'on-ledger venues, the bot\'s rules', status: 'none', reason: ref.reason, at: Date.now(), venues };
       return { price: ref.price, source: `on-ledger venues, the bot's rules: ${used}`, status: ref.status === 'ok' ? 'ok' : 'disagree', reason: ref.reason, at: Date.now(), venues };
@@ -244,6 +244,8 @@ export class PoolsService {
         account: files.bot?.operatorAccount ?? null, accountXrd: opXrd,
       } : null,
       botState: files.bot ?? null,
+      ownerAnchor: s ? ownerAnchorView(files.bot, s.anchor) : null,
+      rules: botRules(state.feeBps),
       fees: { ...fees.totals, complete: fees.complete, valueA: feeValueA ?? null, valueUsd: feeValueA !== undefined && usd ? feeValueA * usd : null },
       markout: files.markout ?? null,
       activity,

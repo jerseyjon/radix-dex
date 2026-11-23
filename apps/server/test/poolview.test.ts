@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { markRecord, parseOwnerPoolTransaction, tradeFromSwap, tradeRecord } from '@radix-dex/core';
 import {
-  NO_FEES, OwnerActionError, addFees, botView, cleanWant, curvePrice, describePoolTx, gapBps, heartbeatView, isOwnerAction, markoutView, planOwnerAction, previewView,
+  NO_FEES, OwnerActionError, addFees, botRules, botView, cleanWant, ownerAnchorView, venueViews, curvePrice, describePoolTx, gapBps, heartbeatView, isOwnerAction, markoutView, planOwnerAction, previewView,
 } from '../src/poolview.ts';
 import { OPERATOR, OP_BADGE, OWNER, OWNER_BADGE, POOL, TEUR, XRD, callLine, configEvent, poolState, proofLine, rebalanceEvent, streamTx, swapEvent } from './pool-fixture.ts';
 
@@ -175,4 +175,33 @@ test('the preview in the owner\'s terms; a `want` sent back is cleaned to known 
   assert.equal(previewView(m, { ok: false, error: 'Reserves moved', feeXrd: '0', changes: [] }, { owner: OWNER, pool: POOL, ownerBadge: OWNER_BADGE, symbol: sym }).error, 'Reserves moved');
   assert.deepEqual(cleanWant({ feeBps: 31, reserves: ['1', '2'], operator: null, junk: 1, anchor: ['x', '1'] }), { feeBps: 31, reserves: ['1', '2'], operator: null });
   assert.deepEqual(cleanWant('nope'), {});
+});
+
+test("the graphics' rules come from the bot's defaults: 5% anchor stop, dead band half the fee", () => {
+  const r = botRules(110);
+  assert.equal(r.anchorStop, 0.05);
+  assert.ok(Math.abs(r.anchorResume - 0.04) < 1e-12);
+  assert.equal(r.deadBandBps, 55);
+  assert.equal(r.feeBandBps, 110);
+  assert.equal(r.reserveFraction, 0.1);
+  assert.equal(r.spendFraction, 0.5);
+  // An explicit dead band wins over half the fee.
+  assert.equal(botRules(110, { maxAnchorDistance: 0.03, anchorResumeFactor: 0.5, deadBandBps: 20, reserveFraction: 0, spendFraction: 1 }).deadBandBps, 20);
+});
+
+test("the owner's anchor: the bot's reading of the owner's statement first, else the ledger anchor", () => {
+  const st = { anchor: ['1', '0.00079187319'] as [string, string], txid: 'txid_x', at: 123 };
+  assert.deepEqual(ownerAnchorView({ ownerAnchor: st }, ['1', '0.0008']), { anchor: st.anchor, source: 'owner-statement', at: 123, price: 0.00079187319 });
+  assert.deepEqual(ownerAnchorView({ ownerAnchor: null }, ['2', '0.0016']), { anchor: ['2', '0.0016'], source: 'ledger', at: null, price: 0.0008 });
+  assert.equal(ownerAnchorView(undefined, undefined), null);
+  assert.equal(ownerAnchorView(undefined, ['0', '1']), null);
+});
+
+test('venues carry their depth and own fee for the depth overlay; nothing undefined or NaN', () => {
+  const v = venueViews([
+    { venue: 'ociswap-precision', used: true, mid: 0.000796, depth: 250_000, fee: 0.0005 },
+    { venue: 'caviarnine', used: false, dropped: 'preview failed', mid: undefined, depth: NaN, fee: undefined },
+  ]);
+  assert.deepEqual(v[0], { venue: 'ociswap-precision', used: true, mid: 0.000796, dropped: null, depth: 250_000, fee: 0.0005 });
+  assert.deepEqual(v[1], { venue: 'caviarnine', used: false, mid: null, dropped: 'preview failed', depth: null, fee: null });
 });
