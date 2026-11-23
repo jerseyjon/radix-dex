@@ -114,7 +114,7 @@ const q = encodeURIComponent;
 export interface PoolToken { address: string; symbol: string; divisibility: number }
 export interface ProcessHealth { status: 'alive' | 'stale' | 'missing' | 'other-pool'; lastSeen: number | null; tick: number | null; ok: boolean | null; note: string | null }
 export interface PoolMarket { price: number | null; source: string; status: 'ok' | 'disagree' | 'none' | 'bot'; reason: string; at: number;
-  venues?: { venue: string; used: boolean; mid: number | null; dropped: string | null }[] }
+  venues?: { venue: string; used: boolean; mid: number | null; dropped: string | null; depth?: number | null; fee?: number | null }[] }
 export interface PoolRow {
   address: string; pair: { a: PoolToken; b: PoolToken }; reserves: { a: string; b: string };
   /** B per A on the curve. */
@@ -139,6 +139,10 @@ export interface PoolDetail extends PoolRow {
     pausedByBot: boolean; pauseReason: string | null; consecutiveFailures: number; haltedUntil: number | null; behindTicks: number;
     reference: { at: number; price: number } | null; confirmedVenues: string[]; singleVenueSince: number | null;
     ownerAnchor: { anchor: [string, string]; txid: string; at: number } | null; lastFeeChangeAt: number | null } | null;
+  /** The owner's anchor the bot's stop is measured from (older servers: absent). */
+  ownerAnchor?: { anchor: [string, string]; price: number; source: 'owner-statement' | 'ledger'; at: number | null } | null;
+  /** The bot's rules drawn around the prices, from its defaults (older servers: absent). */
+  rules?: { source: string; anchorStop: number; anchorResume: number; deadBandBps: number; feeBandBps: number; reserveFraction: number; spendFraction: number };
   fees: { swaps: number; feeA: string; feeB: string; volumeA: string; volumeB: string; firstAt: number | null; lastAt: number | null; complete: boolean; valueA: number | null; valueUsd: number | null };
   markout: { horizonsMin: number[]; trades: number; pending: number; all: MarkoutBucket; lastTradeAt: number | null } | null;
   activity: PoolActivity[];

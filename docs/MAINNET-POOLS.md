@@ -384,6 +384,19 @@ alive. **Open** shows one pool:
 | Markout | trades, fees + markout at +5 and +30 minutes, break-even fee | the watcher's `owner-pool-markout-<network>.jsonl` (the same summary as section 7) |
 | Recent activity | the last 50 transactions with pool events: swap, owner (it proved the owner badge) or operator, and what each did | the pool's events |
 
+**At a glance** (above the cards) draws four figures, each with its numbers in text and in its
+accessible label:
+
+| Figure | What it shows | From |
+|---|---|---|
+| Pool split | reserves and inventory valued in token B at the market price; each side's reserve against the operator's floor and cap on one shared value scale, with the room left to the nearer limit | the ledger, the limits |
+| Price position | the pool's price, the market reference and the owner's anchor on one scale (axis in % from the market), the gap labelled; the band in which the bot follows the market (±5% of the owner's anchor), the fee band (±fee) and dead band (±half the fee) around the market | the bot's defaults (`OWNER_POOL_BOT_DEFAULTS`, returned as `rules`), not the running bot's flags; the owner's anchor as the bot last read it from the ledger, else the ledger anchor |
+| Depth | cost against the pool's price (fee included) and the price move for selling and buying 100 / 1,000 / 10,000 / 50,000 of token A, from the constant-product curve; the reference venue's cost for a sale, read as a constant-product pool of its measured depth and own fee (a guide) | the reserves and fee; the venue's `depth` and `fee` from `aggregateVenues` |
+| Bot allowance | the allowance against the budget, the part the bot keeps back (10%), what its next move may use, and the time to full at the contract's linear refill (an epoch taken as about 5 minutes) | the ledger, the bot's defaults |
+
+The table's "vs market" cell carries a small gauge: the market in the middle, the fee band around it,
+the pool's dot.
+
 A heartbeat is stale after 600 s (`DEX_HEARTBEAT_MAX_AGE_SEC`), as the heartbeat timer judges it. Nothing
 on the page shows a key, a file path, a process id or the alert URL.
 

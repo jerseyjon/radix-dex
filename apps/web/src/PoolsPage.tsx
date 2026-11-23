@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { type OperatorLimits, type OwnerAction, type PoolDetail, type PoolRow, type PreparedAction, type ServerConfig, ApiError, api } from './api';
 import { fmtAmount, fmtPrice, fmtUsd, shortAddr } from './format';
+import { PoolGlance, MiniGap } from './PoolGraphics';
 import { ago, canSign, fmtGap, gapTone, healthLabel, poolStatus, shortId } from './pools';
 import { Empty, Icon, Logo, SkeletonRows } from './ui';
 import { type Wallet, type WalletAccount, getWallet } from './wallet';
@@ -89,7 +90,7 @@ function PoolTable() {
                   <tr key={r.address} className="clickable" onClick={() => { location.hash = href; }}>
                     <td><a className="pair-link" href={href}><strong>{r.pair.a.symbol}</strong><span className="muted">/{r.pair.b.symbol}</span></a></td>
                     <td className="r">{fmtPrice(r.price)} <span className="muted small">{r.pair.b.symbol}</span></td>
-                    <td className={`r ${gapTone(r.gapBps)}`} title={r.market ? `${r.market.source}: ${r.market.reason}` : 'No market reference for this pair'}>{fmtGap(r.gapBps)}</td>
+                    <td className={`r ${gapTone(r.gapBps)}`} title={r.market ? `${r.market.source}: ${r.market.reason}` : 'No market reference for this pair'}><span className="gapcell"><MiniGap gapBps={r.gapBps} feeBps={r.feeBps} />{fmtGap(r.gapBps)}</span></td>
                     <td className="r">{r.tvl.usd != null ? fmtUsd(r.tvl.usd) : `${fmtAmount(r.tvl.a)} ${r.pair.a.symbol}`}</td>
                     <td className="r">{(r.feeBps / 100).toFixed(2)}%</td>
                     <td><span className={`chip ${st.tone}`}>{st.label}</span></td>
@@ -137,6 +138,8 @@ function PoolView({ component, account, wallet, explorer }: { component: string;
         </div>
         {p.errors.length > 0 && <p className="error">{p.errors.join('; ')}</p>}
       </section>
+
+      <PoolGlance p={p} />
 
       <div className="pool-grid">
         <section className="panel card">
