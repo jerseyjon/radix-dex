@@ -291,6 +291,15 @@ export function venueSetHold(prev: VenueHoldState, live: string[], now: number, 
 }
 
 /**
+ * The bot's alert for an owner anchor restatement seen on the ledger. Forced (never rate-limited): each
+ * restatement is a distinct owner act that zeroes the allowance, and the second of two within the alert
+ * interval (a restatement and its correction, seen on Stokenet 23 Nov 2026) was suppressed before.
+ */
+export function anchorRestatedAlert(from: readonly string[], to: readonly string[], txid: string): { key: 'anchor-restated'; text: string; force: true } {
+  return { key: 'anchor-restated', force: true, text: `Owner restated the anchor: ${from.join(':')} -> ${to.join(':')} (${txid}). Allowance restarts from zero.` };
+}
+
+/**
  * The alert for a venue-set change, if any (owner's request, 23 Nov 2026: a hold restarted by a venue
  * coming back must be alerted too, not only the drop that started it). A new hold alerts under
  * `venue-hold`; a restart of a running hold alerts under its own key `venue-hold-restart`, so the start's

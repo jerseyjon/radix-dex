@@ -58,7 +58,7 @@ import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, write
 import { assertReferenceExcludesOwnerPools, makePriceSources, makeVenues, readSource, readVenueSource, type PriceSource, type VenueSource } from './owner-pool-sources.ts';
 import {
   AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, anchorCheck, buildTransaction,
-  calibrateScale, decideRebalance, feeDecision, venueSetHold, venueHoldAlert, venueConfirm, venueGate, volatilityEligible, singleVenueCaution, type VenueHoldState, type VenueConfirmState, type SingleVenueState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
+  calibrateScale, decideRebalance, feeDecision, venueSetHold, venueHoldAlert, anchorRestatedAlert, venueConfirm, venueGate, volatilityEligible, singleVenueCaution, type VenueHoldState, type VenueConfirmState, type SingleVenueState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
   ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
   ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, trySubmitAndWait,
   txAllowance, volatilityBps, type Ed25519Key, type VenueReference, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
@@ -199,8 +199,8 @@ const state = loadState();
 const alerts = new AlertSink(cfg.alertUrl, { intervalMs: cfg.alertIntervalSec * 1000, last: state.alertLast, prefix: `[owner-pool-bot ${NETWORK}${SEND ? '' : ' dry-run'}] ` });
 state.alertLast = alerts.limiter.last;
 /** Raise an alert (rate-limited per key); the outcome goes into the tick's log line, never the URL. */
-async function alert(key: string, text: string, into?: Record<string, unknown>): Promise<void> {
-  const r = await alerts.alert(key, text);
+async function alert(key: string, text: string, into?: Record<string, unknown>, o: { force?: boolean } = {}): Promise<void> {
+  const r = await alerts.alert(key, text, Date.now(), o);
   state.alertLast = alerts.limiter.last;
   const rec = { key, sent: r.sent, ...(r.suppressed ? { suppressed: true } : {}), ...(r.error ? { error: r.error } : {}), ...(alerts.enabled ? {} : { noUrl: true }) };
   if (into) ((into.alerts ??= []) as unknown[]).push(rec);
@@ -339,7 +339,8 @@ async function ownerAnchor(now: number, line: Record<string, unknown>): Promise<
       state.ownerAnchor = { statement: r.statement, complete: r.complete, scannedTo: r.newest, checkedAt: now };
       if (r.statement && prev && r.statement.stateVersion !== prev.stateVersion) {
         line.ownerAnchorChanged = { from: prev.anchor, to: r.statement.anchor, txid: r.statement.txid };
-        await alert('anchor-restated', `Owner restated the anchor: ${prev.anchor.join(':')} -> ${r.statement.anchor.join(':')} (${r.statement.txid}). Allowance restarts from zero.`, line);
+        const a = anchorRestatedAlert(prev.anchor, r.statement.anchor, r.statement.txid);
+        await alert(a.key, a.text, line, { force: a.force });
       }
     } catch (e) {
       const msg = String((e as Error)?.message ?? e).slice(0, 200);

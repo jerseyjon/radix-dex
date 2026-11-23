@@ -418,7 +418,7 @@ timeout); an alert that could not be delivered is retried on the next occurrence
 | `start`, `stop` | the loop starts / stops (not with `--once`). NEVER rate-limited: every restart, a crash loop included, is reported |
 | `pool-pause`, `pool-unpause` | the bot set or cleared the operator pause (with the txid, or "previewed only" in a dry run) |
 | `anchor-stop` | the reference is beyond `--max-anchor-distance` from the owner's anchor: the owner must restate it |
-| `anchor-restated` | the ledger shows a new owner anchor statement |
+| `anchor-restated` | the ledger shows a new owner anchor statement (never rate-limited since 23 Nov 2026: each restatement zeroes the allowance; a correction minutes later was suppressed before) |
 | `anchor-unknown` | the owner's anchor cannot be read from the ledger (and whether the flag is used instead) |
 | `halt` | `--max-failures` sends failed in a row: sending stops for `--halt` seconds |
 | `reference-unhealthy` | the on-ledger reference has been unusable (no live venue, or the venues more than 4% apart) for longer than `--pause-after` |

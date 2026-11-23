@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  OWNER_POOL_BOT_DEFAULTS as D, aggregateVenues, feeDecision, referenceVenueProblems, venueFee, venueSetHold, venueHoldAlert, AlertLimiter,
+  OWNER_POOL_BOT_DEFAULTS as D, aggregateVenues, feeDecision, referenceVenueProblems, venueFee, venueSetHold, venueHoldAlert, AlertLimiter, AlertSink, anchorRestatedAlert,
   type VenueHoldState, type VenueQuote,
 } from '../src/index.ts';
 
@@ -205,4 +205,17 @@ test('venue-set hold alerts: a drop starts the hold (venue-hold), the venue comi
   assert.equal(fire(drop2, NOW + 300_000 + HOLD)?.key, 'venue-hold');
   const back2 = venueSetHold(drop2.state, ['a'], NOW + 360_000 + HOLD, HOLD);
   assert.equal(fire(back2, NOW + 360_000 + HOLD)?.key, 'venue-hold-restart');
+});
+
+test('anchor restated: every restatement alerts, a correction minutes later included (it was suppressed on Stokenet, 23 Nov 2026)', async () => {
+  const posted: string[] = [];
+  const sink = new AlertSink('http://127.0.0.1:1/x', { intervalMs: 3600_000, fetch: async (_u, init) => { posted.push(String(init?.body)); return { ok: true, status: 200 } as Response; } });
+  const a1 = anchorRestatedAlert(['1250', '1'], ['1250', '1.03'], 'txid_a');
+  const a2 = anchorRestatedAlert(['1250', '1.03'], ['1250', '1'], 'txid_b');
+  assert.equal(a1.force, true);
+  assert.equal((await sink.alert(a1.key, a1.text, NOW, { force: a1.force })).sent, true);
+  assert.equal((await sink.alert(a2.key, a2.text, NOW + 180_000, { force: a2.force })).sent, true);
+  // Without force the same key would have been suppressed: that is what happened before.
+  assert.equal((await sink.alert(a2.key, a2.text, NOW + 240_000)).suppressed, true);
+  assert.deepEqual(posted.map((p) => /-> (\S+)/.exec(p)?.[1]), ['1250:1.03', '1250:1']);
 });
