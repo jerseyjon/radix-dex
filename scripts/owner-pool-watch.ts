@@ -74,8 +74,9 @@ const cfg = {
   markoutHorizonsMin: (opt('markout-horizons') ?? '5,30').split(',').map(Number).filter((x) => x > 0),
 };
 
-const gw = new Gateway(NETWORKS[NETWORK]);
-const mainnetGw = new Gateway(NETWORKS.mainnet);
+// --gateway-url / --mainnet-gateway-url: another Gateway (your own, or for tests a local fault proxy).
+const gw = new Gateway(NETWORKS[NETWORK], { url: opt('gateway-url') });
+const mainnetGw = new Gateway(NETWORKS.mainnet, { url: opt('mainnet-gateway-url') });
 const venues = makeVenues(cfg.venues, mainnetGw, { sizeXrd: cfg.quoteSizeXrd, smallFraction: BD.smallQuoteFraction });
 const log = (o: Record<string, unknown>) => console.log(JSON.stringify({ t: new Date().toISOString(), ...o }));
 // Same hard guard as the bot: the reference never contains the watched pool or any OwnerPool component.

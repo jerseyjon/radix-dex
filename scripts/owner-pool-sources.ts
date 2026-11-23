@@ -172,10 +172,11 @@ const syntheticVenue = (s: PriceSource): VenueSource => ({
 
 export function makeVenues(names: string[], mainnetGw: Gateway, o: { sizeXrd: number; smallFraction: number }): VenueSource[] {
   const quoter = new Quoter(mainnetGw);
-  return names.map((n) => {
+  return names.map((n, i) => {
     const def = VENUE_POOLS[n];
     if (def) return venueSource(n, def, mainnetGw, quoter, o);
-    if (n.startsWith('fixed:') || n.startsWith('file:')) return syntheticVenue(makePriceSources([n], mainnetGw)[0]!);
+    // Each synthetic venue made with its own position, so two fixed: venues are two venues (fixed#0, fixed#1), not one.
+    if (n.startsWith('fixed:') || n.startsWith('file:')) return syntheticVenue(makePriceSources(names.map((x, j) => (j === i ? x : 'fixed:1')), mainnetGw)[i]!);
     throw new Error(`Unknown venue ${n} (known: ${VENUE_NAMES.join(', ')}, fixed:<price>, file:<path>)`);
   });
 }

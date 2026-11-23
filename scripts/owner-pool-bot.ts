@@ -48,6 +48,9 @@
 //   --no-fee                 never touch the fee
 //   --state <path>           state file (default data/owner-pool-bot-state.json; data/ is gitignored)
 //   --key <path> --badge <resource> --pool <component> --network stokenet
+//   --gateway-url <url>      the Gateway for the operated network (default: the network's public one); e.g. your own
+//                            Gateway, or for TESTS a local fault proxy (scripts/gateway-fault-proxy.ts)
+//   --mainnet-gateway-url <url>   the mainnet Gateway the venues are READ from (default: the public one); same uses
 //
 // Keys: the operator key is loaded from --key (default data/stokenet-owner-pool-operator.key) and never
 // printed. The bot holds no owner key and cannot do anything only the owner may do.
@@ -57,7 +60,7 @@ import {
   AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, anchorCheck, buildTransaction,
   calibrateScale, decideRebalance, feeDecision, venueSetHold, venueConfirm, venueGate, volatilityEligible, singleVenueCaution, type VenueHoldState, type VenueConfirmState, type SingleVenueState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
   ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
-  ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, submitAndWait,
+  ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, trySubmitAndWait,
   txAllowance, volatilityBps, type Ed25519Key, type VenueReference, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
 } from '../packages/core/src/index.ts';
 
@@ -150,9 +153,9 @@ if (!(cfg.singleVenueSizeFactor > 0 && cfg.singleVenueSizeFactor <= 1) || !(cfg.
 if (!(cfg.quoteSizeXrd > 0) || !(cfg.smallQuoteFraction > 0 && cfg.smallQuoteFraction < 1)) throw new Error('bad --quote-size / --small-fraction');
 
 const net = NETWORKS[NETWORK];
-const gw = new Gateway(net);
+const gw = new Gateway(net, { url: opt('gateway-url') });
 /** Mainnet is only READ, for prices: entity details and free previews. Nothing is ever signed for it. */
-const mainnetGw = new Gateway(NETWORKS.mainnet);
+const mainnetGw = new Gateway(NETWORKS.mainnet, { url: opt('mainnet-gateway-url') });
 
 const log = (o: Record<string, unknown>) => console.log(JSON.stringify({ t: new Date().toISOString(), ...o }));
 // The alert URL may hold a private topic: it is never logged, only whether one is set.
@@ -292,7 +295,8 @@ async function execute(type: string, manifest: string): Promise<Sent> {
   saveState();
   // Recorded BEFORE submission: an operator action on ledger that is not in this file was not ours.
   appendFileSync(cfg.sentLog, JSON.stringify({ at: new Date().toISOString(), txid: tx.intentHashId, type, pool: cfg.pool, network: NETWORK }) + '\n');
-  const out = await submitAndWait(gw, tx, 180_000);
+  // Never throws: a refused or unreachable submit is a FAILED SEND (counted toward the halt), not a tick error.
+  const out = await trySubmitAndWait(gw, tx, 180_000);
   const ok = out.status === 'CommittedSuccess';
   const so = recordSendOutcome(state, ok, Date.now(), { maxFailures: cfg.maxConsecutiveFailures, haltMs: cfg.haltSec * 1000 });
   state.consecutiveFailures = so.consecutiveFailures;
@@ -590,7 +594,7 @@ process.on('SIGINT', () => stop('SIGINT'));
 process.on('SIGTERM', () => stop('SIGTERM'));
 const sleep = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); wake = () => { clearTimeout(t); r(); }; });
 
-log({ event: 'start', mode: SEND ? 'send' : 'dry-run', network: NETWORK, pool: cfg.pool, operatorAccount, badge: cfg.badge, venues: venues.map((s) => s.name), watch: watchSources.map((s) => s.name), config: redactedCfg() });
+log({ event: 'start', mode: SEND ? 'send' : 'dry-run', network: NETWORK, pool: cfg.pool, operatorAccount, badge: cfg.badge, gateway: opt('gateway-url') ?? 'public', mainnetGateway: opt('mainnet-gateway-url') ?? 'public', venues: venues.map((s) => s.name), watch: watchSources.map((s) => s.name), config: redactedCfg() });
 // Start and stop are never rate-limited: every restart (a crash loop included) must be seen.
 if (!ONCE) await forceAlert('start', `Bot started (pid ${process.pid}) on ${cfg.pool.slice(0, 24)}...: venues ${cfg.venues.join(',')}, quote size ${cfg.quoteSizeXrd} XRD, disagreement bound ${(cfg.maxDisagreement * 100).toFixed(1)}%.`);
 let errors = 0;

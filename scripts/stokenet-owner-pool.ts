@@ -33,6 +33,7 @@
 //   builders  the builders the bot needs, on ledger: operator_set_fee 40 then 30 and set_operator_paused
 //             true then false (operator key, sent with --send); set_anchor and withdraw_inventory (owner,
 //             preview only), plus their refusals with the operator badge.
+//   anchor <A> <B> | limits key=value ... | fee <bps>   owner drills for the bot's failure-path tests (see below).
 //   status    print the pool's state.
 //
 // Every manifest is built by code (packages/core/src/ownerpool-ops.ts for the pool calls) and previewed
@@ -633,6 +634,59 @@ if (step === 'trade') {
     `CALL_METHOD ${addr(alice)} "deposit_batch" Expression("ENTIRE_WORKTOP");`,
   ].join('\n'), aliceKey);
   if (r.txid) { state.markoutTrades ??= []; state.markoutTrades.push({ at: new Date().toISOString(), sell: side, amount, out: want, txid: r.txid }); save(); }
+}
+
+// ====================================================================== owner drills (failure-path tests)
+// anchor <A> <B>            the owner restates the anchor (set_anchor, guarded by the reserves seen): zeroes the
+//                           operator's allowance and emits OwnerPoolAnchorEvent. Retried once if a swap or a bot
+//                           move lands between the read and the commit ("Reserves moved").
+// limits key=value ...      the owner changes the operator limits (set_operator_limits): the fields named are
+//                           changed, every other field is copied from the ledger as it is. Keys: moveBudgetBps,
+//                           windowEpochs, maxReserveA, maxReserveB, minReserveA, minReserveB, minFeeBps, maxFeeBps.
+// fee <bps>                 the owner sets the fee (set_fee).
+if (step === 'anchor') {
+  const a = String(args[1] ?? ''), b = String(args[2] ?? '');
+  if (!(Number(a) > 0 && Number(b) > 0)) throw new Error('usage: anchor <A> <B> [--send]');
+  for (let attempt = 1; ; attempt++) {
+    const p = await pool(); show(p);
+    console.log(`  new anchor ${a}:${b} (${(Number(b) / Number(a)).toPrecision(6)} B per A) is ${(ownerPoolAnchorDistance(p, [a, b]) * 100).toFixed(3)}% from the curve's price`);
+    try {
+      const r = await run(`set_anchor ${a}:${b} (owner)`, ownerPoolSetAnchorManifest({ pool: state.pool, owner: ownerSigner(), feeLockXrd: '20', anchor: [a, b], expected: reservesOf(p) }), ownerKey);
+      if (r.txid) { state.drills ??= []; state.drills.push({ at: new Date().toISOString(), step: 'anchor', anchor: [a, b], txid: r.txid }); save(); }
+      break;
+    } catch (e) {
+      if (attempt >= 2 || !/Reserves moved|unexpected outcome|did not do what was expected/.test(String((e as Error)?.message))) throw e;
+      console.log('  reserves moved between the read and the commit: reading again');
+    }
+  }
+  if (send) { const st = await ledgerOperatorStatus(); console.log(`  allowance now ${st.allowance} (zeroed by the restatement)`); }
+  show(await pool());
+}
+if (step === 'limits') {
+  const p = await pool();
+  const before = { ...p.split!.limits };
+  const limits = { ...before } as Record<string, string | number>;
+  const NUM = ['moveBudgetBps', 'windowEpochs', 'minFeeBps', 'maxFeeBps'], STR = ['maxReserveA', 'maxReserveB', 'minReserveA', 'minReserveB'];
+  for (const kv of args.slice(1).filter((x) => x.includes('='))) {
+    const [k, v] = kv.split('=') as [string, string];
+    if (NUM.includes(k)) limits[k] = Number(v); else if (STR.includes(k)) limits[k] = v; else throw new Error(`unknown limit ${k}`);
+  }
+  console.log(`limits before: ${JSON.stringify(before)}\nlimits after:  ${JSON.stringify(limits)}`);
+  const st0 = await ledgerOperatorStatus();
+  console.log(`  allowance before ${st0.allowance}`);
+  const r = await run('set_operator_limits (owner)', ownerPoolSetOperatorLimitsManifest({ pool: state.pool, owner: ownerSigner(), feeLockXrd: '20', limits: limits as never }), ownerKey);
+  if (r.txid) {
+    state.drills ??= []; state.drills.push({ at: new Date().toISOString(), step: 'limits', before, after: limits, txid: r.txid }); save();
+    const st = await ledgerOperatorStatus();
+    console.log(`  allowance after ${st.allowance}`);
+  }
+}
+if (step === 'fee') {
+  const bps = Number(args[1]);
+  if (!Number.isInteger(bps)) throw new Error('usage: fee <bps> [--send]');
+  const r = await run(`set_fee ${bps} (owner)`, ownerPoolSetFeeManifest({ pool: state.pool, owner: ownerSigner(), feeLockXrd: '20', feeBps: bps }), ownerKey);
+  if (r.txid) { state.drills ??= []; state.drills.push({ at: new Date().toISOString(), step: 'fee', feeBps: bps, txid: r.txid }); save(); }
+  show(await pool());
 }
 
 if (step === 'status') {

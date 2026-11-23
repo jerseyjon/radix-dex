@@ -221,3 +221,31 @@ export async function submitAndWait(gateway: Gateway, tx: BuiltTransaction, time
   }
   return { status: 'Timeout', error: `No final status after ${timeoutMs} ms` };
 }
+
+export type SendOutcome = TxOutcome | { status: 'SubmitFailed'; error: string };
+
+/**
+ * Submit and wait like `submitAndWait`, but never throws, so a caller that counts failed sends (the
+ * OwnerPool bot's halt after N failures) sees every failure: a submission the Gateway refuses or
+ * cannot take is `SubmitFailed`; a status poll that fails is retried until the timeout (the
+ * transaction may still commit) and ends in `Timeout` carrying the last poll error.
+ */
+export async function trySubmitAndWait(gateway: Gateway, tx: Pick<BuiltTransaction, 'hex' | 'intentHashId'>, timeoutMs = 60_000, pollMs = 1500): Promise<SendOutcome> {
+  const msg = (e: unknown) => String((e as Error)?.message ?? e).slice(0, 300);
+  try {
+    await gateway.post('/transaction/submit', { notarized_transaction_hex: tx.hex });
+  } catch (e) {
+    return { status: 'SubmitFailed', error: msg(e) };
+  }
+  const started = Date.now();
+  let lastError = '';
+  while (Date.now() - started < timeoutMs) {
+    await new Promise((r) => setTimeout(r, pollMs));
+    let s: any;
+    try { s = await gateway.post('/transaction/status', { intent_hash: tx.intentHashId }); } catch (e) { lastError = msg(e); continue; }
+    if (s?.intent_status === 'CommittedSuccess') return { status: 'CommittedSuccess' };
+    if (s?.intent_status === 'CommittedFailure') return { status: 'CommittedFailure', error: String(s.error_message ?? s.intent_status_description ?? '') };
+    if (s?.intent_status === 'PermanentlyRejected') return { status: 'Rejected', error: String(s.error_message ?? s.intent_status_description ?? '') };
+  }
+  return { status: 'Timeout', error: `No final status after ${timeoutMs} ms${lastError ? `; last status error: ${lastError}` : ''}` };
+}
