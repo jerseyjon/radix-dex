@@ -4,10 +4,11 @@
 # fill ~/.config/radix-dex/owner-pool.env (from deploy/owner-pool.env.example), then:
 #   systemctl --user daemon-reload && systemctl --user enable --now owner-pool-bot
 #   journalctl --user -u owner-pool-bot -f          # one JSON line per tick
-# DRY RUN unless OWNER_POOL_BOT_FLAGS holds --send (which the bot refuses off Stokenet today).
+# DRY RUN unless OWNER_POOL_BOT_FLAGS holds --send. Mainnet --send also needs --mainnet-live, a delivered
+# start alert, the pool in MAINNET_SEND_POOLS and OWNER_POOL_PACKAGES.mainnet (both empty today): refused until then.
 # It holds the OPERATOR (hot) key only: data/mainnet-owner-pool-operator.key, mode 600. No owner key.
 # SIGTERM finishes the current tick, saves state and alerts "stopped"; exit 2 means it refused to run
-# (bad venue, --send off Stokenet, second copy): not restarted.
+# (a guard condition, a state file of another pool, a second copy, a pair mismatch): not restarted.
 [Unit]
 Description=OwnerPool market-making bot (mainnet, operator key)
 After=network-online.target

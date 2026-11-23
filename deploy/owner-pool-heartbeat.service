@@ -1,0 +1,17 @@
+# Dead-man's switch for the OwnerPool bot and watcher (review M-5), run by owner-pool-heartbeat.timer.
+# NOT INSTALLED. Runbook: docs/MAINNET-POOLS.md. Reads the heartbeat files the two processes write every
+# tick and alerts (same alert URL) when either is missing or older than --max-age. Holds no key.
+# Install both files in ~/.config/systemd/user/, adjust WorkingDirectory, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now owner-pool-heartbeat.timer
+# Best run on a DIFFERENT machine from the bot (then ship the heartbeat files, or point it at a copy):
+# a lost host takes its own timer with it.
+[Unit]
+Description=OwnerPool bot and watcher heartbeat check (mainnet)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jon/Radix/dex
+EnvironmentFile=%h/.config/radix-dex/owner-pool.env
+ExecStart=/usr/bin/env npx tsx scripts/owner-pool-heartbeat-check.ts --files data/heartbeat/owner-pool-bot-mainnet.json,data/heartbeat/owner-pool-watch-mainnet.json --max-age 600
+SuccessExitStatus=0 1
+UMask=0077

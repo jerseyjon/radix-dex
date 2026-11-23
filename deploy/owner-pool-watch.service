@@ -1,7 +1,10 @@
 # The read-only OwnerPool watcher, with the per-trade markout record, as a systemd USER service.
 # NOT INSTALLED. Runbook: docs/MAINNET-POOLS.md. It holds no key and sends no transaction; ideally it
-# runs on a different machine from the bot (then copy the bot's sent log there, or drop
-# --bot-sent-log and accept "not-bot" findings for every operator action).
+# runs on a different machine from the bot. On mainnet it REFUSES to start without the bot's sent log
+# (--bot-sent-log, which must exist: the bot creates it at start) unless --no-sent-log is given, which
+# turns the not-bot rule off and says so in its start alert. A sent log on the bot's host can be forged by
+# a thief on that host; the behavioural rules (move-away, fee-outside-rule) do not depend on it.
+# --bot-base-fee must match the bot's --base-fee (the fee-outside-rule bounds).
 # Install as ~/.config/systemd/user/owner-pool-watch.service, adjust WorkingDirectory, then:
 #   systemctl --user daemon-reload && systemctl --user enable --now owner-pool-watch
 #   npx tsx scripts/owner-pool-markout.ts --file data/owner-pool-markout-mainnet.jsonl   # the summary
@@ -13,7 +16,7 @@ Wants=network-online.target
 [Service]
 WorkingDirectory=/home/jon/Radix/dex
 EnvironmentFile=%h/.config/radix-dex/owner-pool.env
-ExecStart=/usr/bin/env npx tsx scripts/owner-pool-watch.ts --network mainnet --pool ${OWNER_POOL} --scale 1 --state data/owner-pool-watch-mainnet-state.json --markout data/owner-pool-markout-mainnet.jsonl --bot-sent-log data/owner-pool-bot-mainnet-sent.jsonl --bot-state data/owner-pool-bot-mainnet-state.json $OWNER_POOL_WATCH_FLAGS
+ExecStart=/usr/bin/env npx tsx scripts/owner-pool-watch.ts --network mainnet --pool ${OWNER_POOL} --scale 1 --state data/owner-pool-watch-mainnet-state.json --markout data/owner-pool-markout-mainnet.jsonl --bot-sent-log data/owner-pool-bot-mainnet-sent.jsonl --bot-base-fee 50 $OWNER_POOL_WATCH_FLAGS
 Restart=on-failure
 RestartSec=30
 RestartPreventExitStatus=2

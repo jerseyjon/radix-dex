@@ -1,0 +1,11 @@
+# Runs owner-pool-heartbeat.service every 2 minutes. NOT INSTALLED (see the service file).
+[Unit]
+Description=OwnerPool heartbeat check every 2 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
