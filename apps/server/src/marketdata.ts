@@ -22,7 +22,8 @@ export function normaliseCandle(c: Candle): Candle {
   return { ...c, high: Math.max(c.open, c.high, c.close), low: Math.min(c.open, c.low, c.close) };
 }
 
-class TtlCache<V> {
+/** A promise cache with a time to live; a failed value is dropped at once. */
+export class TtlCache<V> {
   private readonly map = new Map<string, { at: number; value: Promise<V> }>();
   private readonly ttlMs: number;
   constructor(ttlMs: number) { this.ttlMs = ttlMs; }

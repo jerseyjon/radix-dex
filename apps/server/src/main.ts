@@ -34,7 +34,7 @@ if (config.tls) {
   servers.push(api.listen(config.tls.port, config.host, { key: readFileSync(config.tls.keyFile), cert: readFileSync(config.tls.certFile) }));
   console.log(`also on https://${config.host}:${config.tls.port}`);
 }
-console.log(`radix-dex server on http://${config.host}:${config.port} (${config.network.name}, ${data.markets.length} markets, limit orders ${config.solverBadge ? 'on' : 'off'}, solver ${solver ? 'on' : 'off'})`);
+console.log(`radix-dex server on http://${config.host}:${config.port} (${config.network.name}${config.readOnly ? ', READ ONLY' : ''}, ${data.markets.length} markets, limit orders ${config.solverBadge ? 'on' : 'off'}, solver ${solver ? 'on' : 'off'})`);
 
 /**
  * On SIGTERM or SIGINT: stop the timers, stop taking requests, let the solver's pass in progress

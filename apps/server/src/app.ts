@@ -10,6 +10,7 @@ import { Api, HttpError, JsonReply } from './http.ts';
 import { MarketData, isResolution } from './marketdata.ts';
 import { GAS_ALLOWANCE_MARGIN, GAS_XRD, Solver, fillGasXrd, loadSolverKey } from './solver.ts';
 import { OrderStore, type StoredOrder } from './store.ts';
+import { PoolsService } from './pools.ts';
 
 /** How long the site asks the wallet to keep a market order valid. */
 const MARKET_ORDER_LIFETIME_SEC = 180;
@@ -121,7 +122,8 @@ export async function createApp(config: Config) {
   const data = new MarketData(config, readGateway);
   const store = new OrderStore(config.dataDir === ':memory:' ? ':memory:' : join(config.dataDir, `orders-${config.network.name}.sqlite`));
   const book = config.orderBook ? new BookWatcher(readGateway, config.orderBook) : undefined;
-  const solver = config.solverBadge && config.solverKeyFile
+  // Read-only: never a solver, whatever key is configured (a second instance beside the live one).
+  const solver = !config.readOnly && config.solverBadge && config.solverKeyFile
     ? new Solver({ config, gateway, store, data, key: loadSolverKey(config.solverKeyFile), badge: config.solverBadge, book })
     : undefined;
   const api = new Api({
@@ -129,6 +131,8 @@ export async function createApp(config: Config) {
     // The Radix Wallet fetches this from the site to confirm the dApp definition really claims it.
     documents: config.dAppDefinition ? { '/.well-known/radix.json': { dApps: [{ dAppDefinitionAddress: config.dAppDefinition }] } } : {},
   });
+
+  const pools = new PoolsService({ config, gateway, readGateway, data });
 
   const marketOr404 = (id: string) => {
     const m = data.market(id);
@@ -144,7 +148,10 @@ export async function createApp(config: Config) {
     network: config.network.name, networkId: config.network.networkId, xrd: config.network.xrd,
     feeBps: config.feeBps, makerFeeBps: config.makerFeeBps, refreshedAt: data.refreshedAt, warning: data.lastError ?? null,
     dAppDefinition: config.dAppDefinition ?? null,
-    limitOrders: config.solverBadge
+    // Added 23 Nov 2026: a read-only server takes no orders (the site still shows markets and the Pools page).
+    readOnly: config.readOnly,
+    ownerPools: pools.addresses().length,
+    limitOrders: config.solverBadge && !config.readOnly
       ? {
         enabled: true, solverBadge: config.solverBadge, registry: config.registry ?? null, maxLifetimeSec: config.maxOrderLifetimeSec, filling: Boolean(solver),
         // Fallback network allowance in XRD when no route-specific figure is at hand. Prefer /api/quote's gasAllowanceInBuyToken.
@@ -321,6 +328,7 @@ export async function createApp(config: Config) {
   }
 
   api.on('POST', '/api/orders', async ({ body }) => {
+    if (config.readOnly) throw new HttpError(503, 'This server is read-only: it takes no orders');
     if (!config.solverBadge) throw new HttpError(503, 'Limit orders are not enabled on this server');
     const submission = await body();
     let order;
@@ -394,5 +402,18 @@ export async function createApp(config: Config) {
     return { id: order.id, status: 'cancelled' };
   });
 
-  return { api, data, store, solver, gateway, readGateway, config, book };
+  // ---------------------------------------------------------------- the owner's pools (read only)
+  // The OwnerPools listed here, their state on the ledger, the market reference under the bot's rules,
+  // their events, and the bot's and watcher's health. Never a key, a file path or the alert URL.
+  api.on('GET', '/api/pools', () => pools.list(), 2);
+  api.on('GET', '/api/pools/:component', ({ params }) => pools.detail(params.component!), 2);
+  // Whether an account holds a pool's owner badge, read on the ledger. The page shows the owner's
+  // actions only then; the contract checks the badge again on every owner call anyway.
+  api.on('GET', '/api/pools/:component/owner', ({ params, url }) => pools.isOwner(params.component!, url.searchParams.get('account')));
+  // Build an owner action with the shared builders and preview it on the Gateway. Nothing is signed or
+  // sent here: the page hands the manifest to the owner's wallet.
+  api.on('POST', '/api/pools/:component/prepare', async ({ params, body }) => pools.prepare(params.component!, await body()), 5);
+  api.on('POST', '/api/pools/:component/verify', async ({ params, body }) => pools.verify(params.component!, await body()), 2);
+
+  return { api, data, store, solver, gateway, readGateway, config, book, pools };
 }

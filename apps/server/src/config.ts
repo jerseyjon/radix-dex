@@ -66,6 +66,20 @@ export interface Config {
    * keeps XRD. `DEX_FEE_TOKENS`, comma-separated, replaces the per-network default.
    */
   feeTokens: string[];
+  /**
+   * Read-only: no solver is started and no order is taken, whatever else is configured (`DEX_READ_ONLY=1`).
+   * For a second instance beside the live one (e.g. to look at the Pools page against mainnet).
+   */
+  readOnly: boolean;
+  /**
+   * Where the OwnerPool bot and watcher write their heartbeats, the bot's state file and the markout
+   * record (`DEX_OWNER_POOL_FILES`, default the data directory), read by the Pools page and never written.
+   * Names as in deploy/owner-pool-*.service: heartbeat/owner-pool-{bot,watch}-<network>.json,
+   * owner-pool-bot-<network>-state.json, owner-pool-markout-<network>.jsonl.
+   */
+  ownerPoolFilesDir: string;
+  /** A heartbeat older than this is reported stale (the heartbeat timer's --max-age, 600 s). */
+  heartbeatMaxAgeSec: number;
 }
 
 /** A whole number from the environment, or the default; anything else is a start-up error rather than a silent NaN. */
@@ -161,5 +175,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     minBookOrderXrd: num(env, 'DEX_MIN_BOOK_ORDER_XRD', DEFAULT_MIN_BOOK_ORDER_XRD[name] ?? 5, 1e9),
     lowXrd: num(env, 'DEX_LOW_XRD', 30, 1e9),
     feeTokens: resources(env, 'DEX_FEE_TOKENS', DEFAULT_FEE_TOKENS[name] ?? [], name === 'mainnet' ? 'rdx' : 'tdx_2_'),
+    readOnly: ['1', 'true', 'yes'].includes(String(env.DEX_READ_ONLY ?? '').trim().toLowerCase()),
+    ownerPoolFilesDir: env.DEX_OWNER_POOL_FILES ?? env.DEX_DATA_DIR ?? 'data',
+    heartbeatMaxAgeSec: int(env, 'DEX_HEARTBEAT_MAX_AGE_SEC', 600, 10, 86_400),
   };
 }
