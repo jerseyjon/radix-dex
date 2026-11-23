@@ -15,9 +15,12 @@ import type { Pool } from './types.ts';
  * the ledger confirms it is an `OwnerPool` of an allow-listed package (`OWNER_POOL_PACKAGES`).
  */
 
-/** Packages whose `OwnerPool` blueprint we route through, by network. Nothing is published on mainnet yet. */
+/** Packages whose `OwnerPool` blueprint we route through, by network. */
 export const OWNER_POOL_PACKAGES: Record<string, string[]> = {
-  mainnet: [],
+  // Published 23 Nov 2026 by the owner from the owner account, owner role None (DenyAll),
+  // txid_rdx1ndxh492mf32efcfjkmlh0vjp23ymar0xadpx5mah9n92h9lavc7sg0yh69.
+  // Code hash 0b460d5f…446a7872: the pool-split build audited twice and proven on Stokenet.
+  mainnet: ['package_rdx1p4k62xfkcakva7wmll67zgc8udn6tsujzfs9hqq399hdzujtksdlsv'],
   // Published 22 Nov 2026 from scrypto/owner-pool at c8c2be0 with throwaway keys (scripts/stokenet-owner-pool.ts).
   // Code hash (blake2b-256 of the wasm) 1dd88642…6eed78b9d3; wasm sha256 390362e6…c8e68091.
   // Published 22 Nov 2026 from scrypto/owner-pool at 934c904 (pool-split: cold owner badge, hot operator
