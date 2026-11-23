@@ -55,7 +55,7 @@ import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, write
 import { assertReferenceExcludesOwnerPools, makePriceSources, makeVenues, readSource, readVenueSource, type PriceSource, type VenueSource } from './owner-pool-sources.ts';
 import {
   AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, anchorCheck, buildTransaction,
-  calibrateScale, decideRebalance, feeDecision, venueSetHold, venueConfirm, venueGate, singleVenueCaution, type VenueHoldState, type VenueConfirmState, type SingleVenueState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
+  calibrateScale, decideRebalance, feeDecision, venueSetHold, venueConfirm, venueGate, volatilityEligible, singleVenueCaution, type VenueHoldState, type VenueConfirmState, type SingleVenueState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
   ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
   ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, submitAndWait,
   txAllowance, volatilityBps, type Ed25519Key, type VenueReference, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
@@ -404,7 +404,11 @@ async function tick(): Promise<void> {
     if ('alarm' in w && w.alarm) await alert(`watch-${w.source}`, `WATCH: ${w.source} ${w.price} is ${((w.deviation ?? 0) * 100).toFixed(1)}% from the on-ledger reference ${r6(vref.price)} (limit ${(cfg.watchMaxDeviation * 100).toFixed(0)}%). Trading is NOT affected; check the venues.`, line);
     else if ('alarm' in w && w.deviation !== null) alerts.limiter.clear(`watch-${w.source}`);
   }
-  if (ref.ok) {
+  // Volatility history: only prices from the full confirmed set (trade or hold ticks, never uncertain,
+  // disagree or none), so a one-tick jump from a partial venue set cannot raise the fee.
+  const volOk = volatilityEligible({ status: vref.status, holding: vh.holding, uncertain: vc.uncertain });
+  line.volatilitySample = volOk;
+  if (ref.ok && volOk) {
     state.history.push({ at: now, price: ref.price });
     state.history = state.history.filter((h) => now - h.at <= D.historyKeepSec * 1000);
   }

@@ -228,7 +228,8 @@ behaviour).
   priced from the confirmed venues that did quote (as before), but the tick is a no-rebalance tick
   (`gate: "uncertain"`, decision `NO REBALANCE: venue(s) failed this tick, not dropped yet: x 1/2`).
   No hold starts. The fee step runs with narrowing blocked, as in a hold (a less certain reference
-  should not narrow the spread; widening still protects). The "behind" counter is not advanced. If
+  should not narrow the spread; widening still protects). The "behind" counter is not advanced. Its
+  price does NOT enter the volatility history (`volatilityEligible`, log `volatilitySample: false`). If
   no confirmed venue quoted at all, there is no reference: no trade, no fee change (as before), and
   the 10-minute pause timer runs.
 - **A venue that is not confirmed and quotes** (coming back, or new) counts only after 2 good ticks
@@ -935,9 +936,10 @@ set the fee to 100 (clamped) on its first tick.
   runs, the `behind` alert, a swap racing a rebalance. The first four are unit-tested as the pure
   pieces the bot script uses (`tickOutcome`, `recordSendOutcome`/`sendHalted`, `resolveOwnerAnchor` +
   allowance zero, `behindUpdate`), not as a full tick with a fake Gateway.
-- A no-rebalance tick (one venue failed once) still records its reference in the volatility history;
-  in Soak 6 the one-tick jump (0.24%) raised the fee target by 6 bps and cost one fee transaction.
-  Leaving those prices out of the history is a one-line change; not done without the owner's call.
+- Only a price from the full confirmed set enters the volatility history: `trade` ticks and `hold`
+  ticks (in a hold the confirmed set is the new, stable one), never `uncertain`, `disagree` or `none`
+  ticks, nor a hold tick on which another confirmed venue failed. (In Soak 6, before this rule, a
+  one-tick 0.24% jump on an uncertain tick raised the fee target by 6 bps and cost one fee transaction.)
 - No cautious (halved) rebalance AFTER a drop to one venue has been seen on ledger: the drop starts
   the 15-minute hold, and Soak 6 stopped inside it. The halved caps are unit-tested and were seen on
   the first tick of Soak 6 (spendable a quarter of the allowance, window 30%), where the move fitted.

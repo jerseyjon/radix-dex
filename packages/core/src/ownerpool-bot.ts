@@ -351,6 +351,17 @@ export function venueGate(o: { status: VenueReference['status']; holding: boolea
   return 'trade';
 }
 
+/**
+ * Whether this tick's reference price enters the volatility history (and so the fee target). Only a
+ * price from the full confirmed set counts: `trade` ticks, and `hold` ticks unless a confirmed venue
+ * also failed this tick (during a hold the confirmed set is the new, stable one, so its price is sound).
+ * `uncertain` (a confirmed venue missing: priced from fewer venues), `disagree` and `none` never count,
+ * so a one-tick jump from a partial venue set cannot raise the fee.
+ */
+export function volatilityEligible(o: { status: VenueReference['status']; holding: boolean; uncertain: boolean }): boolean {
+  return o.status === 'ok' && !o.uncertain;
+}
+
 // ------------------------------------------------------------------ single-venue caution
 
 /** Persisted: when the current single-venue episode began (undefined: not in one). */

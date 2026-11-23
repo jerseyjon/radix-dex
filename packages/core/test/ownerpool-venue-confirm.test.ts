@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   AlertLimiter, Decimal, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, aggregateVenues, decideRebalance, feeDecision, feeTargetDetail, singleVenueCaution,
-  spendableAllowance, venueConfirm, venueGate, venueSetHold, windowSpendRoom,
+  spendableAllowance, venueConfirm, venueGate, venueSetHold, volatilityBps, volatilityEligible, windowSpendRoom,
   type OwnerPoolState, type SingleVenueState, type VenueConfirmState, type VenueHoldState, type VenueQuote,
 } from '../src/index.ts';
 
@@ -287,4 +287,41 @@ test('confirmation and the hold: a single failure during a hold neither restarts
   // A failed tick blocks narrowing the fee like a hold (the bot passes its message as noNarrow).
   const fd = feeDecision({ currentFeeBps: 150, targetFeeBps: 100, now: NOW, minFeeBps: 10, maxFeeBps: 200, cfg: { minFeeChangeBps: 5, widenIntervalMs: 120_000, narrowIntervalMs: 900_000 }, noNarrow: 'venue(s) failed this tick, not dropped yet: b 1/2' });
   assert.match(fd.reason, /narrow to 100 bps held: venue\(s\) failed this tick/);
+});
+
+// ------------------------------------------------------------------ volatility history
+
+test('volatility history: only trade ticks and clean hold ticks count; uncertain, disagree and none do not', () => {
+  // Normal trade tick: included.
+  assert.equal(venueGate({ status: 'ok', holding: false, uncertain: false }), 'trade');
+  assert.equal(volatilityEligible({ status: 'ok', holding: false, uncertain: false }), true);
+  // Uncertain tick (a confirmed venue failed once, priced from the rest): excluded.
+  assert.equal(venueGate({ status: 'ok', holding: false, uncertain: true }), 'uncertain');
+  assert.equal(volatilityEligible({ status: 'ok', holding: false, uncertain: true }), false);
+  // Hold on the new confirmed set: included; a hold tick on which another venue failed: excluded.
+  assert.equal(volatilityEligible({ status: 'ok', holding: true, uncertain: false }), true);
+  assert.equal(volatilityEligible({ status: 'ok', holding: true, uncertain: true }), false);
+  // Disagree and none: excluded.
+  assert.equal(volatilityEligible({ status: 'disagree', holding: false, uncertain: false }), false);
+  assert.equal(volatilityEligible({ status: 'none', holding: false, uncertain: false }), false);
+
+  // Through venueConfirm: b fails once -> uncertain tick -> its price is left out, so a one-tick jump
+  // does not move the volatility measure; the next normal tick is recorded.
+  let vs: VenueConfirmState = {};
+  const history: { at: number; price: number }[] = [];
+  const step = (quoting: string[], at: number, price: number) => {
+    const vc = venueConfirm(vs, quoting, N);
+    vs = vc.state;
+    if (volatilityEligible({ status: 'ok', holding: false, uncertain: vc.uncertain })) history.push({ at, price });
+    return vc;
+  };
+  for (let i = 0; i < 10; i++) step(['a', 'b'], NOW + i * MIN, 1);
+  const before = volatilityBps(history, NOW + 9 * MIN, 3_600_000, MIN);
+  assert.equal(before, 0);
+  const vc = step(['a'], NOW + 10 * MIN, 1.0024);
+  assert.equal(vc.uncertain, true);
+  assert.equal(history.length, 10);
+  assert.equal(volatilityBps(history, NOW + 10 * MIN, 3_600_000, MIN), 0);
+  step(['a', 'b'], NOW + 11 * MIN, 1);
+  assert.equal(history.length, 11);
 });
