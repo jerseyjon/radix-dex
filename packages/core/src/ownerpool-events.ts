@@ -182,6 +182,16 @@ export async function readOwnerPoolTransactions(gateway: Gateway, pool: string, 
 }
 
 /**
+ * The pool's most recent transactions (those in which it emitted an event), newest first, with the
+ * manifest's methods and proofs so the caller can tell a swap from an owner or operator action.
+ * One page of at most `limit` (100) transactions. Read only: for display (the site's Pools page).
+ */
+export async function readRecentOwnerPoolTransactions(gateway: Gateway, pool: string, limit = 50): Promise<OwnerPoolTx[]> {
+  const r = await streamPage(gateway, pool, { order: 'desc', manifest: true, limit: Math.max(1, Math.min(100, limit)) });
+  return r.txs;
+}
+
+/**
  * The owner's last stated anchor, searching the pool's event stream newest first until an anchor
  * statement is found. `found: false, complete: true`: the pool has never had one (the bot must not
  * rebalance). `complete: false`: the search stopped at `maxPages` without finding one (undetermined).
