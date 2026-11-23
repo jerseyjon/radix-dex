@@ -437,11 +437,17 @@ export function windowSpendRoom(spends: { at: number; cost: number }[], allowanc
 
 // ------------------------------------------------------------------ send failures
 
-/** After a send: reset or count failures; halt sending for `haltMs` when `maxFailures` fail in a row. */
-export function recordSendOutcome(st: { consecutiveFailures: number; haltedUntil?: number }, ok: boolean, now: number, o: { maxFailures: number; haltMs: number }): { consecutiveFailures: number; haltedUntil?: number; halted: boolean } {
+/**
+ * After a send: reset or count failures; halt sending for `haltMs` when `maxFailures` fail in a row.
+ * The count is not reset when a halt runs out, so ONE more failure after it halts again at once.
+ * `recovered`: this success ended a run that had halted (the caller clears the `halt` alert key, so the
+ * next halt is alerted even within the alert interval).
+ */
+export function recordSendOutcome(st: { consecutiveFailures: number; haltedUntil?: number }, ok: boolean, now: number, o: { maxFailures: number; haltMs: number }): { consecutiveFailures: number; haltedUntil?: number; halted: boolean; recovered: boolean } {
   const consecutiveFailures = ok ? 0 : st.consecutiveFailures + 1;
-  if (consecutiveFailures >= o.maxFailures) return { consecutiveFailures, haltedUntil: now + o.haltMs, halted: true };
-  return { consecutiveFailures, haltedUntil: st.haltedUntil, halted: false };
+  const recovered = ok && st.consecutiveFailures >= o.maxFailures;
+  if (consecutiveFailures >= o.maxFailures) return { consecutiveFailures, haltedUntil: now + o.haltMs, halted: true, recovered };
+  return { consecutiveFailures, haltedUntil: st.haltedUntil, halted: false, recovered };
 }
 
 /** Whether sending is halted at `now`. */

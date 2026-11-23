@@ -62,3 +62,19 @@ test('three failed submissions in a row halt sending (the bot path: trySubmitAnd
   assert.equal(sendHalted(st, 2_000), true);
   assert.equal(sendHalted(st, 1_002 + 3_600_000), false);
 });
+
+test('recordSendOutcome: one more failure after a halt runs out halts again; the success that ends a halted run says recovered', () => {
+  const o = { maxFailures: 3, haltMs: 150_000 };
+  let st: { consecutiveFailures: number; haltedUntil?: number } = { consecutiveFailures: 0 };
+  for (let i = 0; i < 3; i++) st = recordSendOutcome(st, false, 0, o);
+  assert.equal(sendHalted(st, 149_999), true);
+  const again = recordSendOutcome(st, false, 160_000, o);
+  assert.equal(again.halted, true);
+  assert.equal(again.consecutiveFailures, 4);
+  assert.equal(again.haltedUntil, 310_000);
+  const ok = recordSendOutcome(again, true, 320_000, o);
+  assert.equal(ok.recovered, true);
+  assert.equal(ok.consecutiveFailures, 0);
+  assert.equal(recordSendOutcome({ consecutiveFailures: 2 }, true, 0, o).recovered, false);
+  assert.equal(recordSendOutcome({ consecutiveFailures: 0 }, true, 0, o).recovered, false);
+});

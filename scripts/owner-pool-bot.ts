@@ -301,6 +301,11 @@ async function execute(type: string, manifest: string): Promise<Sent> {
   const so = recordSendOutcome(state, ok, Date.now(), { maxFailures: cfg.maxConsecutiveFailures, haltMs: cfg.haltSec * 1000 });
   state.consecutiveFailures = so.consecutiveFailures;
   state.haltedUntil = so.haltedUntil;
+  if (so.recovered) {
+    // The halted run is over: the next halt must be alerted even inside the alert interval.
+    alerts.limiter.clear('halt');
+    log({ event: 'halt-recovered', txid: tx.intentHashId, type });
+  }
   if (so.halted) {
     await alert('halt', `HALTED: ${state.consecutiveFailures} failed sends in a row (last ${type} ${tx.intentHashId}: ${out.status}${'error' in out ? ' ' + out.error.slice(0, 120) : ''}). No sends until ${new Date(state.haltedUntil ?? 0).toISOString()}.`);
   }
@@ -546,7 +551,7 @@ async function tick(): Promise<void> {
       const after = (await readOwnerPools(gw, [cfg.pool], OWNER_POOL_PACKAGES[NETWORK]))[0]!;
       feeNow = after.feeBps;
       line.after = { event: ev, price: new Decimal(after.reserveB).div(after.reserveA).toNumber(), reserveA: after.reserveA, reserveB: after.reserveB, gapBps: round(priceDistance(new Decimal(after.reserveB).div(after.reserveA).toNumber(), target) * 10_000, 2) };
-    } else if (!r.sent && !r.preview.ok) behind = true;
+    } else if (r.sent || !r.preview.ok) behind = true; // sent but failed, preview failed, or skipped (halt, cap): the gap stays open
   } else line.rebalance = { action: 'none', reason: dec.reason, allowance: dec.allowance, spendable: dec.spendable };
 
   const bu = behindUpdate(state.behindTicks, behind, cfg.alertBehindTicks);
