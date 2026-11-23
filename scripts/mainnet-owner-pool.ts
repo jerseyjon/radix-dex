@@ -28,7 +28,8 @@
 //   deposit --a <A> --b <B>      deposit into the reserves, guarded by the reserves read now, curve checked against the market
 //   withdraw --a <A> [--b <B>]   withdraw from the reserves (B defaults to the proportional amount), guarded
 //   withdraw-inventory --a --b   withdraw from the inventory
-//   operator-badge               create the operator (hot) badge into the owner's account
+//   owner-rebalance --a <±A> --b <±B>   inventory <-> reserves with no limits (emergency: restore the curve), guarded
+//   operator-badge [--replace]   create the operator (hot) badge into the owner's account (--replace: a new one after a revoke)
 //   limits [k=v ...]             set_operator_limits: suggested defaults (budget 300 bps per --window epochs,
 //                                caps +10%, floors 50%, fee range --min-fee..--max-fee), any field overridable
 //   limits-fee --fee <bps> [k=v ...]   limits AND fee in ONE transaction (a lower max fee does not clamp the fee)
@@ -59,7 +60,7 @@ import { ManifestSborStringRepresentation, RadixEngineToolkit } from '@steleaio/
 import {
   Decimal, Gateway, NETWORKS, OWNER_POOL_BOT_DEFAULTS as BD, OWNER_POOL_PACKAGES, accountOf, aggregateVenues, badgeProblems, buildTransaction, keyFromHex,
   ownerPoolAllowanceNow, ownerPoolAnchorDistance, ownerPoolAppointManifest, ownerPoolCreateBadgeManifest, ownerPoolDepositInventoryManifest, ownerPoolDepositManifest,
-  ownerPoolInstantiateManifest, ownerPoolLimitsAndFeeManifest, ownerPoolPublishManifest, ownerPoolSetAnchorManifest, ownerPoolSetFeeManifest,
+  ownerPoolInstantiateManifest, ownerPoolLimitsAndFeeManifest, ownerPoolOwnerRebalanceManifest, ownerPoolPublishManifest, ownerPoolSetAnchorManifest, ownerPoolSetFeeManifest,
   ownerPoolSetOperatorLimitsManifest, ownerPoolSetOperatorManifest, ownerPoolSetPausedManifest, ownerPoolStepMismatches, ownerPoolSuggestedLimits,
   ownerPoolWithdrawAllManifest, ownerPoolWithdrawInventoryManifest, ownerPoolWithdrawManifest, poolTokenProblems, priceGap, proportionalB, readOwnerPools,
   submitAndWait, toHex, transferManifest, type Ed25519Key, type NetworkName, type OwnerPoolOperatorLimits, type OwnerPoolState,
@@ -439,8 +440,11 @@ if (step === 'simulate') {
   let account = OWNER, standIn: string | undefined;
   if (new Decimal(bal[rb] ?? '0').lt(amountB) || new Decimal(bal[ra] ?? '0').lt(amountA)) {
     const holders = await gw.resourceHolders(rb, 20);
-    const h = holders.find((x) => x.address.startsWith('account_') && new Decimal(x.amount).gte(amountB));
-    if (!h) throw new Error(`No account holds ${amountB} ${sym(rb)} to simulate with`);
+    let h: { address: string } | undefined;
+    for (const x of holders.filter((y) => y.address.startsWith('account_') && new Decimal(y.amount).gte(amountB))) {
+      if (new Decimal(await gw.fungibleBalance(x.address, ra)).gte(amountA)) { h = x; break; }
+    }
+    if (!h) throw new Error(`No account holds ${amountA} ${sym(ra)} and ${amountB} ${sym(rb)} to simulate with`);
     account = h.address; standIn = `the account ${h.address} (holds ${sym(rb)}) instead of the owner's, who holds ${bal[rb] ?? '0'} ${sym(rb)}`;
   }
   const manifest = [
@@ -526,8 +530,11 @@ if (step === 'inventory' || step === 'withdraw-inventory') {
 if (step === 'deposit') {
   const p = await pool(); showPool(p);
   const a = amountArg('a')!, b = amountArg('b')!;
-  // Depth added at a price someone moved with a swap is exposed to him: check the curve first.
-  await checkAgainstMarket('the curve\'s price', new Decimal(p.reserveB).div(p.reserveA).toNumber());
+  // Depth added at a price someone moved with a swap is exposed to him: check the curve first. An
+  // emptied pool (after unwind) has no price: then this deposit sets it, and its own ratio is checked.
+  const empty = new Decimal(p.reserveA).isZero() || new Decimal(p.reserveB).isZero();
+  if (empty && (new Decimal(a).isZero() || new Decimal(b).isZero())) throw new Error('The pool is empty: deposit both tokens (this sets the price)');
+  await checkAgainstMarket(empty ? 'the price this deposit sets (empty pool)' : 'the curve\'s price', empty ? new Decimal(b).div(a).toNumber() : new Decimal(p.reserveB).div(p.reserveA).toNumber());
   await stage('deposit', ownerPoolDepositManifest({ pool: p.address, owner: owner(), feeLockXrd: FEE_LOCK, resourceA: p.resourceA, resourceB: p.resourceB, amountA: a, amountB: b, expected: [p.reserveA, p.reserveB] }), {
     want: { reserves: [plus(p.reserveA, a), plus(p.reserveB, b)] },
     note: `Guarded: fails "Reserves moved" unless the pool holds exactly ${p.reserveA} / ${p.reserveB} when it runs (a swap in between: run this step again).`,
@@ -543,9 +550,23 @@ if (step === 'withdraw') {
   });
 }
 
+if (step === 'owner-rebalance') {
+  // Emergency procedure step 2: move between inventory and reserves with no limits (works while paused),
+  // guarded by the reserves read now. Positive = inventory to reserves. Does not move the anchor.
+  const p = await pool(); showPool(p);
+  const a = opt('a') ?? '0', b = opt('b') ?? '0';
+  if (new Decimal(a).isZero() && new Decimal(b).isZero()) throw new Error('--a and/or --b (signed amounts; positive = inventory to reserves)');
+  const after: [string, string] = [plus(p.reserveA, a), plus(p.reserveB, b)];
+  await checkAgainstMarket('the curve\'s price after the move', new Decimal(after[1]).div(after[0]).toNumber());
+  await stage('owner-rebalance', ownerPoolOwnerRebalanceManifest({ pool: p.address, owner: owner(), feeLockXrd: FEE_LOCK, toReserveA: a, toReserveB: b, expected: [p.reserveA, p.reserveB] }), {
+    want: { reserves: after, inventory: [minus(p.split!.inventoryA, a), minus(p.split!.inventoryB, b)] },
+  });
+}
+
 if (step === 'operator-badge') {
   const r = rec();
-  if (r.operatorBadge) throw new Error(`An operator badge is already recorded for "${NAME}": ${r.operatorBadge}`);
+  // --replace: a NEW badge after a revoke (emergency procedure step 3); the old one stays revoked on ledger.
+  if (r.operatorBadge && !flag('replace')) throw new Error(`An operator badge is already recorded for "${NAME}": ${r.operatorBadge} (--replace to make a new one after a revoke)`);
   await stage('operator-badge', ownerPoolCreateBadgeManifest({ account: OWNER, name: BADGE_TEXT.operatorName(), description: BADGE_TEXT.operatorDescription(), feeLockXrd: FEE_LOCK }));
 }
 
@@ -669,6 +690,6 @@ if (step === 'status') {
   }
 }
 
-const KNOWN = ['check', 'simulate', 'badge', 'publish', 'instantiate', 'pause', 'unpause', 'inventory', 'withdraw-inventory', 'deposit', 'withdraw', 'operator-badge',
+const KNOWN = ['check', 'simulate', 'badge', 'publish', 'instantiate', 'pause', 'unpause', 'inventory', 'withdraw-inventory', 'deposit', 'withdraw', 'owner-rebalance', 'operator-badge',
   'limits', 'limits-fee', 'appoint', 'anchor', 'fee', 'revoke', 'unwind', 'operator-return', 'operator-key', 'record', 'status'];
 if (!KNOWN.includes(step)) { console.log(`Unknown step ${step}. Steps: ${KNOWN.join(', ')}. See the top of this file.`); process.exitCode = 2; }

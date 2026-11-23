@@ -3,6 +3,9 @@
 First release: market orders and signed ("Whole only") limit orders filled through existing
 pools, plus the on-ledger order book ("In parts" orders). Our own `Pool` is not deployed.
 
+The owner's own OwnerPools (cold owner badge, market-making bot) have their own runbook:
+`docs/MAINNET-POOLS.md`.
+
 **Nothing in this repository sends a mainnet transaction during set-up.** Each one is printed,
 previewed, and signed by the owner in their own wallet. After go-live the solver submits fills
 from its own account, paying fees from the XRD sent to it.
