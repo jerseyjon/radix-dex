@@ -503,7 +503,9 @@ nothing. Otherwise the candidates are one-sided moves that would land exactly on
 remove A (A to rb/T) or add B (B to T*ra); to lower it, remove B or add A. Each candidate is checked
 with `ownerPoolPlanRebalance` (the contract's checks and cost, exact); if the full move does not fit
 (cost above the spendable allowance, a cap, a floor, or not enough inventory), the largest fraction
-of it that fits is found by bisection. Amounts are rounded toward zero to the token's places. A
+of it that fits is taken (next section: the cost is not lowest for the smallest move, so this is a
+search for the cheapest point first, then the largest fraction beyond it that fits; since 47dc8fe).
+Amounts are rounded toward zero to the token's places: a partial move never passes the target. A
 returned move has therefore already passed every check the contract will make; the preview then
 confirms it on ledger state, and the `expected` reserves guard makes it fail rather than act if a
 swap lands between the read and the commit.
@@ -515,6 +517,41 @@ ledger's `OwnerPoolRebalanceEvent`, else the planned cost) are kept in the state
 Remember (design doc): after an operator move the anchor ON LEDGER becomes the new price, and the
 next move costs max(distance from the current price, distance from that anchor). That is why the bot
 checks its own distance against the OWNER's stated anchor, not the ledger's.
+
+### After a trade bigger than the budget: partial moves, and why arbitrageurs do most of it
+
+A trade moves the curve but not the ledger anchor (the reserves after the operator's last costed
+move). Say the operator left the pool at the target, then a sale moved it g away. A move t of the way
+back costs
+
+    max(t x g, (1 - t) x g)  (+ depth growth for an addition; removals have none)
+
+because the "from the anchor" term starts at the whole trade's move g and only falls as the price
+returns. So **every** move back costs at least g/2, the cheapest is the half-way move, and the full
+correction costs g. The bot (since 47dc8fe) finds the cheapest point, then takes the largest move from
+there whose exact contract cost fits the spendable allowance and every cap, floor and inventory limit,
+and sends it if it is at least the minimum move. Three cases with spendable S:
+
+- **S >= g:** the full correction, at once.
+- **g/2 <= S < g:** a partial move past the half-way point (cost = S), then, since that move resets the
+  ledger anchor to the curve, later moves cost only their own size and close the rest as the
+  allowance and the rolling window refill (one budget per 72 epochs, about 4 bps per epoch at 300 bps).
+- **S < g/2:** nothing fits. The log says `no move fits: the cheapest move toward the target costs C ...`
+  with `cheapestCost`, and the bot is behind until the allowance has grown to C or the price has come
+  back on its own. If the target is not where the anchor is (the reference moved), the cheapest point is
+  not exactly half-way; the search handles that (the code before 47dc8fe bisected down from the full
+  move and missed partial moves whose cheapest point lay beyond half-way).
+
+On mainnet defaults (budget 300 bps, per tick half the allowance, window 60%, single venue halves both)
+a tick spends at most 0.015 with a full allowance (0.0075 with one venue), so a trade that moves the
+pool more than about 3% from where the operator left it (1.5% with one venue; less when the allowance
+is not full) leaves the bot unable to move at all at first, and a
+correction of a few percent takes hours of refill. **On a small pool, arbitrageurs do most of the
+re-centring:** the pool after a big trade is off the market by the trade's whole move, minus only the
+fee, which is exactly the profit an arbitrageur takes by trading it back. The budget is deliberately too
+small for the operator to chase large moves (it is what limits a stolen hot key), so the bot's job after
+a large trade is to widen the fee while behind and correct the residual; the arbitrage trade, which
+pays the pool's fee, does the bulk.
 
 ## Alerts
 
@@ -1178,6 +1215,48 @@ brake's normal fills in 12 minutes, not an hour); phase B forces the brake. Bot 
 Not seen on ledger in this soak (unit-tested): a "Reserves moved" race, an unresolved send, a lagging
 Gateway, the `move-away` and `fee-outside-rule` alerts, the brake in `normal` mode (the market did not
 move 2% against CoinGecko), a rebalance after a trade (the ledger-anchor cost blocked it both times).
+
+## Soak 10 on Stokenet (23 Nov 2026, 14:11-14:29 UTC, code 47dc8fe): partial moves after a trade
+
+**Why Soak 9 logged "no move fits":** not a refused feasible move, and the allowance was not near zero
+(0.0067 at tick 6, 0.0096 in C2). Every move toward the target cost more than the spendable part,
+because the cost counts the distance from the ledger anchor (the price the operator's last move left):
+at tick 6 (pool 0.000777, anchor 0.000801, target 0.0008) the cheapest possible move cost 0.0154 against
+0.00054 spendable (single-venue caution, window room); in C2 (pool 0.000794) the cheapest cost 0.00428
+against 0.0024. Reading the old search, though, showed a real gap: it bisected down from the full move
+and gave up when the half-way move did not fit, so with spendable between 0.00428 and 0.0050 (the C2
+half-way cost) it would also have said "no move fits" while a move to about 60% fitted. Fixed in 47dc8fe
+(see "After a trade bigger than the budget"); unit tests cover both Soak 9 states.
+
+Real bot (`--send`) and watcher, alerts to a local listener on 127.0.0.1:18941 only, fresh state
+`data/soak/s10-state.json`. Driver `data/soak/run10.sh`, `bot10.sh`; logs `run10.log`, `run10-P1.log`,
+`run10-P2.log`, `watch10.log`, `phases10.txt`, `alerts10.jsonl`, `balances10.txt`. TEST settings throughout:
+`--interval 30 --no-fee` (fee stays 30 bps, dead band 15 bps); P1 also `--spend-fraction 0.69
+--max-window-spend 1 --spend-window 120`; P2 `--spend-fraction 1 --reserve-fraction 0
+--single-venue-size-factor 1 --max-window-spend 1 --spend-window 120` (all of the allowance spendable, so
+the contract's budget is the only limit). Ledger cost = planned cost on every move.
+
+| time | what | gap (bps) | allowance before -> after | cost | tx |
+|---|---|---|---|---|---|
+| 14:12-14:13 | defaults (spend fraction 0.3): cheapest move 0.00427 > spendable 0.0020 | 70.95 | 0.0133 | none | - |
+| 14:13:56 | P1, the case the old search missed: spendable 0.00474 (cheapest 0.00427, half-way 0.0050) | 70.95 -> 23.40 | 0.01375 -> 0.00901 | 0.0047438 | `txid_tdx_2_1a60pzqktmn...` |
+| 14:14:32 | window room 0.00213 binds: partial again (anchor now on the curve: cost = move) | 23.40 -> 2.09 | 0.00901 -> 0.00688 | 0.0021313 | `txid_tdx_2_1jtem5hg8pc...` |
+| 14:16 | alice sells 100 XRD (`txid_tdx_2_19j2dz47yg...`): full correction ~0.0106 > allowance | 105.67 | | | |
+| 14:16:27 | P2: largest partial that fits, all of the allowance | 105.67 -> 36.66 | 0.006875 -> 0 | 0.006875 | `txid_tdx_2_1x9007psge0...` |
+| 14:18:38 | one epoch's refill (0.03/72) | 36.66 -> 32.48 | 0.000417 -> 0 | 0.000417 | `txid_tdx_2_1gyy6rkfr6q...` |
+| 14:23:56 | the next epoch | 32.48 -> 28.31 | 0.000417 -> 0 | 0.000417 | `txid_tdx_2_137kl6fy42t...` |
+| 14:28:42 | the next | 28.31 -> 24.13 | 0.000417 -> 0 | 0.000417 | `txid_tdx_2_1pvpwrdpwsc...` |
+
+So after a trade bigger than the budget the bot moves as far as the budget allows at once, then about
+4 bps per epoch (about 50 bps an hour at 300 bps per 72 epochs) as it refills: the 24 bps left would have
+taken another ~30 minutes. The watcher alerted `large-spend` and `window-spend` (100% of the allowance in
+one move: expected with these test settings), the bot `behind` after 10 ticks; no tick error. After the
+bot stopped, alice bought back with 0.0186 TEUR (`txid_tdx_2_17tz6qe5es...`).
+
+Final (Gateway, state version 35127483): reserves 19253.606531576128012879 XRD / 15.40293 TEUR (0.00080000,
+about 1250:1), fee 30 bps, owner and operator pauses off, inventory 1961.9175 XRD / 1.270471 TEUR, ledger
+anchor 19276.814489252643513903:15.38433. XRD: operator 174.651 -> 171.549 (3.10 XRD of fees for six
+rebalances), alice 7107.773 -> 7029.923 (100 sold, about 22.7 bought back, fees).
 
 ## Not done, not tested, open
 
