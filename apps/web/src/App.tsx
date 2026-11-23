@@ -204,6 +204,7 @@ export function App() {
           <div className="venues"><dt>Venues</dt><dd>{market.venues.map(venueName).join(', ') || 'orders only'}</dd></div>
         </dl>
         <div className="right">
+          {!STATIC && (config.ownerPools ?? 0) > 0 && <nav className="nav" aria-label="Sections"><a href="#/pools">Pools</a></nav>}
           <span className={`net ${config.network}`}><span className="dot" aria-hidden="true" />{config.network}</span>
           {accounts.length > 1 && (
             <select className="account" value={account} onChange={(e) => setAccount(e.target.value)} aria-label="Account">
