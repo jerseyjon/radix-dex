@@ -772,7 +772,7 @@ async function tick(): Promise<void> {
       feeNow = after.feeBps;
       line.after = { event: ev, price: new Decimal(after.reserveB).div(after.reserveA).toNumber(), reserveA: after.reserveA, reserveB: after.reserveB, gapBps: round(priceDistance(new Decimal(after.reserveB).div(after.reserveA).toNumber(), target) * 10_000, 2) };
     } else if (r.sent || !r.preview.ok) behind = true; // sent but failed, preview failed, or skipped (halt, cap): the gap stays open
-  } else line.rebalance = { action: 'none', reason: dec.reason, allowance: dec.allowance, spendable: dec.spendable };
+  } else line.rebalance = { action: 'none', reason: dec.reason, allowance: dec.allowance, spendable: dec.spendable, ...(dec.cheapestCost ? { cheapestCost: dec.cheapestCost } : {}) };
 
   const bu = behindUpdate(state.behindTicks, behind, cfg.alertBehindTicks);
   state.behindTicks = bu.ticks;

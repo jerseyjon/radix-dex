@@ -1,6 +1,6 @@
 import { Decimal } from './manifest.ts';
-import { OwnerPoolQuoteError, type OwnerPoolState } from './ownerpool.ts';
-import { ownerPoolAllowanceNow, ownerPoolPlanRebalance, type OwnerPoolRebalancePlan } from './ownerpool-ops.ts';
+import { OwnerPoolQuoteError, fromAttos, toAttos, type OwnerPoolState } from './ownerpool.ts';
+import { ownerPoolAllowanceNow, ownerPoolMoveCostAttos, ownerPoolPlanRebalance, type OwnerPoolRebalancePlan } from './ownerpool-ops.ts';
 
 /**
  * Decision logic of the OwnerPool market-making bot (scripts/owner-pool-bot.ts, docs/owner-pool-bot.md).
@@ -585,7 +585,7 @@ export interface RebalanceConfig {
 }
 
 export type RebalanceDecision =
-  | { action: 'none'; reason: string; gapBps: number; deadBandBps: number; behind: boolean; allowance?: string; spendable?: string }
+  | { action: 'none'; reason: string; gapBps: number; deadBandBps: number; behind: boolean; allowance?: string; spendable?: string; cheapestCost?: string }
   | {
     action: 'rebalance'; toReserveA: string; toReserveB: string; kind: 'removeA' | 'removeB' | 'addA' | 'addB';
     plan: OwnerPoolRebalancePlan; priceBefore: number; priceAfter: number; gapBps: number; gapAfterBps: number;
@@ -617,7 +617,7 @@ export function decideRebalance(pool: OwnerPoolState, epoch: number, target: num
   const ra = new Decimal(pool.reserveA), rb = new Decimal(pool.reserveB);
   const price = rb.div(ra).toNumber();
   const gapBps = bps(priceDistance(price, target));
-  const none = (reason: string, behind = false, extra: { allowance?: string; spendable?: string } = {}): RebalanceDecision => ({ action: 'none', reason, gapBps, deadBandBps, behind, ...extra });
+  const none = (reason: string, behind = false, extra: { allowance?: string; spendable?: string; cheapestCost?: string } = {}): RebalanceDecision => ({ action: 'none', reason, gapBps, deadBandBps, behind, ...extra });
   if (!s) return none('not a split pool');
   if (!s.operator) return none('no operator appointed');
   if (s.ownerPaused) return none('paused by the owner');
@@ -643,30 +643,72 @@ export function decideRebalance(pool: OwnerPoolState, epoch: number, target: num
   const candidates = preferRemove ? [removal, addition] : [addition, removal];
 
   type Found = { kind: (typeof candidates)[number]['kind']; da: string; db: string; plan: OwnerPoolRebalancePlan; after: number; clipped: boolean };
+  // The cheapest move seen (any candidate) when none fits, for the reason.
+  let cheapest: bigint | undefined;
   const tryCandidate = (c: (typeof candidates)[number]): Found | undefined => {
     const full = (c.a ?? c.b)!;
     const div = c.a ? pool.divisibilityA : pool.divisibilityB;
-    const at = (t: number) => {
+    // The move t of the way to the target (0 < t <= 1), rounded toward zero: never past the target.
+    const deltas = (t: number): [string, string] | undefined => {
       const amount = full.mul(t).toDecimalPlaces(div, Decimal.ROUND_DOWN);
       if (amount.isZero()) return undefined;
-      const [da, db] = c.a ? [amount.toFixed(), '0'] : ['0', amount.toFixed()];
+      return c.a ? [amount.toFixed(), '0'] : ['0', amount.toFixed()];
+    };
+    // Fits everything: budget (within `spendable`), caps, floors, inventory (the exact contract checks).
+    const at = (t: number) => {
+      const d = deltas(t);
+      if (!d) return undefined;
       try {
-        const plan = ownerPoolPlanRebalance(pool, da, db, epoch);
+        const plan = ownerPoolPlanRebalance(pool, d[0], d[1], epoch);
         if (new Decimal(plan.cost).gt(spendable)) return undefined;
-        return { da, db, plan };
+        return { da: d[0], db: d[1], plan };
       } catch (e) {
         if (e instanceof OwnerPoolQuoteError) return undefined;
+        throw e;
+      }
+    };
+    // The contract's cost alone (no limit checked); undefined for an empty move.
+    const costAt = (t: number): bigint | undefined => {
+      const d = deltas(t);
+      return d ? (ownerPoolMoveCostAttos(pool, toAttos(d[0]), toAttos(d[1])) ?? 0n) : undefined;
+    };
+    const lt = (x: bigint | undefined, y: bigint | undefined) => x !== undefined && (y === undefined || x < y);
+    // Caps, floors and inventory alone: the plan fails only on the budget (spendable <= allowance).
+    const limitsOk = (t: number) => {
+      const d = deltas(t);
+      if (!d) return false;
+      try { ownerPoolPlanRebalance(pool, d[0], d[1], epoch); return true; } catch (e) {
+        if (e instanceof OwnerPoolQuoteError) return e.message === 'Operator price-move limit';
         throw e;
       }
     };
     let best = at(1), clipped = false;
     if (!best) {
       clipped = true;
-      let lo = 0, hi = 1;
-      for (let i = 0; i < 48; i++) {
-        const mid = (lo + hi) / 2;
-        const r = at(mid);
-        if (r) { lo = mid; best = r; } else hi = mid;
+      // The cost is max(d(current, new), d(anchor, new)) + depth growth. With the anchor where the curve
+      // is (no trade since the operator's last move) it rises from 0 with t; after a trade moved the
+      // curve away from the anchor, even a tiny move costs about the trade's whole price move, and the
+      // cheapest point is where the two distances meet (about halfway back). So: find that minimum
+      // (64-point scan, then a ternary search; the cost is unimodal in t), and from there the largest t
+      // that still fits (feasible t form one interval: cost rises past the minimum, caps/floors/inventory
+      // bind from some t on).
+      const N = 64;
+      let iMin = 1, cMin = costAt(1 / N);
+      for (let i = 2; i <= N; i++) { const ci = costAt(i / N); if (lt(ci, cMin)) { iMin = i; cMin = ci; } }
+      let a = (iMin - 1) / N, b = Math.min(1, (iMin + 1) / N);
+      for (let i = 0; i < 60; i++) {
+        const m1 = a + (b - a) / 3, m2 = b - (b - a) / 3;
+        if (lt(costAt(m2), costAt(m1))) a = m1; else b = m2;
+      }
+      let tMin = (a + b) / 2, cT = costAt(tMin);
+      if (lt(cMin, cT)) { tMin = iMin / N; cT = cMin; }
+      if (cT !== undefined && (cheapest === undefined || cT < cheapest)) cheapest = cT;
+      if (cT !== undefined && cT <= toAttos(spendable.toFixed())) {
+        let lo: number, hi: number, ok: (t: number) => boolean;
+        if (limitsOk(tMin)) { lo = tMin; hi = 1; ok = (t) => !!at(t); } // fits at tMin: the largest t up to 1
+        else { lo = 0; hi = tMin; ok = limitsOk; } // a cap/floor binds below tMin: its edge, if the cost there fits
+        for (let i = 0; i < 52; i++) { const mid = (lo + hi) / 2; if (ok(mid)) lo = mid; else hi = mid; }
+        best = at(lo);
       }
     }
     if (!best) return undefined;
@@ -674,7 +716,12 @@ export function decideRebalance(pool: OwnerPoolState, epoch: number, target: num
     return { kind: c.kind, ...best, after, clipped };
   };
   const found = candidates.map(tryCandidate).filter((f): f is Found => !!f);
-  if (!found.length) return none('no move fits the allowance, caps, floors and inventory', true, extra);
+  if (!found.length) {
+    const why = cheapest !== undefined && cheapest > toAttos(spendable.toFixed())
+      ? `no move fits: the cheapest move toward the target costs ${new Decimal(fromAttos(cheapest)).toSignificantDigits(4).toFixed()} (cost counts the distance from the ledger anchor ${s.anchor[1]}/${s.anchor[0]} too), spendable ${spendable.toSignificantDigits(4).toFixed()}`
+      : 'no move fits the allowance, caps, floors and inventory';
+    return none(why, true, { ...extra, ...(cheapest !== undefined ? { cheapestCost: fromAttos(cheapest) } : {}) });
+  }
   // Most progress wins; the preferred candidate (first) wins within 1 bps.
   const progress = (f: Found) => gapBps - bps(priceDistance(f.after, target));
   let pick = found[0]!;

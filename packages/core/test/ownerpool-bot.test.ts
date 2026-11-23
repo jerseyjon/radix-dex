@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   Decimal, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, aggregateReference, anchorCheck, calibrateScale, decideRebalance, feeDecision, feeTarget, median,
-  ownerPoolPlanRebalance, pauseDecision, poolTargetPrice, priceDistance, spendableAllowance, txAllowance, volatilityBps, type OwnerPoolState, type PauseState,
+  fromAttos, ownerPoolMoveCostAttos, ownerPoolPlanRebalance, pauseDecision, poolTargetPrice, priceDistance, spendableAllowance, toAttos, txAllowance, volatilityBps, type OwnerPoolState, type PauseState,
   type RebalanceConfig,
 } from '../src/index.ts';
 
@@ -269,4 +269,109 @@ test('transaction-rate cap: counts sends in the last hour only', () => {
   assert.equal(txAllowance([], now, 12), 12);
   assert.equal(txAllowance([now - 10, now - 3_599_999, now - 3_600_000, now - 9_000_000], now, 12), 10);
   assert.equal(txAllowance(Array.from({ length: 15 }, (_, i) => now - i * 1000), now, 12), 0);
+});
+
+// ------------------------------------------------------------------ partial moves after a trade (stale anchor)
+
+/** The pool after a trade moved it off the anchor the operator's last move left (anchor = those reserves). */
+const traded = (ra: string, rb: string, anchor: [string, string], allowance = '0.03', o: { ia?: string; ib?: string; minA?: string; maxB?: string } = {}): OwnerPoolState => {
+  const p = pool({ ra, rb, allowance, ia: o.ia ?? '2000', ib: o.ib ?? '2' });
+  return { ...p, split: { ...p.split!, anchor, limits: { ...p.split!.limits, minReserveA: o.minA ?? '10000', maxReserveB: o.maxB ?? '17.6' } } };
+};
+const S9_ANCHOR: [string, string] = ['19378.478733451898825465', '15.525368'];
+
+test('cost mirror: max(from current, from the stored anchor) + depth growth, as lib.rs, in attos', () => {
+  const p = traded('19466.729087505715781973', '15.463664', S9_ANCHOR);
+  const big = (v: string) => new Decimal(v);
+  for (const [da, db] of [['-50', '0'], ['-120.5', '0'], ['0', '0.04'], ['0', '0.09'], ['30', '0']] as const) {
+    const ra = big(p.reserveA), rb = big(p.reserveB), na = ra.plus(da), nb = rb.plus(db);
+    const dist = (x: Decimal, y: Decimal) => Decimal.max(x.div(y), y.div(x)).minus(1);
+    const fromCurrent = dist(nb.div(na), rb.div(ra)), fromAnchor = dist(nb.div(na), big(S9_ANCHOR[1]).div(S9_ANCHOR[0]));
+    const growth = Decimal.max(0, na.mul(nb).div(ra.mul(rb)).minus(1).div(2));
+    const expect = Decimal.max(fromCurrent, fromAnchor).plus(growth);
+    const got = ownerPoolMoveCostAttos(p, toAttos(da), toAttos(db))!;
+    const plan = ownerPoolPlanRebalance(p, da, db, EPOCH);
+    assert.equal(plan.cost, fromAttos(got), 'the plan uses the same cost');
+    // Each term rounds up by at most one atto: within 3 attos of the exact value, never below it.
+    const diff = big(fromAttos(got)).minus(expect);
+    assert.ok(diff.gte(0) && diff.lte('3e-18'), `${da}/${db}: ${fromAttos(got)} vs ${expect.toFixed(24)}`);
+  }
+  // A free proportional decrease costs nothing (null), as in lib.rs.
+  assert.equal(ownerPoolMoveCostAttos(pool(), toAttos('-2000'), toAttos('-1.6')), null);
+});
+
+test('big gap, small allowance: the largest partial move toward the target that fits (anchor at the curve)', () => {
+  // 20,000/16 with anchor = curve, target 5% up, spendable 0.004: the move costs ~0.004 and closes ~40 bps.
+  const p = pool({ allowance: '0.03' });
+  const d = decideRebalance(p, EPOCH, 0.0008 * 1.05, cfg({ spendCap: 0.004 }));
+  assert.ok(d.action === 'rebalance' && d.clipped && d.behind);
+  assert.ok(new Decimal(d.plan.cost).lte('0.004') && new Decimal(d.plan.cost).gt('0.00399'), d.plan.cost);
+  near(priceDistance(d.priceBefore, d.priceAfter), 0.004, 0.00002);
+  assert.ok(d.priceAfter > d.priceBefore && d.priceAfter < 0.0008 * 1.05, 'toward the target, not past it');
+  assert.equal(ownerPoolPlanRebalance(p, d.toReserveA, d.toReserveB, EPOCH).cost, d.plan.cost);
+});
+
+test('after a trade: the cheapest move is halfway back, and a partial move is found beyond it (Soak 9 C2)', () => {
+  // Soak 9 phase C2: pool 0.00079436, anchor 0.00080116 (the operator's last move), target 0.0008.
+  // A move t of the way costs max(t x 71, 85 - t x 71) bps (+ growth): never below ~43 bps, lowest at t ~0.6.
+  const p = traded('19466.729087505715781973', '15.463664', S9_ANCHOR);
+  // As logged: spendable 0.0024 < the cheapest 0.0043: nothing fits, and the reason says why.
+  const no = decideRebalance(p, EPOCH, 0.0008, cfg({ spendCap: 0.002395841653050242 }));
+  assert.ok(no.action === 'none' && no.behind);
+  assert.match(no.reason, /cheapest move toward the target costs 0\.004/);
+  near(Number(no.cheapestCost), 0.00428, 0.00002);
+  // Spendable 0.0045: t = 0.5 costs 0.0050 (too much; a search down from t = 1 stopped there and found
+  // nothing), but t ~0.59-0.63 costs <= 0.0045. The largest such t is taken.
+  const d = decideRebalance(p, EPOCH, 0.0008, cfg({ spendCap: 0.0045 }));
+  assert.ok(d.action === 'rebalance' && d.kind === 'removeA' && d.clipped, JSON.stringify(d));
+  assert.ok(new Decimal(d.plan.cost).lte('0.0045') && new Decimal(d.plan.cost).gt('0.00449'), d.plan.cost);
+  assert.ok(d.priceAfter > d.priceBefore && d.priceAfter < 0.0008, 'toward the target, never past it');
+  assert.ok(d.gapAfterBps < d.gapBps * 0.45, `gap ${d.gapBps} -> ${d.gapAfterBps}`);
+  // Maximal: 0.1% more of the same move no longer fits.
+  const more = new Decimal(d.toReserveA).mul(1.001).toDecimalPlaces(18, Decimal.ROUND_DOWN).toFixed();
+  assert.ok(new Decimal(ownerPoolPlanRebalance(p, more, '0', EPOCH).cost).gt('0.0045'));
+  // With the whole budget it goes all the way to the target (cost 0.0071 from the current price).
+  const full = decideRebalance(p, EPOCH, 0.0008, cfg({ spendFraction: 1, reserveFraction: 0 }));
+  assert.ok(full.action === 'rebalance' && !full.clipped);
+  near(full.priceAfter, 0.0008, 1e-10);
+});
+
+test('after a trade: Soak 9 tick 6 had no feasible move at all (the cheapest cost 0.0154 vs 0.00054 spendable)', () => {
+  const p = traded('19678.478733451898825465', '15.291014', S9_ANCHOR, '0.006666699945534301');
+  const d = decideRebalance(p, EPOCH, 0.0008, cfg({ spendFraction: 0.25, sizeFactor: 0.5, spendCap: 0.000541699945534301 }));
+  assert.ok(d.action === 'none' && d.behind);
+  near(Number(d.cheapestCost), 0.01544, 0.0001);
+  // 0.02 all spendable (more than the cheapest 0.0154, less than the 0.0295 to the target): a partial move
+  // past the halfway point, using nearly all of it.
+  const part = decideRebalance(traded('19678.478733451898825465', '15.291014', S9_ANCHOR, '0.02'), EPOCH, 0.0008, cfg({ spendFraction: 1, reserveFraction: 0 }));
+  assert.ok(part.action === 'rebalance' && part.clipped, JSON.stringify(part));
+  assert.ok(new Decimal(part.plan.cost).lte('0.02') && new Decimal(part.plan.cost).gt('0.0199'), part.plan.cost);
+  assert.ok(part.gapAfterBps < part.gapBps * 0.35 && part.priceAfter < 0.0008);
+});
+
+test('partial moves after a trade respect floors, caps, inventory and the minimum move', () => {
+  // XRD floor just under the cheapest point: the removal stops at the floor if its cost fits there.
+  const atFloor = traded('19466.729087505715781973', '15.463664', S9_ANCHOR, '0.03', { minA: '19400', ib: '0' });
+  const f = decideRebalance(atFloor, EPOCH, 0.0008, cfg({ side: 'remove', spendFraction: 1, reserveFraction: 0 }));
+  if (f.action === 'rebalance') {
+    assert.ok(new Decimal(f.plan.reserveA).gte('19400'));
+    assert.ok(new Decimal(f.plan.cost).lte('0.03'));
+  }
+  // Every proposal over a sweep of targets, sides and spend caps re-checks against the contract copy.
+  for (const target of [0.00079, 0.0008, 0.000801, 0.00081, 0.00078])
+    for (const side of ['remove', 'add', 'balanced'] as const)
+      for (const spendCap of [0.001, 0.003, 0.0045, 0.008, 0.02]) {
+        const p = traded('19466.729087505715781973', '15.463664', S9_ANCHOR, '0.03', { minA: '19300', maxB: '15.6', ia: '50', ib: '0.05' });
+        const d = decideRebalance(p, EPOCH, target, cfg({ side, targetDepth: 17000, spendCap, spendFraction: 1, reserveFraction: 0 }));
+        if (d.action !== 'rebalance') continue;
+        const plan = ownerPoolPlanRebalance(p, d.toReserveA, d.toReserveB, EPOCH); // throws on any breach
+        assert.ok(new Decimal(plan.cost).lte(spendCap));
+        assert.ok(new Decimal(plan.reserveA).gte('19300') && new Decimal(plan.reserveB).lte('15.6'));
+        assert.ok(new Decimal(d.toReserveA).lte('50') && new Decimal(d.toReserveB).lte('0.05'));
+        const lo = Math.min(d.priceBefore, target), hi = Math.max(d.priceBefore, target);
+        assert.ok(d.priceAfter >= lo - 1e-12 && d.priceAfter <= hi + 1e-12, `never past the target: ${d.priceAfter} vs ${target}`);
+      }
+  // Minimum move: a partial move smaller than it is not sent.
+  const m = decideRebalance(traded('19466.729087505715781973', '15.463664', S9_ANCHOR), EPOCH, 0.0008, cfg({ spendCap: 0.0045, minMoveBps: 60 }));
+  assert.match(m.action === 'none' ? m.reason : '', /minimum 60/);
 });

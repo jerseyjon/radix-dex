@@ -86,17 +86,32 @@ export function ownerPoolPlanRebalance(state: OwnerPoolState, toReserveA: string
   if (da > 0n && da > toAttos(s.inventoryA)) throw new OwnerPoolQuoteError('Not enough inventory of token A');
   if (db > 0n && db > toAttos(s.inventoryB)) throw new OwnerPoolQuoteError('Not enough inventory of token B');
   const before = ownerPoolAllowanceNow(state, epoch);
-  const fromCurrent = ownerPoolPriceDistanceAttos(ra, rb, na, nb);
-  if (!raises && fromCurrent === 0n) {
+  const total = ownerPoolMoveCostAttos(state, da, db);
+  if (total === null) {
     return { reserveA: fromAttos(na), reserveB: fromAttos(nb), cost: '0', allowanceBefore: before, allowanceAfter: before, anchor: [...s.anchor] };
   }
-  const aa = toAttos(s.anchor[0]), ab = toAttos(s.anchor[1]);
-  if (!(aa > 0n && ab > 0n)) throw new OwnerPoolQuoteError('No anchor price');
-  const fromAnchor = ownerPoolPriceDistanceAttos(aa, ab, na, nb);
-  const total = (fromCurrent >= fromAnchor ? fromCurrent : fromAnchor) + ownerPoolDepthGrowthAttos(ra, rb, na, nb);
   const have = toAttos(before);
   if (total > have) throw new OwnerPoolQuoteError('Operator price-move limit');
   return { reserveA: fromAttos(na), reserveB: fromAttos(nb), cost: fromAttos(total), allowanceBefore: before, allowanceAfter: fromAttos(have - total), anchor: [fromAttos(na), fromAttos(nb)] };
+}
+
+/**
+ * The budget an operator move of (da, db) attos costs (lib.rs `move_inventory`), with no limit checked:
+ * max(d(current, new), d(anchor, new)) + depth growth, or null for a free exactly-proportional decrease.
+ * The anchor is the stored one (the reserves after the operator's last costed move, or the owner's
+ * statement), so a move back toward it after a trade costs at least half the trade's price move.
+ */
+export function ownerPoolMoveCostAttos(state: OwnerPoolState, da: bigint, db: bigint): bigint | null {
+  const s = needSplit(state);
+  const ra = toAttos(state.reserveA), rb = toAttos(state.reserveB);
+  const na = ra + da, nb = rb + db;
+  if (!(ra > 0n && rb > 0n && na > 0n && nb > 0n)) throw new OwnerPoolQuoteError('Pool is empty');
+  const fromCurrent = ownerPoolPriceDistanceAttos(ra, rb, na, nb);
+  if (!(da > 0n || db > 0n) && fromCurrent === 0n) return null;
+  const aa = toAttos(s.anchor[0]), ab = toAttos(s.anchor[1]);
+  if (!(aa > 0n && ab > 0n)) throw new OwnerPoolQuoteError('No anchor price');
+  const fromAnchor = ownerPoolPriceDistanceAttos(aa, ab, na, nb);
+  return (fromCurrent >= fromAnchor ? fromCurrent : fromAnchor) + ownerPoolDepthGrowthAttos(ra, rb, na, nb);
 }
 
 function needSplit(state: OwnerPoolState) {
