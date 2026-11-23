@@ -126,8 +126,8 @@ test('the mainnet --send guard: every condition, each with its own message', () 
   assert.deepEqual(sendGuardProblems({ ...ok, network: 'stokenet', scaleFlag: 'auto', ack: false, sendPools: [], mainnetPackages: [] }), []);
   assert.equal(sendGuardProblems({ ...ok, network: 'stokenet', alertUrl: undefined }).length, 1);
   // As committed today: mainnet --send is impossible.
-  // The package is published (23 Nov 2026); no pool is approved for sending yet.
-  assert.deepEqual([MAINNET_SEND_POOLS.length, OWNER_POOL_PACKAGES.mainnet?.length ?? 0], [0, 1]);
+  // The package is published and the owner's XRD/hUSDC pool approved for sending (23 Nov 2026).
+  assert.deepEqual([MAINNET_SEND_POOLS, OWNER_POOL_PACKAGES.mainnet?.length ?? 0], [['component_rdx1cz6ga0dfz3vqefku0vvgyu0fsv9q6u09vtkpew5ysa8qdsz3ha6zyr'], 1]);
 });
 
 test('H-2: the target is the median of the last 3 healthy readings; one spike is not the target', () => {

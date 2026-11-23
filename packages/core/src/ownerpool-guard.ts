@@ -175,7 +175,10 @@ export function optValue(argv: string[], name: string): string | undefined {
 // ------------------------------------------------------------------ the mainnet --send guard
 
 /** Pools the bot may SEND for on mainnet. Committed in code, filled only on the owner's explicit go-ahead. */
-export const MAINNET_SEND_POOLS: readonly string[] = [];
+export const MAINNET_SEND_POOLS: readonly string[] = [
+  // The owner's XRD/hUSDC pool, created 23 Nov 2026; live sending approved by the owner 23 Nov 2026.
+  'component_rdx1cz6ga0dfz3vqefku0vvgyu0fsv9q6u09vtkpew5ysa8qdsz3ha6zyr',
+];
 
 export interface SendGuardInput {
   network: string;
