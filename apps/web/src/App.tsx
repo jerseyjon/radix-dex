@@ -5,7 +5,7 @@ import { Book } from './Book';
 import { Chart } from './Chart';
 import { DepthChart } from './DepthChart';
 import { fmtPrice, fmtTime, fmtUsd, shortAddr, venueName } from './format';
-import { Markets } from './Markets';
+import { Markets, PairPicker, useShowAllMarkets } from './Markets';
 import { OrderForm } from './OrderForm';
 import { Orders } from './Orders';
 import { type Keyed, forKey, headerChange, pollGuard, retryWaitMs } from './live';
@@ -19,7 +19,6 @@ const EMPTY_CANDLES: Candle[] = [];
 const NO_BALANCES: Record<string, string> = {};
 const NO_ORDERS: OrderView[] = [];
 const NO_TRADES: TradeView[] = [];
-const WIDE = '(min-width: 1101px)'; // above this the markets list is always shown, not a drawer
 
 /**
  * Run `load` now and every `ms`. `load` gets `isCurrent`, which turns false once the inputs change
@@ -33,18 +32,6 @@ function usePolling(load: (isCurrent: () => boolean) => Promise<void> | void, ms
     const t = setInterval(run, ms);
     return () => { guard.stop(); clearInterval(t); };
   }, deps); // the caller names the inputs `load` depends on
-}
-
-function useMedia(query: string): boolean {
-  const [on, setOn] = useState(() => typeof matchMedia === 'function' && matchMedia(query).matches);
-  useEffect(() => {
-    if (typeof matchMedia !== 'function') return;
-    const m = matchMedia(query), f = () => setOn(m.matches);
-    // Some environments (device emulation, older engines) miss the change event: also check on resize.
-    f(); m.addEventListener('change', f); window.addEventListener('resize', f);
-    return () => { m.removeEventListener('change', f); window.removeEventListener('resize', f); };
-  }, [query]);
-  return on;
 }
 
 export function App() {
@@ -69,8 +56,7 @@ export function App() {
   const [toast, setToast] = useState<string>();
   const [loadError, setLoadError] = useState<{ message: string; retryInSec: number; attempt: number }>();
   const [reload, setReload] = useState(0);
-  const [showMarkets, setShowMarkets] = useState(false);
-  const wide = useMedia(WIDE);
+  const [showAllMarkets, setShowAllMarkets] = useShowAllMarkets();
   const pickCount = useRef(0);
 
   // First load, retried with backoff: one failure (a 429 after a burst, say) is not final.
@@ -108,8 +94,6 @@ export function App() {
   const trades = forKey(historySet, account) ?? NO_TRADES;
   const onPick = useCallback((price: number) => { if (marketId) setPickedSet({ key: marketId, value: { price, n: ++pickCount.current } }); }, [marketId]);
 
-  // Above 1100 px there is no drawer: never leave one marked open for when the window narrows.
-  useEffect(() => { if (wide) setShowMarkets(false); }, [wide]);
   useEffect(() => { if (selected) history.replaceState(null, '', '#' + encodeURIComponent(selected)); }, [selected]);
 
   const wallet = useMemo(() => (config && !STATIC ? getWallet(config.networkId, config.dAppDefinition) : undefined), [config]);
@@ -180,18 +164,12 @@ export function App() {
   const priceIsMid = depth?.mid != null;
   const headPrice = priceIsMid ? depth?.mid : last?.close;
   const showPools = !STATIC && (config.ownerPools ?? 0) > 0;
-  const pairClick = () => {
-    if (wide) { document.querySelector<HTMLInputElement>('.markets input[type="search"]')?.focus(); return; }
-    setShowMarkets((v) => !v);
-  };
 
   return (
-    <div className={`app ${showMarkets ? 'show-markets' : ''}`}>
+    <div className="app">
       <header className="top">
         <div className="market-bar glass">
-          <button className="pair-btn" onClick={pairClick} aria-expanded={wide ? undefined : showMarkets} aria-controls="markets-panel" aria-label={`${market.base.symbol}/${market.quote.symbol}: choose a market`}>
-            <span className="pair-base">{market.base.symbol}</span><span className="pair-quote">/{market.quote.symbol}</span> <span className="caret"><Icon name="chevron" size={14} /></span>
-          </button>
+          <PairPicker markets={markets} market={market} onSelect={setSelected} showAll={showAllMarkets} onShowAll={setShowAllMarkets} />
           <div className="ticker">
             <span className="ticker-label" title={priceIsMid ? 'Mid price of the order book (pools and limit orders). The chart shows trade prices, so its last price can differ.' : 'Last trade price, from the chart'}>{headPrice === undefined ? 'Price' : priceIsMid ? 'Mid' : 'Last'}</span>
             <span className="ticker-price">{fmtPrice(headPrice)}</span>
@@ -229,8 +207,7 @@ export function App() {
         </div>
       )}
 
-      {showMarkets && <div className="scrim" onClick={() => setShowMarkets(false)} aria-hidden="true" />}
-      <Markets markets={markets} selected={market.id} onSelect={(id) => { setSelected(id); setShowMarkets(false); }} />
+      <Markets markets={markets} selected={market.id} onSelect={setSelected} showAll={showAllMarkets} onShowAll={setShowAllMarkets} />
 
       <main className="center">
         <section className="panel chart-panel">
