@@ -34,6 +34,15 @@ export const OWNER_POOL_BOT_DEFAULTS = {
   maxVenueFee: 0.01,
   /** The set of live venues changed: no rebalance for this long (restarts on another change; persisted). */
   venueHoldSec: 900,
+  /**
+   * A venue counts as dropped only after failing this many ticks in a row, and as back only after
+   * quoting this many ticks in a row (`venueConfirm`; owner, 23 Nov 2026). 1 = the old behaviour.
+   */
+  confirmTicks: 2,
+  /** Only ONE venue in the confirmed live set: fee target + this (bps, still clamped to the operator range)... */
+  singleVenueFeeAddBps: 50,
+  /** ...and the per-tick spend cap and the rolling-window share are multiplied by this (owner, 23 Nov 2026). */
+  singleVenueSizeFactor: 0.5,
   /** While the venues disagree: fee + this fraction of the disagreement (in bps), inside the operator range. */
   disagreeFeeFactor: 0.5,
   /** CoinGecko (watch only) this far from the on-ledger reference: alert. Never affects a trade. */
@@ -208,7 +217,7 @@ export function readVenue(q: VenueQuote, minImpact: number): Required<Pick<Venue
  * lowest live midpoint differ by more than `maxDisagreement`: disagree (the price is reported for
  * the logs and the fee, never traded on).
  */
-export function aggregateVenues(quotes: VenueQuote[], nowMs: number, o: { minVenues: number; maxAgeMs: number; maxDisagreement: number; maxRoundTrip: number; minImpactBps: number; maxVenueFee?: number; exclude?: string[] }): VenueReference {
+export function aggregateVenues(quotes: VenueQuote[], nowMs: number, o: { minVenues: number; maxAgeMs: number; maxDisagreement: number; maxRoundTrip: number; minImpactBps: number; maxVenueFee?: number; exclude?: string[]; unconfirmed?: Record<string, string> }): VenueReference {
   const maxFee = o.maxVenueFee ?? OWNER_POOL_BOT_DEFAULTS.maxVenueFee;
   const venues: VenueReading[] = quotes.map((q) => {
     if (o.exclude?.includes(q.venue)) return { venue: q.venue, used: false, dropped: 'excluded by --exclude-venues (TEST)' };
@@ -220,6 +229,9 @@ export function aggregateVenues(quotes: VenueQuote[], nowMs: number, o: { minVen
     if (!(r.roundTrip >= -1e-9)) return { venue: q.venue, ...r, used: false, dropped: `ask below bid (round trip ${(r.roundTrip * 100).toFixed(2)}%)` };
     if (r.roundTrip > o.maxRoundTrip) return { venue: q.venue, ...r, used: false, dropped: `round trip ${(r.roundTrip * 100).toFixed(2)}% > ${(o.maxRoundTrip * 100).toFixed(1)}%` };
     if (r.fee > maxFee + 1e-9) return { venue: q.venue, ...r, used: false, dropped: `fee ${(r.fee * 100).toFixed(3)}% > ${(maxFee * 100).toFixed(2)}% (estimated from its quotes)` };
+    // Passed every check, but coming back and not yet confirmed (`venueConfirm`): read, logged, not used.
+    const pending = o.unconfirmed?.[q.venue];
+    if (pending !== undefined) return { venue: q.venue, ...r, used: false, dropped: pending };
     return { venue: q.venue, ...r, used: true };
   });
   const live = venues.filter((v) => v.used);
@@ -276,6 +288,86 @@ export function venueSetHold(prev: VenueHoldState, live: string[], now: number, 
   const expired = !holding && st.holdUntil !== undefined;
   if (expired) { st.holdUntil = undefined; st.holdStartedAt = undefined; st.holdReason = undefined; }
   return { state: st, changed, started, holding, expired, added, removed, remainingMs: holding ? st.holdUntil! - now : 0 };
+}
+
+// ------------------------------------------------------------------ venue confirmation (two ticks)
+
+/** Persisted in the bot's state file: the CONFIRMED live venue set and the per-venue streak counters. */
+export interface VenueConfirmState {
+  /** Sorted; undefined before the first tick. */
+  confirmed?: string[];
+  /** Confirmed venue -> failed ticks in a row (it is still confirmed). */
+  fails?: Record<string, number>;
+  /** Unconfirmed venue -> good ticks in a row (it does not count yet). */
+  goods?: Record<string, number>;
+}
+
+/**
+ * The owner's rule (23 Nov 2026): one failed quote does not change the live set. A confirmed venue
+ * must fail on `confirmTicks` ticks in a row before it is dropped (and the venue-set hold starts); a
+ * venue that is not confirmed must quote on `confirmTicks` ticks in a row before it counts. `quoting`
+ * is the set of venues that passed every check this tick (`aggregateVenues` without `unconfirmed`).
+ * `uncertain`: a confirmed venue failed this tick and is not dropped yet; the caller prices from the
+ * confirmed venues that did quote but does not rebalance on that tick. The first tick ever (no
+ * confirmed set) confirms whatever quotes, as before. `confirmTicks` 1 = the old behaviour.
+ */
+export function venueConfirm(prev: VenueConfirmState, quoting: string[], confirmTicks: number): {
+  state: VenueConfirmState; confirmed: string[]; failing: { venue: string; ticks: number }[]; returning: { venue: string; ticks: number }[];
+  dropped: string[]; added: string[]; uncertain: boolean;
+} {
+  const n = Math.max(1, Math.floor(confirmTicks));
+  const q = [...new Set(quoting)].sort();
+  if (!prev.confirmed) return { state: { confirmed: q, fails: {}, goods: {} }, confirmed: q, failing: [], returning: [], dropped: [], added: [], uncertain: false };
+  const fails: Record<string, number> = {}, goods: Record<string, number> = {};
+  const failing: { venue: string; ticks: number }[] = [], returning: { venue: string; ticks: number }[] = [];
+  const dropped: string[] = [], added: string[] = [];
+  const confirmed: string[] = [];
+  for (const v of prev.confirmed) {
+    if (q.includes(v)) { confirmed.push(v); continue; }
+    const t = (prev.fails?.[v] ?? 0) + 1;
+    if (t >= n) dropped.push(v);
+    else { confirmed.push(v); fails[v] = t; failing.push({ venue: v, ticks: t }); }
+  }
+  for (const v of q) {
+    if (prev.confirmed.includes(v)) continue;
+    const t = (prev.goods?.[v] ?? 0) + 1;
+    if (t >= n) { added.push(v); confirmed.push(v); } else { goods[v] = t; returning.push({ venue: v, ticks: t }); }
+  }
+  confirmed.sort();
+  return { state: { confirmed, fails, goods }, confirmed, failing, returning, dropped, added, uncertain: failing.length > 0 };
+}
+
+/**
+ * What the venue rules allow this tick, in the bot's order: venues disagreeing (> max disagreement):
+ * hold and widen; a venue-set hold running: hold; a confirmed venue failed once (`uncertain`): no
+ * rebalance; no reference: nothing; otherwise trade. Hold, uncertain and disagree all keep the fee
+ * step with narrowing blocked; `none` skips it.
+ */
+export function venueGate(o: { status: VenueReference['status']; holding: boolean; uncertain: boolean }): 'disagree' | 'hold' | 'uncertain' | 'none' | 'trade' {
+  if (o.status === 'disagree') return 'disagree';
+  if (o.status !== 'ok') return 'none';
+  if (o.holding) return 'hold';
+  if (o.uncertain) return 'uncertain';
+  return 'trade';
+}
+
+// ------------------------------------------------------------------ single-venue caution
+
+/** Persisted: when the current single-venue episode began (undefined: not in one). */
+export interface SingleVenueState { since?: number }
+
+/**
+ * The owner's rule (23 Nov 2026): with only ONE venue in the confirmed live set the bot keeps trading,
+ * cautiously (fee + `singleVenueFeeAddBps`, sizes x `singleVenueSizeFactor`, applied by the caller).
+ * `active` when the confirmed set has exactly one venue; `started` on the first such tick of an episode
+ * (alert once); `ended` when two or more venues are confirmed again (clear the alert key). Zero confirmed
+ * venues neither starts nor ends an episode (no reference: no trade anyway).
+ */
+export function singleVenueCaution(prev: SingleVenueState, confirmedCount: number, now: number): { state: SingleVenueState; active: boolean; started: boolean; ended: boolean } {
+  const active = confirmedCount === 1;
+  if (active) return { state: { since: prev.since ?? now }, active, started: prev.since === undefined, ended: false };
+  if (confirmedCount >= 2) return { state: {}, active, started: false, ended: prev.since !== undefined };
+  return { state: { ...prev }, active, started: false, ended: false };
 }
 
 // ------------------------------------------------------------------ reference must not contain our own pool
@@ -444,6 +536,11 @@ export interface RebalanceConfig {
   targetDepth?: number;
   /** Further cap on this tick's spend (the rolling-window room, `windowSpendRoom`). */
   spendCap?: number;
+  /**
+   * Multiplies the per-tick spend cap min(allowance x spendFraction, allowance - reserve) (default 1).
+   * The single-venue caution passes 0.5; the caller halves the window share for `spendCap` itself.
+   */
+  sizeFactor?: number;
 }
 
 export type RebalanceDecision =
@@ -486,7 +583,9 @@ export function decideRebalance(pool: OwnerPoolState, epoch: number, target: num
   if (!(target > 0) || !Number.isFinite(target)) return none('no target price');
   if (gapBps <= deadBandBps) return none('inside the dead band');
   const allowance = ownerPoolAllowanceNow(pool, epoch);
-  const base = spendableAllowance(allowance, s.limits.moveBudgetBps, cfg);
+  const f = cfg.sizeFactor ?? 1;
+  if (!(f > 0 && f <= 1)) throw new Error(`sizeFactor must be in (0, 1], not ${f}`);
+  const base = spendableAllowance(allowance, s.limits.moveBudgetBps, cfg).mul(f).toDecimalPlaces(18, Decimal.ROUND_DOWN);
   const windowCapped = cfg.spendCap !== undefined && base.gt(Math.max(0, cfg.spendCap));
   const spendable = windowCapped ? new Decimal(Math.max(0, cfg.spendCap!)).toDecimalPlaces(18, Decimal.ROUND_DOWN) : base;
   const extra = { allowance, spendable: spendable.toFixed() };
@@ -582,15 +681,16 @@ export function volatilityBps(history: { at: number; price: number }[], now: num
 
 /**
  * fee = base + volMultiplier * volatility (+ behindFeeBps when the bot cannot catch up) (+ disagreeFeeFactor
- * * the venues' disagreement, in bps, while they disagree), rounded, inside [min, max].
+ * * the venues' disagreement, in bps, while they disagree) (+ `singleVenueAddBps` while only one venue is
+ * confirmed live), rounded, inside [min, max].
  */
-export function feeTarget(o: { volBps: number; behind: boolean; disagreement?: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'baseFeeBps' | 'volMultiplier' | 'behindFeeBps'> & { disagreeFeeFactor?: number } }): number {
+export function feeTarget(o: { volBps: number; behind: boolean; disagreement?: number; singleVenueAddBps?: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'baseFeeBps' | 'volMultiplier' | 'behindFeeBps'> & { disagreeFeeFactor?: number } }): number {
   return feeTargetDetail(o).feeBps;
 }
 
 /** `feeTarget` with the unclamped value, and whether the owner's range clamped it. */
-export function feeTargetDetail(o: { volBps: number; behind: boolean; disagreement?: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'baseFeeBps' | 'volMultiplier' | 'behindFeeBps'> & { disagreeFeeFactor?: number } }): { feeBps: number; rawBps: number; clamped: 'min' | 'max' | null } {
-  const rawBps = Math.round(o.cfg.baseFeeBps + o.cfg.volMultiplier * o.volBps + (o.behind ? o.cfg.behindFeeBps : 0) + (o.disagreement ? (o.cfg.disagreeFeeFactor ?? 0) * o.disagreement * 10_000 : 0));
+export function feeTargetDetail(o: { volBps: number; behind: boolean; disagreement?: number; singleVenueAddBps?: number; minFeeBps: number; maxFeeBps: number; cfg: Pick<FeeConfig, 'baseFeeBps' | 'volMultiplier' | 'behindFeeBps'> & { disagreeFeeFactor?: number } }): { feeBps: number; rawBps: number; clamped: 'min' | 'max' | null } {
+  const rawBps = Math.round(o.cfg.baseFeeBps + o.cfg.volMultiplier * o.volBps + (o.behind ? o.cfg.behindFeeBps : 0) + (o.disagreement ? (o.cfg.disagreeFeeFactor ?? 0) * o.disagreement * 10_000 : 0) + (o.singleVenueAddBps ?? 0));
   const feeBps = Math.min(o.maxFeeBps, Math.max(o.minFeeBps, rawBps));
   return { feeBps, rawBps, clamped: rawBps > o.maxFeeBps ? 'max' : rawBps < o.minFeeBps ? 'min' : null };
 }

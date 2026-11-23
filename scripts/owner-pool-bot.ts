@@ -20,6 +20,11 @@
 //                            The bot REFUSES to start if a venue is the operated pool or any OwnerPool component (checked on ledger).
 //   --venue-hold <s>         the set of live venues changed: no rebalance for this long (900; restarts on another change;
 //                            kept in the state file); the fee may widen meanwhile, not narrow
+//   --confirm-ticks <n>      a venue counts as dropped only after failing n ticks in a row, and as back only after
+//                            quoting n ticks in a row (2); on a tick where a confirmed venue failed but is not yet
+//                            dropped, the bot prices from the venues that did quote and does not rebalance
+//   --single-venue-fee-add <bps>      only ONE venue confirmed live: fee target + this (50; still clamped to the range)
+//   --single-venue-size-factor <f>    ...and the per-tick spend cap and the rolling-window share x this (0.5)
 //   --exclude-venues a,b     TEST/DRILL ONLY: treat these venues as dropped. --exclude-venues-file <path>: the same, names
 //                            read from the file (comma/whitespace separated) on every tick, so a venue can be dropped mid-run
 //   --watch-sources a,b      WATCH ONLY, never traded on: coingecko (default). Alert when it is more than
@@ -50,7 +55,7 @@ import { appendFileSync, existsSync, readFileSync, renameSync, unlinkSync, write
 import { assertReferenceExcludesOwnerPools, makePriceSources, makeVenues, readSource, readVenueSource, type PriceSource, type VenueSource } from './owner-pool-sources.ts';
 import {
   AlertSink, Decimal, Gateway, findOwnerAnchor, parseAnchorFlag, refreshOwnerAnchor, resolveOwnerAnchor, type OwnerAnchorSource, type OwnerAnchorStatement, NETWORKS, OWNER_POOL_BOT_DEFAULTS as D, OWNER_POOL_PACKAGES, accountOf, addr, anchorCheck, buildTransaction,
-  calibrateScale, decideRebalance, feeDecision, venueSetHold, type VenueHoldState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
+  calibrateScale, decideRebalance, feeDecision, venueSetHold, venueConfirm, venueGate, singleVenueCaution, type VenueHoldState, type VenueConfirmState, type SingleVenueState, feeTargetDetail, keyFromHex, aggregateVenues, watchPriceCheck, windowSpendRoom, recordSendOutcome, sendHalted, behindUpdate, tickOutcome,
   ownerPoolAllowanceNow, ownerPoolOperatorSetFeeManifest,
   ownerPoolRebalanceManifest, ownerPoolSetOperatorPausedManifest, pauseDecision, poolTargetPrice, priceDistance, readOwnerPools, submitAndWait,
   txAllowance, volatilityBps, type Ed25519Key, type VenueReference, type NetworkName, type OwnerPoolState, type PauseState, type RebalanceSide,
@@ -91,6 +96,9 @@ const cfg = {
   maxRoundTrip: num('max-round-trip', D.maxRoundTrip),
   maxVenueFee: num('max-venue-fee', D.maxVenueFee),
   venueHoldSec: num('venue-hold', D.venueHoldSec),
+  confirmTicks: num('confirm-ticks', D.confirmTicks),
+  singleVenueFeeAddBps: num('single-venue-fee-add', D.singleVenueFeeAddBps),
+  singleVenueSizeFactor: num('single-venue-size-factor', D.singleVenueSizeFactor),
   excludeVenues: (opt('exclude-venues') ?? '').split(',').map((s) => s.trim()).filter(Boolean),
   excludeVenuesFile: opt('exclude-venues-file'),
   disagreeFeeFactor: num('disagree-fee-factor', D.disagreeFeeFactor),
@@ -137,6 +145,8 @@ const cfg = {
 if (!['balanced', 'remove', 'add'].includes(cfg.side)) throw new Error('--side must be balanced, remove or add');
 if (!(cfg.spendFraction > 0 && cfg.spendFraction <= 1) || cfg.reserveFraction < 0 || cfg.reserveFraction >= 1) throw new Error('bad --spend-fraction / --reserve-fraction');
 if (!(cfg.maxWindowSpendShare > 0 && cfg.maxWindowSpendShare <= 1) || !(cfg.spendWindowSec > 0)) throw new Error('bad --max-window-spend / --spend-window');
+if (!(Number.isInteger(cfg.confirmTicks) && cfg.confirmTicks >= 1)) throw new Error('--confirm-ticks must be a whole number >= 1');
+if (!(cfg.singleVenueSizeFactor > 0 && cfg.singleVenueSizeFactor <= 1) || !(cfg.singleVenueFeeAddBps >= 0)) throw new Error('bad --single-venue-size-factor (0-1] / --single-venue-fee-add (>= 0)');
 if (!(cfg.quoteSizeXrd > 0) || !(cfg.smallQuoteFraction > 0 && cfg.smallQuoteFraction < 1)) throw new Error('bad --quote-size / --small-fraction');
 
 const net = NETWORKS[NETWORK];
@@ -172,6 +182,10 @@ interface BotState {
   lastFeeFailure?: { feeBps: number; at: number };
   /** The live venue set last seen and the venue-set hold (survives a restart). */
   venueHold?: VenueHoldState;
+  /** The confirmed live venue set and the two-tick streak counters (survive a restart). */
+  venueConfirm?: VenueConfirmState;
+  /** The current single-venue episode (survives a restart, so its alert is not repeated). */
+  singleVenue?: SingleVenueState;
 }
 const loadState = (): BotState => {
   const fresh: BotState = { history: [], txTimes: [], pause: { pausedByBot: false }, consecutiveFailures: 0 };
@@ -341,22 +355,44 @@ async function tick(): Promise<void> {
   // 1. Reference: on-ledger venues only. Watch sources (CoinGecko) are read beside them, never used.
   const [quotes, watch] = await Promise.all([Promise.all(venues.map(readVenueSource)), Promise.all(watchSources.map(readSource))]);
   const exclude = excludedVenues();
-  const vref: VenueReference = aggregateVenues(quotes, now, { minVenues: cfg.minVenues, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement, maxRoundTrip: cfg.maxRoundTrip, minImpactBps: cfg.minImpactBps, maxVenueFee: cfg.maxVenueFee, exclude });
+  const aggOpts = { minVenues: cfg.minVenues, maxAgeMs: cfg.maxSourceAgeSec * 1000, maxDisagreement: cfg.maxDisagreement, maxRoundTrip: cfg.maxRoundTrip, minImpactBps: cfg.minImpactBps, maxVenueFee: cfg.maxVenueFee, exclude };
+  const raw: VenueReference = aggregateVenues(quotes, now, aggOpts);
   if (exclude.length) line.testExcluded = exclude;
-  // Venue-set hold: a change in which venues are live (any rule) holds the position for --venue-hold.
-  const vh = venueSetHold(state.venueHold ?? {}, vref.venues.filter((v) => v.used).map((v) => v.venue), now, cfg.venueHoldSec * 1000);
+  // Two-tick confirmation: one failed tick does not drop a venue, one good tick does not bring one back.
+  // A state file from before this rule has no confirmed set: start from the hold's last live set.
+  const vc = venueConfirm(state.venueConfirm ?? (state.venueHold?.liveSet ? { confirmed: state.venueHold.liveSet } : {}), raw.venues.filter((v) => v.used).map((v) => v.venue), cfg.confirmTicks);
+  state.venueConfirm = vc.state;
+  // A venue coming back is read and logged but does not enter the price until it is confirmed.
+  const unconfirmed = Object.fromEntries(vc.returning.map((r) => [r.venue, `coming back: ${r.ticks}/${cfg.confirmTicks} good ticks in a row, not counted yet`]));
+  const vref: VenueReference = vc.returning.length ? aggregateVenues(quotes, now, { ...aggOpts, unconfirmed }) : raw;
+  const uncertainMsg = vc.uncertain ? `venue(s) failed this tick, not dropped yet: ${vc.failing.map((f) => `${f.venue} ${f.ticks}/${cfg.confirmTicks}`).join(', ')}` : undefined;
+  line.venueConfirm = { confirmed: vc.confirmed, ...(vc.failing.length ? { failing: vc.failing } : {}), ...(vc.returning.length ? { returning: vc.returning } : {}), ...(vc.dropped.length ? { dropped: vc.dropped } : {}), ...(vc.added.length ? { added: vc.added } : {}) };
+  // Venue-set hold: a change in the CONFIRMED live set (any rule) holds the position for --venue-hold.
+  const vh = venueSetHold(state.venueHold ?? {}, vc.confirmed, now, cfg.venueHoldSec * 1000);
   state.venueHold = vh.state;
   const holdMsg = vh.holding ? `venue-set hold (${vh.state.holdReason}) for ${Math.round(vh.remainingMs / 1000)} s more` : undefined;
   line.venueSet = { live: vh.state.liveSet, ...(vh.changed ? { changed: { removed: vh.removed, added: vh.added } } : {}), ...(vh.holding ? { holdUntil: new Date(vh.state.holdUntil!).toISOString(), remainingSec: Math.round(vh.remainingMs / 1000), reason: vh.state.holdReason } : {}), ...(vh.expired ? { holdEnded: true } : {}) };
   if (vh.started) await alert('venue-hold', `VENUE SET CHANGED (${vh.state.holdReason}): holding position (no rebalance) for ${Math.round(cfg.venueHoldSec / 60)} min; the fee may widen, not narrow. Live now: ${vh.state.liveSet!.join(',') || 'none'}.`, line);
   if (vh.expired) alerts.limiter.clear('venue-hold');
+  // Single-venue caution: one confirmed venue = trade, but with a wider fee and half the sizes.
+  const sv = singleVenueCaution(state.singleVenue ?? {}, vc.confirmed.length, now);
+  state.singleVenue = sv.state;
+  const caution = sv.active ? { feeAddBps: cfg.singleVenueFeeAddBps, sizeFactor: cfg.singleVenueSizeFactor } : undefined;
+  if (sv.active) {
+    line.singleVenueCaution = {
+      active: true, venue: vc.confirmed[0], since: new Date(sv.state.since!).toISOString(), feeAddBps: caution!.feeAddBps, sizeFactor: caution!.sizeFactor,
+      spendFraction: cfg.spendFraction * caution!.sizeFactor, windowShare: cfg.maxWindowSpendShare * caution!.sizeFactor,
+    };
+  }
+  if (sv.started) await alert('single-venue', `SINGLE VENUE: only ${vc.confirmed[0]} is confirmed live. Trading cautiously: fee target +${cfg.singleVenueFeeAddBps} bps (inside the operator range), per-tick spend and rolling-window share x${cfg.singleVenueSizeFactor}.`, line);
+  if (sv.ended) alerts.limiter.clear('single-venue');
   const ref = vref.status === 'ok' ? { ok: true as const, price: vref.price } : { ok: false as const, reason: vref.reason };
   const r6 = (x: number | undefined) => (x === undefined ? null : Number(x.toPrecision(6)));
   line.reference = {
     status: vref.status, price: vref.price ?? null, disagreement: vref.disagreement === undefined ? null : round(vref.disagreement, 5), live: vref.live, reason: vref.reason,
     venues: vref.venues.map((v) => ({ venue: v.venue, used: v.used, mid: r6(v.mid), fee: r6(v.fee), roundTrip: r6(v.roundTrip), impact: r6(v.impact), depth: r6(v.depth), weight: r6(v.weight), ...(v.dropped ? { dropped: v.dropped } : {}) })),
   };
-  if (vref.live === 1) line.referenceWarning = `only ONE live venue (${vref.venues.find((v) => v.used)!.venue}): its price is not checked against another venue`;
+  if (vref.live === 1) line.referenceWarning = `only ONE live venue (${vref.venues.find((v) => v.used)!.venue}): its price is not checked against another venue${sv.active ? ' (single-venue caution on)' : vc.uncertain ? ' (another venue failed this tick: no rebalance)' : ''}`;
   const watchLines = watch.map((w) => {
     if (w.error) return { source: w.source, error: w.error };
     const c = watchComparable ? watchPriceCheck(vref.price, w.price, cfg.watchMaxDeviation) : { alarm: false, deviation: undefined };
@@ -454,26 +490,39 @@ async function tick(): Promise<void> {
   if (s.ownerPaused) { line.decision = 'owner pause on: nothing to do (only the owner reopens)'; return void log(line); }
   if (s.operatorPaused) { line.decision = 'operator pause on: no rebalance or fee change'; return void log(line); }
   if (!ownerAnchorNow) { line.decision = 'owner anchor unknown: no rebalance, no fee change'; return void log(line); }
-  if (vref.status === 'disagree') {
+  const gate = venueGate({ status: vref.status, holding: !!holdMsg, uncertain: vc.uncertain });
+  line.gate = gate;
+  if (gate === 'disagree') {
     // Hold the position (no rebalance) and widen the fee: the venues do not agree where the price is.
-    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, vref.disagreement, actions, line, holdMsg) : undefined;
+    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, vref.disagreement, actions, line, holdMsg ?? uncertainMsg, caution) : undefined;
     line.decision = `HOLD: ${vref.reason}${fr ? `; ${fr}` : ''}`;
     return void log(line);
   }
-  if (holdMsg && ref.ok) {
+  if (gate === 'hold') {
     // The venue set changed: hold the position (no rebalance) until the hold ends; the fee may widen, not narrow.
-    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, undefined, actions, line, holdMsg) : undefined;
+    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, undefined, actions, line, holdMsg, caution) : undefined;
     line.decision = `HOLD: ${holdMsg}: no rebalance${fr ? `; ${fr}` : ''}`;
     return void log(line);
   }
-  if (!ref.ok || !target) { line.decision = `no reference (${ref.ok ? 'no target' : ref.reason}): no rebalance, no fee change`; return void log(line); }
+  if (gate === 'uncertain') {
+    // A confirmed venue failed once: priced from the venues that quoted, but the reference is less certain.
+    // No rebalance this tick, no hold; the fee may widen, not narrow (as in a hold).
+    const fr = cfg.feeControl ? await feeStep(now, pool.feeBps, s, false, undefined, actions, line, uncertainMsg, caution) : undefined;
+    line.decision = `NO REBALANCE: ${uncertainMsg}${fr ? `; ${fr}` : ''}`;
+    return void log(line);
+  }
+  if (gate === 'none' || !ref.ok || !target) { line.decision = `no reference (${ref.ok ? 'no target' : ref.reason}): no rebalance, no fee change`; return void log(line); }
   if (!anchor.ok) { line.decision = 'beyond the owner anchor distance: not following'; return void log(line); }
 
   // 6. Rebalance.
   state.spends = (state.spends ?? []).filter((x) => now - x.at < 86_400_000);
-  const win = windowSpendRoom(state.spends, Number(allowanceLocal), now, { windowMs: cfg.spendWindowSec * 1000, maxShare: cfg.maxWindowSpendShare });
-  line.spendWindow = { spentInWindow: round(win.spentInWindow, 9), room: round(win.room, 9), maxShare: cfg.maxWindowSpendShare, windowSec: cfg.spendWindowSec };
-  const dec = decideRebalance(pool, epoch, target, { deadBandBps: cfg.deadBandBps, spendFraction: cfg.spendFraction, reserveFraction: cfg.reserveFraction, minMoveBps: cfg.minMoveBps, side: cfg.side, targetDepth, spendCap: win.room });
+  // Single-venue caution: half the window share (60% -> 30% of the allowance at the window's start) and
+  // half the per-tick cap (sizeFactor on min(allowance x spendFraction, allowance - reserve)).
+  const sizeFactor = caution?.sizeFactor ?? 1;
+  const windowShare = cfg.maxWindowSpendShare * sizeFactor;
+  const win = windowSpendRoom(state.spends, Number(allowanceLocal), now, { windowMs: cfg.spendWindowSec * 1000, maxShare: windowShare });
+  line.spendWindow = { spentInWindow: round(win.spentInWindow, 9), room: round(win.room, 9), maxShare: windowShare, windowSec: cfg.spendWindowSec, ...(caution ? { sizeFactor } : {}) };
+  const dec = decideRebalance(pool, epoch, target, { deadBandBps: cfg.deadBandBps, spendFraction: cfg.spendFraction, reserveFraction: cfg.reserveFraction, minMoveBps: cfg.minMoveBps, side: cfg.side, targetDepth, spendCap: win.room, sizeFactor });
   line.deadBandBps = dec.deadBandBps;
   let behind = dec.behind;
   let feeNow = pool.feeBps;
@@ -500,7 +549,7 @@ async function tick(): Promise<void> {
   } else if (bu.cleared) alerts.limiter.clear('behind');
 
   // 7. Fee.
-  if (cfg.feeControl) await feeStep(now, feeNow, s, behind, undefined, actions, line);
+  if (cfg.feeControl) await feeStep(now, feeNow, s, behind, undefined, actions, line, undefined, caution);
   line.decision = actions.length ? actions.map((a) => `${a.type}: ${a.sent ? a.status : a.skipped ?? (a.preview.ok ? 'previewed ok (dry run)' : 'PREVIEW FAILED, not sent')}`).join('; ') : 'nothing to do';
   log(line);
 }
@@ -512,13 +561,13 @@ const round = (x: number, d: number) => Math.round(x * 10 ** d) / 10 ** d;
  * disagree), clamped to the owner's operator range (logged when clamped), with hysteresis; a change that
  * failed is not retried at once. Returns a short summary.
  */
-async function feeStep(now: number, feeNow: number, s: NonNullable<OwnerPoolState['split']>, behind: boolean, disagreement: number | undefined, actions: Sent[], line: Record<string, unknown>, noNarrow?: string): Promise<string> {
+async function feeStep(now: number, feeNow: number, s: NonNullable<OwnerPoolState['split']>, behind: boolean, disagreement: number | undefined, actions: Sent[], line: Record<string, unknown>, noNarrow?: string, caution?: { feeAddBps: number }): Promise<string> {
   const volBps = volatilityBps(state.history, now, cfg.volWindowSec * 1000, cfg.intervalSec * 1000);
-  const ft = feeTargetDetail({ volBps, behind, disagreement, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, cfg });
+  const ft = feeTargetDetail({ volBps, behind, disagreement, singleVenueAddBps: caution?.feeAddBps, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, cfg });
   const fd = feeDecision({ currentFeeBps: feeNow, targetFeeBps: ft.feeBps, lastChangeAt: state.lastFeeChangeAt, now, minFeeBps: s.limits.minFeeBps, maxFeeBps: s.limits.maxFeeBps, lastFailure: state.lastFeeFailure, noNarrow, cfg: { minFeeChangeBps: cfg.minFeeChangeBps, widenIntervalMs: cfg.widenIntervalSec * 1000, narrowIntervalMs: cfg.narrowIntervalSec * 1000 } });
   line.fee = {
     current: feeNow, target: ft.feeBps, rule: ft.rawBps, ...(ft.clamped ? { clamped: `${ft.clamped} of the operator range ${s.limits.minFeeBps}-${s.limits.maxFeeBps} bps` } : {}),
-    volBps: round(volBps, 2), behind, ...(disagreement !== undefined ? { disagreement: round(disagreement, 5) } : {}), decision: fd.reason,
+    volBps: round(volBps, 2), behind, ...(caution ? { singleVenueAddBps: caution.feeAddBps } : {}), ...(disagreement !== undefined ? { disagreement: round(disagreement, 5) } : {}), decision: fd.reason,
   };
   if (fd.action !== 'set') return `fee: ${fd.reason}`;
   const r = await execute(`operator_set_fee(${fd.feeBps})`, ownerPoolOperatorSetFeeManifest({ pool: cfg.pool, operator: signer, feeBps: fd.feeBps, feeLockXrd: cfg.feeLockXrd }));
